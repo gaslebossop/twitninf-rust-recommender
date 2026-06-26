@@ -198,6 +198,10 @@ pub struct ScoreBreakdown {
     pub moderation_penalty: f64,
     pub source_weight: f64,
     pub shadowban_multiplier: f64,
+    pub garbage_penalty: f64,
+
+    /// Métadonnée portée pour le calcul de diversité de format du feed (D6).
+    pub has_media: bool,
 
     pub final_score: f64,
 }

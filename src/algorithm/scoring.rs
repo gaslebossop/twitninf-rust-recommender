@@ -1,4 +1,4 @@
-/// NeuralRank Fusion — Moteur de scoring 12 dimensions
+/// NeuralRank Fusion — Moteur de scoring 8 dimensions + modificateurs
 ///
 /// Contrairement au moteur JS qui utilise Math.random() pour le "ML",
 /// chaque dimension est calculée à partir des données réelles extraites de la BDD.
@@ -23,7 +23,7 @@ use crate::models::{
     ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
     UserProfile, UserType,
 };
-use crate::shadowban::ShadowbanEnforcer;
+use crate::shadowban::{GarbageContentDetector, ShadowbanEnforcer};
 
 // ─── Poids globaux des 8 dimensions (Phase 1 CTR Optimization) ───────────────
 // D1 boosted: engagement velocity est le meilleur prédicteur de CTR
@@ -132,10 +132,23 @@ pub fn score_tweet(
     // ── Mod D : Shadowban — suppression graduelle des comptes poubelle ────────
     let enforcer = ShadowbanEnforcer::new();
     let shadowban_mult = enforcer.multiplier(tweet.author_shadowban_level);
-    let final_score = enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
-    debug!(final_score, score_before_shadowban, shadowban_mult,
+    let score_after_shadowban = enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
+
+    // ── Mod E : Garbage-content penalty (qualité par tweet, temps réel) ───────
+    // Pénalise le tweet individuel selon ses signaux de contenu poubelle.
+    // Complète le shadowban (niveau compte) par un filtrage au grain du tweet.
+    let garbage_signals = GarbageContentDetector::new().detect(tweet);
+    let garbage_score = garbage_signals.score();
+    // Pénalité multiplicative douce : un tweet 100% poubelle perd 60% de son score.
+    let garbage_penalty = 1.0 - 0.60 * garbage_score;
+    let final_score = (score_after_shadowban * garbage_penalty).clamp(0.0, 1.0);
+    if garbage_score > 0.0 {
+        debug!(garbage_score, garbage_penalty, signals = ?garbage_signals.active_signals(),
+               "Mod E: garbage-content penalty applied");
+    }
+    debug!(final_score, score_before_shadowban, shadowban_mult, garbage_penalty,
            level = tweet.author_shadowban_level.label(),
-           "━━━ FINAL SCORE (with shadowban Mod D) ━━━");
+           "━━━ FINAL SCORE (with shadowban Mod D + garbage Mod E) ━━━");
 
     ScoredTweet {
         tweet_id: tweet.id.clone(),
@@ -159,6 +172,8 @@ pub fn score_tweet(
             moderation_penalty:     mod_penalty,
             source_weight:          tweet.source_weight,
             shadowban_multiplier:   shadowban_mult,
+            garbage_penalty,
+            has_media:              tweet.has_media,
             final_score,
         },
     }
@@ -532,14 +547,23 @@ fn d6_content_diversity(
     let mut score = 0.70_f64; // base
     trace!(base_score = 0.70, "D6 Base score");
 
-    // Bonus format : médias vs texte
-    let media_ratio_in_feed = feed.iter()
-        .filter(|_| true) // placeholder : on n'a pas les métadonnées dans ScoredTweet
-        .count() as f64 / feed_size.max(1) as f64;
-    // Heuristique simple
-    let media_bonus = if t.has_media && media_ratio_in_feed < 0.4 { 0.15 } else { 0.0 };
+    // Bonus format : médias vs texte — ratio réel de tweets-média déjà dans le feed.
+    // (auparavant un placeholder figé à 1.0 qui désactivait totalement ce bonus)
+    let media_in_feed = feed.iter()
+        .filter(|s| s.breakdown.has_media)
+        .count();
+    let media_ratio_in_feed = media_in_feed as f64 / feed_size.max(1) as f64;
+    // Récompense la nouveauté de format : un tweet média dans un feed pauvre en média
+    // (ou inversement, un tweet texte dans un feed saturé de médias).
+    let media_bonus = if t.has_media && media_ratio_in_feed < 0.40 {
+        0.15
+    } else if !t.has_media && media_ratio_in_feed > 0.70 {
+        0.10
+    } else {
+        0.0
+    };
     score += media_bonus;
-    trace!(media_bonus, media_ratio_in_feed, "D6 Media format diversity");
+    trace!(media_bonus, media_ratio_in_feed, media_in_feed, "D6 Media format diversity (real ratio)");
 
     // Bonus hashtags non vus (nouveaux sujets)
     let hashtag_novelty = if t.hashtag_count > 0 { 0.10 } else { 0.0 };
