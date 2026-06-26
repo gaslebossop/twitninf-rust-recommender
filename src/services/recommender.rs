@@ -769,6 +769,8 @@ fn map_rows(rows: Vec<tokio_postgres::Row>, source: TweetSource, weight: f64) ->
             author_account_age_days: 365,
             author_tweet_count: 0,
             source, source_weight: weight,
+            // Chargé depuis Redis/DB par le job de qualité ; Clean par défaut
+            author_shadowban_level: crate::shadowban::ShadowbanLevel::Clean,
         })
     }).collect()
 }
