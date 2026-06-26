@@ -1,0 +1,41 @@
+[Unit]
+Description=TwitNinf Rust Recommender — NeuralRank Fusion Engine
+After=network.target postgresql.service redis-server.service
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=debian
+WorkingDirectory=/home/debian/rust-recommender
+ExecStart=/home/debian/rust-recommender/target/release/twitninf-recommender
+Restart=on-failure
+RestartSec=5
+
+# Variables d'environnement
+Environment=RUST_PORT=3002
+Environment=DB_HOST=localhost
+Environment=DB_PORT=5432
+Environment=DB_NAME=twitninf
+Environment=DB_USER=admin
+Environment=DB_PASSWORD=myytree88
+Environment=REDIS_URL=redis://:linecraft_redis_2024@127.0.0.1:6379
+Environment=LOG_LEVEL=debug
+Environment=DB_POOL_SIZE=10
+Environment=RUST_LOG=twitninf_recommender=debug
+
+# Sécurité
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/debian/rust-recommender
+
+# Limites
+LimitNOFILE=65536
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=twitninf-recommender
+
+[Install]
+WantedBy=multi-user.target
