@@ -17,6 +17,8 @@
 use chrono::Utc;
 use tracing::{debug, trace};
 
+use crate::ml::ctr_predictor::{extract_features, CtrPredictor};
+use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
     ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
     UserProfile, UserType,
@@ -36,6 +38,8 @@ const W_D8_PERSONALIZATION: f64      = 0.04; // -0.01
 
 /// Score final d'un tweet, toutes dimensions combinées.
 /// `author_feed_count` = combien de fois cet auteur apparaît déjà dans le feed courant.
+/// `ctr_predictor`     = modèle ML optionnel pour blending CTR prédit (Phase 2)
+/// `realtime_boost`    = delta feedback loop Redis (Phase 3), 0.0 si non disponible
 pub fn score_tweet(
     tweet: &RawTweet,
     profile: &UserProfile,
@@ -82,8 +86,12 @@ pub fn score_tweet(
     let d8 = d8_personalization_depth(tweet, profile);
     trace!(d8, "D8 Personalization Depth");
 
-    // ── Pondération principale ───────────────────────────────────────────────
-    let base_score = d1 * W_D1_ENGAGEMENT_VELOCITY
+    // ── Phase 2 : User-Specific Weights ─────────────────────────────────────
+    let user_weights = UserDimensionWeights::for_profile(profile);
+    let user_weighted_score = user_weights.apply(d1, d2, d3, d4, d5, d6, d7, d8);
+
+    // ── Pondération principale : blend global + user-specific (60/40) ────────
+    let global_score = d1 * W_D1_ENGAGEMENT_VELOCITY
         + d2 * W_D2_CONTENT_INTELLIGENCE
         + d3 * W_D3_SOCIAL_GRAPH
         + d4 * W_D4_TEMPORAL
@@ -91,7 +99,9 @@ pub fn score_tweet(
         + d6 * W_D6_DIVERSITY
         + d7 * W_D7_VIRAL
         + d8 * W_D8_PERSONALIZATION;
-    debug!(base_score, d1, d2, d3, d4, d5, d6, d7, d8, "Base score from 8 dimensions");
+    let base_score = global_score * 0.60 + user_weighted_score * 0.40;
+    debug!(base_score, global_score, user_weighted_score, d1, d2, d3, d4, d5, d6, d7, d8,
+           "Base score (60% global + 40% user-specific weights)");
 
     // ── Mod A : Diversity Multiplier (anti-bulle) ────────────────────────────
     let diversity_mult = diversity_multiplier(author_feed_count);
@@ -143,6 +153,55 @@ pub fn score_tweet(
             final_score,
         },
     }
+}
+
+/// Version avec ML CTR Predictor (Phase 2) + realtime boost (Phase 3)
+/// `ctr`           = CtrPredictor optionnel (None → score classique)
+/// `realtime_boost`= delta feedback loop Redis, typiquement [-0.20, +0.20]
+pub fn score_tweet_ml(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    author_feed_count: u32,
+    feed_tweets_so_far: &[ScoredTweet],
+    ctr: Option<&CtrPredictor>,
+    realtime_boost: f64,
+) -> ScoredTweet {
+    // Score de base (Phase 1 + Phase 2 user weights)
+    let mut scored = score_tweet(tweet, profile, author_feed_count, feed_tweets_so_far);
+
+    // Phase 2 : blending ML CTR predictor (40% ML + 60% règles)
+    if let Some(ctr_model) = ctr {
+        let age_h = age_hours(tweet);
+        let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
+        let features = extract_features(
+            d1,
+            scored.breakdown.content_intelligence,
+            scored.breakdown.social_graph_dynamics,
+            scored.breakdown.temporal_dynamics,
+            scored.breakdown.behavioral_prediction,
+            scored.breakdown.content_diversity,
+            scored.breakdown.viral_prediction,
+            scored.breakdown.personalization_depth,
+            age_h,
+            tweet.source == TweetSource::Trending,
+            tweet.has_media,
+            tweet.author_followers,
+            ev_accel,
+        );
+        let ml_ctr = ctr_model.predict_ctr(&features);
+        let blended = scored.score * 0.60 + ml_ctr * 0.40;
+        debug!(base = scored.score, ml_ctr, blended, "Phase 2: ML CTR blend (60% rules + 40% ML)");
+        scored.score = blended;
+    }
+
+    // Phase 3 : realtime feedback boost/penalty
+    if realtime_boost.abs() > 0.001 {
+        scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
+        debug!(realtime_boost, final = scored.score, "Phase 3: Realtime feedback applied");
+    }
+
+    scored.breakdown.final_score = scored.score;
+    scored
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

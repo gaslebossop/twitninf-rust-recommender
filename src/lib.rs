@@ -13,9 +13,11 @@
 //! 6. **Response** → Paginated results with metadata
 
 pub mod algorithm;
+pub mod bandit;    // Phase 3: Contextual Bandit
 pub mod constants;
 pub mod error;
 pub mod handlers;
+pub mod ml;        // Phase 2: ML CTR Predictor + User Weights
 pub mod models;
 pub mod services;
 pub mod utils;

@@ -25,6 +25,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+deadpool-redis = { version = "0.15", features = ["rt_tokio_1"] }
+
+# ML / randomness
+rand = "0.8"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
