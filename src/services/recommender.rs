@@ -6,23 +6,59 @@ use deadpool_postgres::Pool as PgPool;
 use tokio::join;
 use tracing::{info, warn, debug, trace};
 
-use crate::algorithm::scoring::{compute_feed_metrics, score_tweet};
+use crate::algorithm::scoring::{compute_feed_metrics, score_tweet, score_tweet_ml};
 use crate::algorithm::trending::trending_score;
+use crate::bandit::bandit_select;
+use crate::ml::ctr_predictor::CtrPredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
+use crate::shadowban::GarbageContentDetector;
+
+/// Seuil dur de filtration : au-dessus, un tweet d'un auteur non suivi est
+/// retiré du feed avant scoring (le reste est seulement pénalisé via Mod E).
+const GARBAGE_HARD_DROP: f64 = 0.60;
 
 pub struct RecommenderService {
     pg: PgPool,
     cache: CacheManager,
+    ctr_predictor: CtrPredictor,
 }
 
 impl RecommenderService {
     pub fn new(pg: PgPool, cache: CacheManager) -> Self {
-        Self { pg, cache }
+        Self { pg, cache, ctr_predictor: CtrPredictor::new() }
+    }
+
+    pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
+        let ctr_predictor = CtrPredictor::load_or_default().await;
+        Self { pg, cache, ctr_predictor }
+    }
+
+    /// Enregistre un click/skip et met à jour le modèle ML en temps réel
+    pub fn record_ctr_event(
+        &self,
+        features: [f64; 14],
+        clicked: bool,
+    ) {
+        self.ctr_predictor.record_interaction(features, clicked);
+        let (samples, global_ctr) = self.ctr_predictor.stats();
+        if samples % 100 == 0 {
+            info!(samples, global_ctr, "CTR model checkpoint — 100 new samples");
+        }
     }
 
     pub async fn recommend(&self, req: &RecommendRequest) -> Result<RecommendResponse> {
         let start = Instant::now();
+
+        // ── Sécurité : valider que user_id est un UUID strict ────────────────────
+        // Toutes les requêtes interpolent user_id dans le SQL ; un identifiant
+        // non-UUID pourrait casser le littéral de chaîne (injection). On rejette
+        // tôt et proprement avant le moindre accès base.
+        if uuid::Uuid::parse_str(&req.user_id).is_err() {
+            warn!(user_id = %req.user_id, "Rejected: user_id is not a valid UUID (injection guard)");
+            anyhow::bail!("invalid user_id: must be a UUID");
+        }
+
         let mode = req.mode.clone().unwrap_or_default();
         let mode_str = mode_label(&mode);
         let limit = req.limit.unwrap_or(50).clamp(1, 200) as usize;
@@ -116,7 +152,7 @@ impl RecommenderService {
             tweet_ids: page_ids,
             count,
             algorithm: "NeuralRank Fusion",
-            algorithm_version: "2.0.0 — 12 dimensions réelles",
+            algorithm_version: "2.1.0 — 8 dimensions + ML CTR + bandit + garbage filter",
             mode: mode_str.to_string(),
             latency_ms: start.elapsed().as_millis() as u64,
             cache_hit: false,
@@ -158,11 +194,33 @@ impl RecommenderService {
     fn score_all(&self, tweets: &[RawTweet], profile: &UserProfile, mode: &RecommendMode) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
-        trace!(mode = ?mode, "Scoring all tweets with mode adjustments");
+        let (ctr_samples, _) = self.ctr_predictor.stats();
+        // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
+        let use_ml = ctr_samples >= 200;
+        let detector = GarbageContentDetector::new();
+        let mut dropped_garbage = 0usize;
+        trace!(mode = ?mode, use_ml, ctr_samples, "Scoring all tweets with mode adjustments");
 
         for (idx, tweet) in tweets.iter().enumerate() {
+            // ── Filtration dure : retirer le pur spam des auteurs non suivis ──────
+            // On épargne les comptes suivis pour ne jamais masquer un abonnement,
+            // même si un de ses tweets est bruité.
+            if !profile.following_ids.contains(&tweet.user_id) {
+                let g = detector.detect(tweet).score();
+                if g >= GARBAGE_HARD_DROP {
+                    dropped_garbage += 1;
+                    trace!(tweet_id = %tweet.id, garbage = g, "Hard-dropped garbage candidate");
+                    continue;
+                }
+            }
+
             let ac = *author_count.get(&tweet.user_id).unwrap_or(&0);
-            let mut s = score_tweet(tweet, profile, ac, &scored_feed);
+            // Phase 2+3: score_tweet_ml intègre user weights + CTR predictor + realtime boost
+            let mut s = score_tweet_ml(
+                tweet, profile, ac, &scored_feed,
+                if use_ml { Some(&self.ctr_predictor) } else { None },
+                0.0, // realtime_boost: 0.0 ici (appliqué via feedback_loop dans le handler)
+            );
             let base_score = s.score;
 
             match mode {
@@ -208,6 +266,10 @@ impl RecommenderService {
             scored_feed.push(s);
         }
 
+        if dropped_garbage > 0 {
+            debug!(dropped_garbage, kept = scored_feed.len(), "Garbage hard-filter applied");
+        }
+
         debug!("Sorting {} scored tweets by final score...", scored_feed.len());
         scored_feed.sort_by(|a, b| {
             b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
@@ -215,6 +277,25 @@ impl RecommenderService {
 
         let top_scores: Vec<_> = scored_feed.iter().take(3).map(|s| (&s.tweet_id, s.score)).collect();
         debug!("Top 3 final scores: {:?}", top_scores);
+
+        // Phase 3: Contextual Bandit — réorganise le feed (80% exploit / 20% explore)
+        // Seulement en mode ForYou/Feed, pas en Trending (déjà ordonné par trending score)
+        if matches!(mode, RecommendMode::ForYou | RecommendMode::Feed) {
+            let selection = bandit_select(&scored_feed, tweets, profile, scored_feed.len());
+            debug!(
+                exploit = selection.exploit_count,
+                explore = selection.explore_count,
+                "Phase 3: Bandit reordering applied (80% exploit + 20% explore)"
+            );
+            // Réordonner scored_feed selon l'ordre du bandit
+            let mut id_to_scored: HashMap<String, ScoredTweet> = scored_feed
+                .into_iter()
+                .map(|s| (s.tweet_id.clone(), s))
+                .collect();
+            return selection.tweet_ids.into_iter()
+                .filter_map(|id| id_to_scored.remove(&id))
+                .collect();
+        }
 
         scored_feed
     }
@@ -230,35 +311,28 @@ impl RecommenderService {
         let client = self.pg.get().await?;
         let uid = user_id;
 
-        // Séquentiel sur une seule connexion (pas de vrai parallélisme possible sur un seul client PG)
-        let social_res = client.query(
-            &*format!("SELECT following_id::text, EXISTS(SELECT 1 FROM user_follows f2 WHERE f2.follower_id = following_id AND f2.following_id = '{uid}'::uuid) AS is_mutual FROM user_follows WHERE follower_id = '{uid}'::uuid LIMIT 1000"),
-            &[]
-        ).await;
-        let engagement_res = client.query(
-            &*format!("SELECT SUM(CASE WHEN created_at > NOW() - INTERVAL '1 day' THEN 1 ELSE 0 END) AS daily, SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS weekly FROM tweet_likes WHERE user_id = '{uid}'::uuid"),
-            &[]
-        ).await;
-        let temporal_res = client.query(
-            &*format!("SELECT EXTRACT(HOUR FROM created_at)::int AS h, EXTRACT(DOW FROM created_at)::int AS d, COUNT(*) AS cnt FROM tweet_likes WHERE user_id = '{uid}'::uuid AND created_at > NOW() - INTERVAL '60 days' GROUP BY h, d ORDER BY h, d"),
-            &[]
-        ).await;
-        let content_pref_res = client.query(
-            &*format!("SELECT AVG(LENGTH(t.content))::float8 AS avg_len, SUM(CASE WHEN t.media_urls IS NOT NULL AND t.media_urls != '[]'::jsonb THEN 1 ELSE 0 END)::float8 / GREATEST(COUNT(*), 1) AS media_ratio, AVG(COALESCE(jsonb_array_length(t.hashtags), 0))::float8 AS avg_hashtags FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = '{uid}'::uuid AND tl.created_at > NOW() - INTERVAL '30 days'"),
-            &[]
-        ).await;
-        let behavior_res = client.query(
-            &*format!("SELECT (SELECT COUNT(*) FROM tweet_retweets WHERE user_id = '{uid}'::uuid) AS rt_count, (SELECT COUNT(*) FROM tweet_likes WHERE user_id = '{uid}'::uuid) AS like_count, (SELECT COUNT(*) FROM tweets WHERE user_id = '{uid}'::uuid AND parent_tweet_id IS NOT NULL) AS reply_count, (SELECT COUNT(*) FROM user_follows WHERE following_id = '{uid}'::uuid) AS followers, (SELECT COUNT(*) FROM user_follows WHERE follower_id = '{uid}'::uuid) AS following"),
-            &[]
-        ).await;
-        let author_affinity_res = client.query(
-            &*format!("SELECT t.user_id::text AS author_id, COUNT(*)::float8 AS affinity FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = '{uid}'::uuid AND tl.created_at > NOW() - INTERVAL '60 days' GROUP BY t.user_id ORDER BY affinity DESC LIMIT 20"),
-            &[]
-        ).await;
-        let seen_ids_res = client.query(
-            &*format!("SELECT tweet_id::text FROM tweet_likes WHERE user_id = '{uid}'::uuid ORDER BY created_at DESC LIMIT 500"),
-            &[]
-        ).await;
+        // Pipeline : tokio-postgres multiplexe plusieurs requêtes concurrentes sur
+        // une même connexion. On lance les 7 requêtes de profil en parallèle via
+        // join! au lieu de les enchaîner — la latence devient celle de la plus
+        // lente, pas la somme.
+        let sql_social = format!("SELECT following_id::text, EXISTS(SELECT 1 FROM user_follows f2 WHERE f2.follower_id = following_id AND f2.following_id = '{uid}'::uuid) AS is_mutual FROM user_follows WHERE follower_id = '{uid}'::uuid LIMIT 1000");
+        let sql_engagement = format!("SELECT SUM(CASE WHEN created_at > NOW() - INTERVAL '1 day' THEN 1 ELSE 0 END) AS daily, SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS weekly FROM tweet_likes WHERE user_id = '{uid}'::uuid");
+        let sql_temporal = format!("SELECT EXTRACT(HOUR FROM created_at)::int AS h, EXTRACT(DOW FROM created_at)::int AS d, COUNT(*) AS cnt FROM tweet_likes WHERE user_id = '{uid}'::uuid AND created_at > NOW() - INTERVAL '60 days' GROUP BY h, d ORDER BY h, d");
+        let sql_content = format!("SELECT AVG(LENGTH(t.content))::float8 AS avg_len, SUM(CASE WHEN t.media_urls IS NOT NULL AND t.media_urls != '[]'::jsonb THEN 1 ELSE 0 END)::float8 / GREATEST(COUNT(*), 1) AS media_ratio, AVG(COALESCE(jsonb_array_length(t.hashtags), 0))::float8 AS avg_hashtags FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = '{uid}'::uuid AND tl.created_at > NOW() - INTERVAL '30 days'");
+        let sql_behavior = format!("SELECT (SELECT COUNT(*) FROM tweet_retweets WHERE user_id = '{uid}'::uuid) AS rt_count, (SELECT COUNT(*) FROM tweet_likes WHERE user_id = '{uid}'::uuid) AS like_count, (SELECT COUNT(*) FROM tweets WHERE user_id = '{uid}'::uuid AND parent_tweet_id IS NOT NULL) AS reply_count, (SELECT COUNT(*) FROM user_follows WHERE following_id = '{uid}'::uuid) AS followers, (SELECT COUNT(*) FROM user_follows WHERE follower_id = '{uid}'::uuid) AS following");
+        let sql_affinity = format!("SELECT t.user_id::text AS author_id, COUNT(*)::float8 AS affinity FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = '{uid}'::uuid AND tl.created_at > NOW() - INTERVAL '60 days' GROUP BY t.user_id ORDER BY affinity DESC LIMIT 20");
+        let sql_seen = format!("SELECT tweet_id::text FROM tweet_likes WHERE user_id = '{uid}'::uuid ORDER BY created_at DESC LIMIT 500");
+
+        let (social_res, engagement_res, temporal_res, content_pref_res,
+             behavior_res, author_affinity_res, seen_ids_res) = join!(
+            client.query(sql_social.as_str(), &[]),
+            client.query(sql_engagement.as_str(), &[]),
+            client.query(sql_temporal.as_str(), &[]),
+            client.query(sql_content.as_str(), &[]),
+            client.query(sql_behavior.as_str(), &[]),
+            client.query(sql_affinity.as_str(), &[]),
+            client.query(sql_seen.as_str(), &[]),
+        );
 
         let mut profile = UserProfile::default();
         profile.user_id = user_id.to_string();
@@ -398,10 +472,16 @@ impl RecommenderService {
         let following_list = &profile.following_ids;
         let active_hour = profile.most_active_hour as i32;
 
-        // Formater une liste d'UUIDs pour une clause IN SQL
+        // Formater une liste d'UUIDs pour une clause IN SQL.
+        // On ne garde que les entrées qui sont des UUID valides : défense en
+        // profondeur contre toute valeur malformée venant du graphe social.
         let format_uuid_list = |ids: &[String]| -> String {
-            if ids.is_empty() { return "'00000000-0000-0000-0000-000000000000'".to_string(); }
-            ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",")
+            let valid: Vec<String> = ids.iter()
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                .map(|id| format!("'{}'", id))
+                .collect();
+            if valid.is_empty() { return "'00000000-0000-0000-0000-000000000000'".to_string(); }
+            valid.join(",")
         };
 
         let following_sql = format_uuid_list(following_list);
@@ -620,7 +700,7 @@ impl RecommenderService {
         RecommendResponse {
             success: true, user_id: user_id.to_string(), tweet_ids, count,
             algorithm: "NeuralRank Fusion",
-            algorithm_version: "2.0.0 — 12 dimensions réelles",
+            algorithm_version: "2.1.0 — 8 dimensions + ML CTR + bandit + garbage filter",
             mode: mode.to_string(), latency_ms, cache_hit,
             metadata: RecommendMetadata {
                 candidates_collected: 0,
@@ -682,10 +762,22 @@ fn map_rows(rows: Vec<tokio_postgres::Row>, source: TweetSource, weight: f64) ->
         let content: String = r.try_get(2).unwrap_or_default();
 
         let content_lower = content.to_lowercase();
-        let emoji_count       = content.chars().filter(|c| *c as u32 > 0x1F000).count() as i32;
+        // Détection émoji couvrant les blocs Unicode réels (emoticons, symboles,
+        // dingbats, supplément). L'ancien seuil `> 0x1F000` manquait ❤ ✅ ⭐ … et
+        // comptait à tort des idéogrammes CJK situés plus haut.
+        let emoji_count = content.chars().filter(|c| {
+            let u = *c as u32;
+            (0x1F300..=0x1FAFF).contains(&u)  // emoticons + symbols & pictographs + supplemental
+                || (0x2600..=0x27BF).contains(&u) // misc symbols + dingbats
+                || (0x1F000..=0x1F0FF).contains(&u) // mahjong, dominoes, cards
+                || (0xFE00..=0xFE0F).contains(&u)   // variation selectors (emoji style)
+                || u == 0x2B50 || u == 0x2764       // ⭐ ❤
+        }).count() as i32;
         let exclamation_count = content.matches('!').count() as i32;
         let question_count    = content.matches('?').count() as i32;
-        let url_count         = content.matches("http").count() as i32;
+        // Compter les vraies URLs (schémas) plutôt que toute occurrence de "http".
+        let url_count = (content_lower.matches("http://").count()
+            + content_lower.matches("https://").count()) as i32;
         let words: Vec<String> = content_lower.split_whitespace()
             .filter(|w| w.len() > 3)
             .map(String::from)
@@ -721,6 +813,8 @@ fn map_rows(rows: Vec<tokio_postgres::Row>, source: TweetSource, weight: f64) ->
             author_account_age_days: 365,
             author_tweet_count: 0,
             source, source_weight: weight,
+            // Chargé depuis Redis/DB par le job de qualité ; Clean par défaut
+            author_shadowban_level: crate::shadowban::ShadowbanLevel::Clean,
         })
     }).collect()
 }

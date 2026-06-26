@@ -1,8 +1,16 @@
+mod ads;       // Targeted advertising
 mod algorithm;
+mod bandit;    // Phase 3: Contextual Bandit
+mod shadowban; // Suppression des comptes contenu poubelle
 mod config;
+mod constants;
+mod error;
 mod handlers;
+mod middleware;
+mod ml;        // Phase 2: ML CTR Predictor
 mod models;
 mod services;
+mod utils;
 
 use std::sync::Arc;
 use std::time::SystemTime;

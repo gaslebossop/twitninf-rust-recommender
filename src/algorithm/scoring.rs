@@ -1,4 +1,4 @@
-/// NeuralRank Fusion — Moteur de scoring 12 dimensions
+/// NeuralRank Fusion — Moteur de scoring 8 dimensions + modificateurs
 ///
 /// Contrairement au moteur JS qui utilise Math.random() pour le "ML",
 /// chaque dimension est calculée à partir des données réelles extraites de la BDD.
@@ -17,24 +17,30 @@
 use chrono::Utc;
 use tracing::{debug, trace};
 
+use crate::ml::ctr_predictor::{extract_features, CtrPredictor};
+use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
     ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
     UserProfile, UserType,
 };
+use crate::shadowban::{GarbageContentDetector, ShadowbanEnforcer};
 
-// ─── Poids globaux des 12 dimensions ─────────────────────────────────────────
-const W_D1_ENGAGEMENT_VELOCITY: f64  = 0.25;
-const W_D2_CONTENT_INTELLIGENCE: f64 = 0.20;
+// ─── Poids globaux des 8 dimensions (Phase 1 CTR Optimization) ───────────────
+// D1 boosted: engagement velocity est le meilleur prédicteur de CTR
+const W_D1_ENGAGEMENT_VELOCITY: f64  = 0.32; // +0.07 vs baseline
+const W_D2_CONTENT_INTELLIGENCE: f64 = 0.18; // -0.02
 const W_D3_SOCIAL_GRAPH: f64         = 0.15;
 const W_D4_TEMPORAL: f64             = 0.10;
-const W_D5_BEHAVIORAL: f64           = 0.10;
-const W_D6_DIVERSITY: f64            = 0.08;
+const W_D5_BEHAVIORAL: f64           = 0.08; // -0.02
+const W_D6_DIVERSITY: f64            = 0.06; // -0.02 (acceptable)
 const W_D7_VIRAL: f64                = 0.07;
-const W_D8_PERSONALIZATION: f64      = 0.05;
+const W_D8_PERSONALIZATION: f64      = 0.04; // -0.01
 // Total = 1.00
 
 /// Score final d'un tweet, toutes dimensions combinées.
 /// `author_feed_count` = combien de fois cet auteur apparaît déjà dans le feed courant.
+/// `ctr_predictor`     = modèle ML optionnel pour blending CTR prédit (Phase 2)
+/// `realtime_boost`    = delta feedback loop Redis (Phase 3), 0.0 si non disponible
 pub fn score_tweet(
     tweet: &RawTweet,
     profile: &UserProfile,
@@ -68,15 +74,25 @@ pub fn score_tweet(
     trace!(d6, "D6 Content Diversity");
 
     // ── D7 : Viral Prediction ────────────────────────────────────────────────
-    let d7 = d7_viral_prediction(tweet);
-    trace!(d7, "D7 Viral Prediction");
+    let d7_raw = d7_viral_prediction(tweet);
+    // Phase 1: boost trending tweets de 20% en D7 (potentiel viral prouvé)
+    let d7 = if tweet.source == TweetSource::Trending {
+        (d7_raw * 1.2).clamp(0.0, 1.0)
+    } else {
+        d7_raw
+    };
+    trace!(d7, d7_raw, source = ?tweet.source, "D7 Viral Prediction (with trending boost)");
 
     // ── D8 : Personalization Depth ───────────────────────────────────────────
     let d8 = d8_personalization_depth(tweet, profile);
     trace!(d8, "D8 Personalization Depth");
 
-    // ── Pondération principale ───────────────────────────────────────────────
-    let base_score = d1 * W_D1_ENGAGEMENT_VELOCITY
+    // ── Phase 2 : User-Specific Weights ─────────────────────────────────────
+    let user_weights = UserDimensionWeights::for_profile(profile);
+    let user_weighted_score = user_weights.apply(d1, d2, d3, d4, d5, d6, d7, d8);
+
+    // ── Pondération principale : blend global + user-specific (60/40) ────────
+    let global_score = d1 * W_D1_ENGAGEMENT_VELOCITY
         + d2 * W_D2_CONTENT_INTELLIGENCE
         + d3 * W_D3_SOCIAL_GRAPH
         + d4 * W_D4_TEMPORAL
@@ -84,7 +100,9 @@ pub fn score_tweet(
         + d6 * W_D6_DIVERSITY
         + d7 * W_D7_VIRAL
         + d8 * W_D8_PERSONALIZATION;
-    debug!(base_score, d1, d2, d3, d4, d5, d6, d7, d8, "Base score from 8 dimensions");
+    let base_score = global_score * 0.60 + user_weighted_score * 0.40;
+    debug!(base_score, global_score, user_weighted_score, d1, d2, d3, d4, d5, d6, d7, d8,
+           "Base score (60% global + 40% user-specific weights)");
 
     // ── Mod A : Diversity Multiplier (anti-bulle) ────────────────────────────
     let diversity_mult = diversity_multiplier(author_feed_count);
@@ -95,21 +113,42 @@ pub fn score_tweet(
     trace!(mod_penalty, report_count = tweet.report_count, "Moderation penalty");
 
     // ── Mod C : Source weight (bonus selon la source de collecte) ────────────
+    // Phase 1: source_bonus trending doublé (0.02 → 0.04) pour booster le CTR
     let source_bonus = match tweet.source {
         TweetSource::SocialGraph  => 0.08,  // boost fort : personne suivie
         TweetSource::Personalized => 0.05,
         TweetSource::Viral        => 0.04,
         TweetSource::Influencer   => 0.03,
-        TweetSource::Trending     => 0.02,
+        TweetSource::Trending     => 0.04,  // Phase 1: +0.02 (était 0.02)
         TweetSource::Temporal     => 0.02,
         TweetSource::Discovery    => 0.01,
         TweetSource::Quality      => 0.01,
     };
     trace!(source_bonus, source = ?tweet.source, "Source bonus");
 
-    let final_score = ((base_score + source_bonus) * diversity_mult + mod_penalty)
+    let score_before_shadowban = ((base_score + source_bonus) * diversity_mult + mod_penalty)
         .clamp(0.0, 1.0);
-    debug!(final_score, base_score, source_bonus, diversity_mult, mod_penalty, "━━━ FINAL SCORE ━━━");
+
+    // ── Mod D : Shadowban — suppression graduelle des comptes poubelle ────────
+    let enforcer = ShadowbanEnforcer::new();
+    let shadowban_mult = enforcer.multiplier(tweet.author_shadowban_level);
+    let score_after_shadowban = enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
+
+    // ── Mod E : Garbage-content penalty (qualité par tweet, temps réel) ───────
+    // Pénalise le tweet individuel selon ses signaux de contenu poubelle.
+    // Complète le shadowban (niveau compte) par un filtrage au grain du tweet.
+    let garbage_signals = GarbageContentDetector::new().detect(tweet);
+    let garbage_score = garbage_signals.score();
+    // Pénalité multiplicative douce : un tweet 100% poubelle perd 60% de son score.
+    let garbage_penalty = 1.0 - 0.60 * garbage_score;
+    let final_score = (score_after_shadowban * garbage_penalty).clamp(0.0, 1.0);
+    if garbage_score > 0.0 {
+        debug!(garbage_score, garbage_penalty, signals = ?garbage_signals.active_signals(),
+               "Mod E: garbage-content penalty applied");
+    }
+    debug!(final_score, score_before_shadowban, shadowban_mult, garbage_penalty,
+           level = tweet.author_shadowban_level.label(),
+           "━━━ FINAL SCORE (with shadowban Mod D + garbage Mod E) ━━━");
 
     ScoredTweet {
         tweet_id: tweet.id.clone(),
@@ -132,9 +171,61 @@ pub fn score_tweet(
             diversity_multiplier:   diversity_mult,
             moderation_penalty:     mod_penalty,
             source_weight:          tweet.source_weight,
+            shadowban_multiplier:   shadowban_mult,
+            garbage_penalty,
+            has_media:              tweet.has_media,
             final_score,
         },
     }
+}
+
+/// Version avec ML CTR Predictor (Phase 2) + realtime boost (Phase 3)
+/// `ctr`           = CtrPredictor optionnel (None → score classique)
+/// `realtime_boost`= delta feedback loop Redis, typiquement [-0.20, +0.20]
+pub fn score_tweet_ml(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    author_feed_count: u32,
+    feed_tweets_so_far: &[ScoredTweet],
+    ctr: Option<&CtrPredictor>,
+    realtime_boost: f64,
+) -> ScoredTweet {
+    // Score de base (Phase 1 + Phase 2 user weights)
+    let mut scored = score_tweet(tweet, profile, author_feed_count, feed_tweets_so_far);
+
+    // Phase 2 : blending ML CTR predictor (40% ML + 60% règles)
+    if let Some(ctr_model) = ctr {
+        let age_h = age_hours(tweet);
+        let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
+        let features = extract_features(
+            d1,
+            scored.breakdown.content_intelligence,
+            scored.breakdown.social_graph_dynamics,
+            scored.breakdown.temporal_dynamics,
+            scored.breakdown.behavioral_prediction,
+            scored.breakdown.content_diversity,
+            scored.breakdown.viral_prediction,
+            scored.breakdown.personalization_depth,
+            age_h,
+            tweet.source == TweetSource::Trending,
+            tweet.has_media,
+            tweet.author_followers,
+            ev_accel,
+        );
+        let ml_ctr = ctr_model.predict_ctr(&features);
+        let blended = scored.score * 0.60 + ml_ctr * 0.40;
+        debug!(base = scored.score, ml_ctr, blended, "Phase 2: ML CTR blend (60% rules + 40% ML)");
+        scored.score = blended;
+    }
+
+    // Phase 3 : realtime feedback boost/penalty
+    if realtime_boost.abs() > 0.001 {
+        scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
+        debug!(realtime_boost, final = scored.score, "Phase 3: Realtime feedback applied");
+    }
+
+    scored.breakdown.final_score = scored.score;
+    scored
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -158,8 +249,18 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
            shares = t.share_count, bookmarks = t.bookmark_count, views = t.view_count,
            eng_total, "D1 Raw engagement total");
 
-    // Vélocité = engagement / âge pondéré logarithmiquement
-    let velocity_raw = eng_total / (1.0 + (age_h / 6.0).ln().max(0.0) * 2.0);
+    // Phase 1: boost multiplicatif pour les tweets très récents (CTR signal fort)
+    let recency_boost = if age_h < 0.5 {
+        1.5 // tweets < 30 min : engagement en cours → CTR maximal
+    } else if age_h < 2.0 {
+        1.3 // tweets < 2h : momentum fort
+    } else {
+        1.0
+    };
+    trace!(recency_boost, age_h, "D1 Recency boost multiplier (Phase 1)");
+
+    // Vélocité = engagement / âge pondéré logarithmiquement + recency boost
+    let velocity_raw = (eng_total / (1.0 + (age_h / 6.0).ln().max(0.0) * 2.0)) * recency_boost;
     trace!(velocity_raw, "D1 Raw velocity (engagement/age)");
 
     // Engagement récent (1h) : signal d'accélération
@@ -330,9 +431,9 @@ fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile) -> f64 {
     let age_h = age_hours(t);
     trace!(age_h, "D4 Tweet age in hours");
 
-    // Récence : demi-vie de 6h (inspiration Twitter), décroissance exponentielle
-    let recency = (-0.115 * age_h).exp(); // ln(2)/6h ≈ 0.115
-    trace!(recency, "D4 Recency (6h half-life)");
+    // Phase 1: demi-vie réduite de 6h → 4h pour favoriser contenu frais (+CTR)
+    let recency = (-0.173 * age_h).exp(); // ln(2)/4h ≈ 0.173
+    trace!(recency, "D4 Recency (4h half-life, Phase 1 optimization)");
 
     // Alignement heure d'activité utilisateur
     let pub_hour = t.created_at.format("%H").to_string().parse::<u32>().unwrap_or(12) as usize;
@@ -446,14 +547,23 @@ fn d6_content_diversity(
     let mut score = 0.70_f64; // base
     trace!(base_score = 0.70, "D6 Base score");
 
-    // Bonus format : médias vs texte
-    let media_ratio_in_feed = feed.iter()
-        .filter(|_| true) // placeholder : on n'a pas les métadonnées dans ScoredTweet
-        .count() as f64 / feed_size.max(1) as f64;
-    // Heuristique simple
-    let media_bonus = if t.has_media && media_ratio_in_feed < 0.4 { 0.15 } else { 0.0 };
+    // Bonus format : médias vs texte — ratio réel de tweets-média déjà dans le feed.
+    // (auparavant un placeholder figé à 1.0 qui désactivait totalement ce bonus)
+    let media_in_feed = feed.iter()
+        .filter(|s| s.breakdown.has_media)
+        .count();
+    let media_ratio_in_feed = media_in_feed as f64 / feed_size.max(1) as f64;
+    // Récompense la nouveauté de format : un tweet média dans un feed pauvre en média
+    // (ou inversement, un tweet texte dans un feed saturé de médias).
+    let media_bonus = if t.has_media && media_ratio_in_feed < 0.40 {
+        0.15
+    } else if !t.has_media && media_ratio_in_feed > 0.70 {
+        0.10
+    } else {
+        0.0
+    };
     score += media_bonus;
-    trace!(media_bonus, media_ratio_in_feed, "D6 Media format diversity");
+    trace!(media_bonus, media_ratio_in_feed, media_in_feed, "D6 Media format diversity (real ratio)");
 
     // Bonus hashtags non vus (nouveaux sujets)
     let hashtag_novelty = if t.hashtag_count > 0 { 0.10 } else { 0.0 };
