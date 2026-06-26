@@ -1,3 +1,4 @@
+mod ads;       // Targeted advertising
 mod algorithm;
 mod bandit;    // Phase 3: Contextual Bandit
 mod config;
