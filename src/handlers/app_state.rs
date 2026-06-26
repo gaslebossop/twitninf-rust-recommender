@@ -13,5 +13,6 @@ pub struct AppState {
     pub recommender: Arc<RecommenderService>,
     pub auto_tuner: Arc<AutoTuner>,
     pub admin_secret: String,
+    pub internal_secret: String,
     pub start_time: SystemTime,
 }

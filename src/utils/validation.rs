@@ -17,22 +17,25 @@ pub fn validate_user_id(user_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Validate pagination parameters
-pub fn validate_pagination(limit: Option<usize>, offset: Option<usize>) -> AppResult<(usize, usize)> {
-    let limit = limit.unwrap_or(API_DEFAULT_LIMIT);
-    let offset = offset.unwrap_or(API_DEFAULT_OFFSET);
-
-    if limit < API_MIN_LIMIT || limit > API_MAX_LIMIT {
-        return Err(AppError::InvalidInput(
-            format!("Limit must be between {} and {}", API_MIN_LIMIT, API_MAX_LIMIT),
-        ));
-    }
+/// Validate pagination parameters.
+/// `limit` and `offset` are i64 (signed) pour permettre la détection de valeurs négatives
+/// reçues d'un appelant externe avant conversion.
+pub fn validate_pagination(limit: Option<i64>, offset: Option<i64>) -> AppResult<(usize, usize)> {
+    let limit  = limit.unwrap_or(API_DEFAULT_LIMIT as i64);
+    let offset = offset.unwrap_or(API_DEFAULT_OFFSET as i64);
 
     if offset < 0 {
         return Err(AppError::InvalidInput("Offset cannot be negative".to_string()));
     }
 
-    Ok((limit.clamp(API_MIN_LIMIT, API_MAX_LIMIT), offset.max(0)))
+    let limit_usize = limit as usize;
+    if limit_usize < API_MIN_LIMIT || limit_usize > API_MAX_LIMIT {
+        return Err(AppError::InvalidInput(
+            format!("Limit must be between {} and {}", API_MIN_LIMIT, API_MAX_LIMIT),
+        ));
+    }
+
+    Ok((limit_usize, offset as usize))
 }
 
 /// Validate score is in valid range [0, 1]
