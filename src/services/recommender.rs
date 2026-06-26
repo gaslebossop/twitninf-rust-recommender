@@ -6,9 +6,10 @@ use deadpool_postgres::Pool as PgPool;
 use tokio::join;
 use tracing::{info, warn, debug, trace};
 
-use crate::algorithm::scoring::{compute_feed_metrics, score_tweet, score_tweet_ml};
+use crate::algorithm::scoring::{compute_feed_metrics, score_tweet_ml_with_weights};
 use crate::algorithm::trending::trending_score;
 use crate::bandit::bandit_select;
+use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
@@ -22,16 +23,25 @@ pub struct RecommenderService {
     pg: PgPool,
     cache: CacheManager,
     ctr_predictor: CtrPredictor,
+    auto_tuner: std::sync::Arc<AutoTuner>,
 }
 
 impl RecommenderService {
     pub fn new(pg: PgPool, cache: CacheManager) -> Self {
-        Self { pg, cache, ctr_predictor: CtrPredictor::new() }
+        Self {
+            pg, cache,
+            ctr_predictor: CtrPredictor::new(),
+            auto_tuner: std::sync::Arc::new(AutoTuner::new()),
+        }
+    }
+
+    pub fn new_with_tuner(pg: PgPool, cache: CacheManager, auto_tuner: std::sync::Arc<AutoTuner>) -> Self {
+        Self { pg, cache, ctr_predictor: CtrPredictor::new(), auto_tuner }
     }
 
     pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
-        Self { pg, cache, ctr_predictor }
+        Self { pg, cache, ctr_predictor, auto_tuner: std::sync::Arc::new(AutoTuner::new()) }
     }
 
     /// Enregistre un click/skip et met à jour le modèle ML en temps réel
@@ -45,6 +55,11 @@ impl RecommenderService {
         if samples % 100 == 0 {
             info!(samples, global_ctr, "CTR model checkpoint — 100 new samples");
         }
+    }
+
+    /// Expose les stats CTR pour l'admin node
+    pub fn ctr_stats(&self) -> (u64, f64) {
+        self.ctr_predictor.stats()
     }
 
     pub async fn recommend(&self, req: &RecommendRequest) -> Result<RecommendResponse> {
@@ -80,13 +95,27 @@ impl RecommenderService {
             }
         }
 
+        // ── Vérification hard-ban sur le demandeur lui-même ──────────────────────
+        // Un compte hard-banni ne reçoit plus de recommandations personnalisées
+        if self.cache.admin_is_hard_banned(&req.user_id).await {
+            warn!(user_id = %req.user_id, "Hard-banned user requested recommendations — returning empty");
+            return Ok(self.build_empty_response(
+                &req.user_id, vec![], 0, mode_str,
+                start.elapsed().as_millis() as u64, false,
+            ));
+        }
+
         debug!("Building user profile...");
         let profile = self.build_user_profile(&req.user_id).await?;
         trace!(following_count = profile.following_ids.len(), top_authors = profile.top_authors.len(),
                user_type = ?profile.user_type, "User profile built");
 
+        // ── Charger la liste des hard-bannis pour filtrage SQL ───────────────────
+        let banned_set = self.cache.admin_get_hard_banned_set().await;
+        debug!(banned_count = banned_set.len(), "Hard-banned set loaded");
+
         debug!("Collecting candidates from {} sources...", 8);
-        let (sources, source_stats) = self.collect_candidates(&req.user_id, &profile, &mode).await?;
+        let (sources, source_stats) = self.collect_candidates(&req.user_id, &profile, &mode, &banned_set).await?;
         let total_candidates = sources.len();
         debug!(total_candidates,
                trending = source_stats.trending, social_graph = source_stats.social_graph,
@@ -104,12 +133,35 @@ impl RecommenderService {
         }
 
         debug!("Deduplicating {} candidates...", total_candidates);
-        let deduped = deduplicate(sources);
+        let mut deduped = deduplicate(sources);
         let deduped_count = deduped.len();
+
+        // ── Charger les niveaux de shadowban depuis Redis ────────────────────────
+        // On collecte les author_ids uniques puis on fait un batch lookup Redis.
+        let author_ids: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            deduped.iter().filter_map(|t| {
+                if seen.insert(t.user_id.clone()) { Some(t.user_id.clone()) } else { None }
+            }).collect()
+        };
+        let shadowban_levels = self.cache.admin_load_shadowban_levels(&author_ids).await;
+        if !shadowban_levels.is_empty() {
+            debug!(count = shadowban_levels.len(), "Shadowban levels loaded from Redis");
+            for tweet in deduped.iter_mut() {
+                if let Some(&level) = shadowban_levels.get(&tweet.user_id) {
+                    tweet.author_shadowban_level = level;
+                }
+            }
+        }
         debug!(deduped_count, removed = total_candidates - deduped_count, "Deduplication complete");
 
+        // ── Charger les poids actifs (admin override > auto-tuner > defaults) ────
+        let admin_weights = self.cache.admin_load_weights().await;
+        self.auto_tuner.maybe_update(&self.ctr_predictor, admin_weights.as_ref());
+        let active_weights = self.auto_tuner.active_weights(admin_weights.as_ref());
+
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
-        let scored = self.score_all(&deduped, &profile, &mode);
+        let scored = self.score_all(&deduped, &profile, &mode, &active_weights);
         debug!(scored_count = scored.len(), "Scoring complete");
 
         // Show top 5 scores
@@ -191,7 +243,7 @@ impl RecommenderService {
         })
     }
 
-    fn score_all(&self, tweets: &[RawTweet], profile: &UserProfile, mode: &RecommendMode) -> Vec<ScoredTweet> {
+    fn score_all(&self, tweets: &[RawTweet], profile: &UserProfile, mode: &RecommendMode, weights: &crate::admin::AlgoWeights) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
         let (ctr_samples, _) = self.ctr_predictor.stats();
@@ -215,11 +267,12 @@ impl RecommenderService {
             }
 
             let ac = *author_count.get(&tweet.user_id).unwrap_or(&0);
-            // Phase 2+3: score_tweet_ml intègre user weights + CTR predictor + realtime boost
-            let mut s = score_tweet_ml(
+            // Phase 2+3: score_tweet_ml_with_weights intègre poids actifs + CTR predictor + realtime boost
+            let mut s = score_tweet_ml_with_weights(
                 tweet, profile, ac, &scored_feed,
                 if use_ml { Some(&self.ctr_predictor) } else { None },
                 0.0, // realtime_boost: 0.0 ici (appliqué via feedback_loop dans le handler)
+                weights,
             );
             let base_score = s.score;
 
@@ -459,6 +512,7 @@ impl RecommenderService {
         user_id: &str,
         profile: &UserProfile,
         mode: &RecommendMode,
+        banned_set: &std::collections::HashSet<String>,
     ) -> Result<(Vec<RawTweet>, SourceStats)> {
         let (window_trending, window_social, window_discover, window_viral) = match mode {
             RecommendMode::Trending  => ("6 hours",  "24 hours", "48 hours", "3 hours"),
@@ -484,6 +538,21 @@ impl RecommenderService {
             valid.join(",")
         };
 
+        // Clause SQL d'exclusion des hard-bans (vide si personne n'est banni)
+        let banned_exclusion = if banned_set.is_empty() {
+            String::new()
+        } else {
+            let valid_banned: Vec<String> = banned_set.iter()
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                .map(|id| format!("'{}'", id))
+                .collect();
+            if valid_banned.is_empty() {
+                String::new()
+            } else {
+                format!("AND t.user_id NOT IN ({})", valid_banned.join(","))
+            }
+        };
+
         let following_sql = format_uuid_list(following_list);
         let top_authors_sql = format_uuid_list(
             &profile.top_authors.iter().take(10).map(|(id, _)| id.clone()).collect::<Vec<_>>()
@@ -495,9 +564,9 @@ impl RecommenderService {
              FROM tweets t JOIN users u ON u.id = t.user_id \
              LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS likes_1h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '6 hours') AS likes_6h FROM tweet_likes WHERE tweet_id = t.id) lk ON true \
              LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS comments_1h FROM tweets WHERE parent_tweet_id = t.id AND deleted_at IS NULL) cm ON true \
-             WHERE {WHERE} AND t.created_at > NOW() - INTERVAL '{w}' AND t.user_id != '{uid}'::uuid \
+             WHERE {WHERE} AND t.created_at > NOW() - INTERVAL '{w}' AND t.user_id != '{uid}'::uuid {banned} \
              ORDER BY (COALESCE(t.view_count,0) + lk.likes_1h * 10) DESC LIMIT 400",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_trending, uid = user_id
+            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_trending, uid = user_id, banned = banned_exclusion
         );
 
         // Source 2 : Social graph
@@ -518,9 +587,9 @@ impl RecommenderService {
             "SELECT {COLS}, likes_1h, likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
              FROM tweets t JOIN users u ON u.id = t.user_id \
              LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS likes_1h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '6 hours') AS likes_6h FROM tweet_likes WHERE tweet_id = t.id) lk ON true \
-             WHERE {WHERE} AND t.created_at > NOW() - INTERVAL '{w}' AND t.user_id != '{uid}'::uuid \
+             WHERE {WHERE} AND t.created_at > NOW() - INTERVAL '{w}' AND t.user_id != '{uid}'::uuid {banned} \
              ORDER BY (lk.likes_1h * 10 + lk.likes_6h) DESC LIMIT 250",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_viral, uid = user_id
+            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_viral, uid = user_id, banned = banned_exclusion
         );
 
         // Source 4 : Discovery
@@ -532,9 +601,10 @@ impl RecommenderService {
         let sql_discovery = format!(
             "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
              FROM tweets t JOIN users u ON u.id = t.user_id \
-             WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '{w}' {excl} \
+             WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '{w}' {excl} {banned} \
              ORDER BY RANDOM() LIMIT 150",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_discover, excl = exclude_following_sql, uid = user_id
+            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_discover,
+            excl = exclude_following_sql, uid = user_id, banned = banned_exclusion
         );
 
         // Source 5 : Temporal
@@ -542,10 +612,11 @@ impl RecommenderService {
             "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
              FROM tweets t JOIN users u ON u.id = t.user_id \
              WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '72 hours' \
-             AND EXTRACT(HOUR FROM t.created_at) BETWEEN {h_lo} AND {h_hi} \
+             AND EXTRACT(HOUR FROM t.created_at) BETWEEN {h_lo} AND {h_hi} {banned} \
              ORDER BY t.created_at DESC LIMIT 150",
             COLS = TWEET_COLS, WHERE = WHERE_BASE,
-            h_lo = (active_hour - 1).max(0), h_hi = (active_hour + 1).min(23), uid = user_id
+            h_lo = (active_hour - 1).max(0), h_hi = (active_hour + 1).min(23),
+            uid = user_id, banned = banned_exclusion
         );
 
         // Source 6 : Influenceurs (verified or premium)
@@ -553,9 +624,9 @@ impl RecommenderService {
             "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
              FROM tweets t JOIN users u ON u.id = t.user_id \
              WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '48 hours' \
-             AND (u.verified = true OR u.premium = true) \
+             AND (u.verified = true OR u.premium = true) {banned} \
              ORDER BY t.created_at DESC LIMIT 150",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, uid = user_id
+            COLS = TWEET_COLS, WHERE = WHERE_BASE, uid = user_id, banned = banned_exclusion
         );
 
         // Source 7 : Personnalisé
@@ -565,9 +636,9 @@ impl RecommenderService {
             format!(
                 "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
                  FROM tweets t JOIN users u ON u.id = t.user_id \
-                 WHERE {WHERE} AND t.user_id IN ({ids}) AND t.created_at > NOW() - INTERVAL '7 days' \
+                 WHERE {WHERE} AND t.user_id IN ({ids}) AND t.created_at > NOW() - INTERVAL '7 days' {banned} \
                  ORDER BY t.created_at DESC LIMIT 200",
-                COLS = TWEET_COLS, WHERE = WHERE_BASE, ids = top_authors_sql
+                COLS = TWEET_COLS, WHERE = WHERE_BASE, ids = top_authors_sql, banned = banned_exclusion
             )
         };
 
@@ -576,9 +647,9 @@ impl RecommenderService {
             "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
              FROM tweets t JOIN users u ON u.id = t.user_id \
              WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '72 hours' \
-             AND (u.verified = true OR u.premium = true) \
+             AND (u.verified = true OR u.premium = true) {banned} \
              ORDER BY t.created_at DESC LIMIT 100",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, uid = user_id
+            COLS = TWEET_COLS, WHERE = WHERE_BASE, uid = user_id, banned = banned_exclusion
         );
 
         debug!("Running 8 parallel database queries for candidate sources...");

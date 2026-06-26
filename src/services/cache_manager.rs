@@ -12,7 +12,7 @@ const TWEET_SCORES_KEY: &str = "twitninf:tweet_scores";
 
 #[derive(Clone)]
 pub struct CacheManager {
-    conn: Arc<Mutex<MultiplexedConnection>>,
+    pub(crate) conn: Arc<Mutex<MultiplexedConnection>>,
 }
 
 impl CacheManager {

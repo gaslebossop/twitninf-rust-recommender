@@ -13,6 +13,7 @@ pub struct Config {
     pub redis_url: String,
     pub log_level: String,
     pub node_api_url: String,
+    pub admin_secret: String,
 }
 
 impl Config {
@@ -38,6 +39,8 @@ impl Config {
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
             node_api_url: env::var("NODE_API_URL")
                 .unwrap_or_else(|_| "http://localhost:3001".to_string()),
+            admin_secret: env::var("ADMIN_SECRET")
+                .unwrap_or_else(|_| "changeme-admin-secret".to_string()),
         })
     }
 

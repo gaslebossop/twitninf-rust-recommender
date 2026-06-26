@@ -17,6 +17,7 @@
 use chrono::Utc;
 use tracing::{debug, trace};
 
+use crate::admin::AlgoWeights;
 use crate::ml::ctr_predictor::{extract_features, CtrPredictor};
 use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
@@ -179,6 +180,94 @@ pub fn score_tweet(
     }
 }
 
+/// Variante de `score_tweet` avec poids de dimensions injectés (admin/auto-tuner).
+pub fn score_tweet_with_weights(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    author_feed_count: u32,
+    feed_tweets_so_far: &[ScoredTweet],
+    weights: &AlgoWeights,
+) -> ScoredTweet {
+    let (d1, ev_raw, ev_accel, viral_vel) = d1_engagement_velocity(tweet);
+    let d2 = d2_content_intelligence(tweet, profile);
+    let (d3, d_follow, d_mutual, d_second) = d3_social_graph(tweet, profile);
+    let d4 = d4_temporal_dynamics(tweet, profile);
+    let d5 = d5_behavioral_prediction(tweet, profile);
+    let d6 = d6_content_diversity(tweet, profile, feed_tweets_so_far);
+    let d7_raw = d7_viral_prediction(tweet);
+    let d7 = if tweet.source == TweetSource::Trending { (d7_raw * 1.2).clamp(0.0, 1.0) } else { d7_raw };
+    let d8 = d8_personalization_depth(tweet, profile);
+
+    let user_weights = UserDimensionWeights::for_profile(profile);
+    let user_weighted_score = user_weights.apply(d1, d2, d3, d4, d5, d6, d7, d8);
+
+    // Pondération avec les poids actifs (admin/auto-tuner) au lieu des constantes
+    let w = weights;
+    let global_score =
+          d1 * w.d1_engagement_velocity
+        + d2 * w.d2_content_intelligence
+        + d3 * w.d3_social_graph
+        + d4 * w.d4_temporal
+        + d5 * w.d5_behavioral
+        + d6 * w.d6_diversity
+        + d7 * w.d7_viral
+        + d8 * w.d8_personalization;
+    let base_score = global_score * 0.60 + user_weighted_score * 0.40;
+
+    let diversity_mult = diversity_multiplier(author_feed_count);
+    let mod_penalty    = moderation_penalty(tweet);
+    let source_bonus = match tweet.source {
+        TweetSource::SocialGraph  => 0.08,
+        TweetSource::Personalized => 0.05,
+        TweetSource::Viral        => 0.04,
+        TweetSource::Influencer   => 0.03,
+        TweetSource::Trending     => 0.04,
+        TweetSource::Temporal     => 0.02,
+        TweetSource::Discovery    => 0.01,
+        TweetSource::Quality      => 0.01,
+    };
+
+    let score_before_shadowban = ((base_score + source_bonus) * diversity_mult + mod_penalty)
+        .clamp(0.0, 1.0);
+
+    let enforcer = ShadowbanEnforcer::new();
+    let shadowban_mult = enforcer.multiplier(tweet.author_shadowban_level);
+    let score_after_shadowban = enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
+
+    let garbage_signals = GarbageContentDetector::new().detect(tweet);
+    let garbage_score   = garbage_signals.score();
+    let garbage_penalty = 1.0 - 0.60 * garbage_score;
+    let final_score = (score_after_shadowban * garbage_penalty).clamp(0.0, 1.0);
+
+    ScoredTweet {
+        tweet_id: tweet.id.clone(),
+        score: final_score,
+        breakdown: ScoreBreakdown {
+            engagement_velocity:    d1,
+            content_intelligence:   d2,
+            social_graph_dynamics:  d3,
+            temporal_dynamics:      d4,
+            behavioral_prediction:  d5,
+            content_diversity:      d6,
+            viral_prediction:       d7,
+            personalization_depth:  d8,
+            engagement_velocity_raw: ev_raw,
+            engagement_acceleration: ev_accel,
+            viral_velocity:         viral_vel,
+            direct_follow_boost:    d_follow,
+            mutual_follow_boost:    d_mutual,
+            second_degree_boost:    d_second,
+            diversity_multiplier:   diversity_mult,
+            moderation_penalty:     mod_penalty,
+            source_weight:          tweet.source_weight,
+            shadowban_multiplier:   shadowban_mult,
+            garbage_penalty,
+            has_media:              tweet.has_media,
+            final_score,
+        },
+    }
+}
+
 /// Version avec ML CTR Predictor (Phase 2) + realtime boost (Phase 3)
 /// `ctr`           = CtrPredictor optionnel (None → score classique)
 /// `realtime_boost`= delta feedback loop Redis, typiquement [-0.20, +0.20]
@@ -222,6 +311,48 @@ pub fn score_tweet_ml(
     if realtime_boost.abs() > 0.001 {
         scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
         debug!(realtime_boost, final = scored.score, "Phase 3: Realtime feedback applied");
+    }
+
+    scored.breakdown.final_score = scored.score;
+    scored
+}
+
+/// Variante ML avec poids de dimensions injectés (admin/auto-tuner).
+pub fn score_tweet_ml_with_weights(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    author_feed_count: u32,
+    feed_tweets_so_far: &[ScoredTweet],
+    ctr: Option<&CtrPredictor>,
+    realtime_boost: f64,
+    weights: &AlgoWeights,
+) -> ScoredTweet {
+    let mut scored = score_tweet_with_weights(tweet, profile, author_feed_count, feed_tweets_so_far, weights);
+
+    if let Some(ctr_model) = ctr {
+        let age_h = age_hours(tweet);
+        let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
+        let features = extract_features(
+            d1,
+            scored.breakdown.content_intelligence,
+            scored.breakdown.social_graph_dynamics,
+            scored.breakdown.temporal_dynamics,
+            scored.breakdown.behavioral_prediction,
+            scored.breakdown.content_diversity,
+            scored.breakdown.viral_prediction,
+            scored.breakdown.personalization_depth,
+            age_h,
+            tweet.source == TweetSource::Trending,
+            tweet.has_media,
+            tweet.author_followers,
+            ev_accel,
+        );
+        let ml_ctr = ctr_model.predict_ctr(&features);
+        scored.score = (scored.score * 0.60 + ml_ctr * 0.40).clamp(0.0, 1.0);
+    }
+
+    if realtime_boost.abs() > 0.001 {
+        scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
     }
 
     scored.breakdown.final_score = scored.score;
