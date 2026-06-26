@@ -6,19 +6,40 @@ use deadpool_postgres::Pool as PgPool;
 use tokio::join;
 use tracing::{info, warn, debug, trace};
 
-use crate::algorithm::scoring::{compute_feed_metrics, score_tweet};
+use crate::algorithm::scoring::{compute_feed_metrics, score_tweet, score_tweet_ml};
 use crate::algorithm::trending::trending_score;
+use crate::bandit::bandit_select;
+use crate::ml::ctr_predictor::CtrPredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
 
 pub struct RecommenderService {
     pg: PgPool,
     cache: CacheManager,
+    ctr_predictor: CtrPredictor,
 }
 
 impl RecommenderService {
     pub fn new(pg: PgPool, cache: CacheManager) -> Self {
-        Self { pg, cache }
+        Self { pg, cache, ctr_predictor: CtrPredictor::new() }
+    }
+
+    pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
+        let ctr_predictor = CtrPredictor::load_or_default().await;
+        Self { pg, cache, ctr_predictor }
+    }
+
+    /// Enregistre un click/skip et met à jour le modèle ML en temps réel
+    pub fn record_ctr_event(
+        &self,
+        features: [f64; 14],
+        clicked: bool,
+    ) {
+        self.ctr_predictor.record_interaction(features, clicked);
+        let (samples, global_ctr) = self.ctr_predictor.stats();
+        if samples % 100 == 0 {
+            info!(samples, global_ctr, "CTR model checkpoint — 100 new samples");
+        }
     }
 
     pub async fn recommend(&self, req: &RecommendRequest) -> Result<RecommendResponse> {
@@ -158,11 +179,19 @@ impl RecommenderService {
     fn score_all(&self, tweets: &[RawTweet], profile: &UserProfile, mode: &RecommendMode) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
-        trace!(mode = ?mode, "Scoring all tweets with mode adjustments");
+        let (ctr_samples, _) = self.ctr_predictor.stats();
+        // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
+        let use_ml = ctr_samples >= 200;
+        trace!(mode = ?mode, use_ml, ctr_samples, "Scoring all tweets with mode adjustments");
 
         for (idx, tweet) in tweets.iter().enumerate() {
             let ac = *author_count.get(&tweet.user_id).unwrap_or(&0);
-            let mut s = score_tweet(tweet, profile, ac, &scored_feed);
+            // Phase 2+3: score_tweet_ml intègre user weights + CTR predictor + realtime boost
+            let mut s = score_tweet_ml(
+                tweet, profile, ac, &scored_feed,
+                if use_ml { Some(&self.ctr_predictor) } else { None },
+                0.0, // realtime_boost: 0.0 ici (appliqué via feedback_loop dans le handler)
+            );
             let base_score = s.score;
 
             match mode {
@@ -215,6 +244,25 @@ impl RecommenderService {
 
         let top_scores: Vec<_> = scored_feed.iter().take(3).map(|s| (&s.tweet_id, s.score)).collect();
         debug!("Top 3 final scores: {:?}", top_scores);
+
+        // Phase 3: Contextual Bandit — réorganise le feed (80% exploit / 20% explore)
+        // Seulement en mode ForYou/Feed, pas en Trending (déjà ordonné par trending score)
+        if matches!(mode, RecommendMode::ForYou | RecommendMode::Feed) {
+            let selection = bandit_select(&scored_feed, tweets, profile, scored_feed.len());
+            debug!(
+                exploit = selection.exploit_count,
+                explore = selection.explore_count,
+                "Phase 3: Bandit reordering applied (80% exploit + 20% explore)"
+            );
+            // Réordonner scored_feed selon l'ordre du bandit
+            let mut id_to_scored: HashMap<String, ScoredTweet> = scored_feed
+                .into_iter()
+                .map(|s| (s.tweet_id.clone(), s))
+                .collect();
+            return selection.tweet_ids.into_iter()
+                .filter_map(|id| id_to_scored.remove(&id))
+                .collect();
+        }
 
         scored_feed
     }
