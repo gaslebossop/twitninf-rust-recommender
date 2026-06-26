@@ -2,15 +2,15 @@
 // SCORING WEIGHTS & CALIBRATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Dimension weights (sum = 1.0)
-pub const W_D1_ENGAGEMENT_VELOCITY: f64 = 0.25;
-pub const W_D2_CONTENT_INTELLIGENCE: f64 = 0.20;
+// Dimension weights (sum = 1.0) — Phase 1 CTR Optimization
+pub const W_D1_ENGAGEMENT_VELOCITY: f64 = 0.32; // +0.07: meilleur prédicteur CTR
+pub const W_D2_CONTENT_INTELLIGENCE: f64 = 0.18; // -0.02
 pub const W_D3_SOCIAL_GRAPH: f64 = 0.15;
 pub const W_D4_TEMPORAL: f64 = 0.10;
-pub const W_D5_BEHAVIORAL: f64 = 0.10;
-pub const W_D6_DIVERSITY: f64 = 0.08;
+pub const W_D5_BEHAVIORAL: f64 = 0.08; // -0.02
+pub const W_D6_DIVERSITY: f64 = 0.06; // -0.02
 pub const W_D7_VIRAL: f64 = 0.07;
-pub const W_D8_PERSONALIZATION: f64 = 0.05;
+pub const W_D8_PERSONALIZATION: f64 = 0.04; // -0.01
 
 // ─── D1 : Engagement Velocity ───────────────────────────────────────────────
 
@@ -55,8 +55,8 @@ pub const D3_AUTHOR_INFLUENCE_WEIGHT: f64 = 0.08;
 
 // ─── D4 : Temporal Dynamics ────────────────────────────────────────────────
 
-pub const RECENCY_HALF_LIFE_HOURS: f64 = 6.0;
-pub const RECENCY_DECAY_RATE: f64 = 0.115; // ln(2)/6h
+pub const RECENCY_HALF_LIFE_HOURS: f64 = 4.0; // Phase 1: 6h → 4h pour contenu plus frais
+pub const RECENCY_DECAY_RATE: f64 = 0.173; // ln(2)/4h ≈ 0.173
 
 pub const D4_RECENCY_WEIGHT: f64 = 0.45;
 pub const D4_HOUR_MATCH_WEIGHT: f64 = 0.25;
@@ -173,7 +173,7 @@ pub const RECOMMENDATION_REQUEST_TIMEOUT_SECS: u64 = 30;
 // CANDIDATE COLLECTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const CANDIDATE_LIMIT_TRENDING: usize = 400;
+pub const CANDIDATE_LIMIT_TRENDING: usize = 600; // Phase 1: +50% (était 400)
 pub const CANDIDATE_LIMIT_SOCIAL: usize = 300;
 pub const CANDIDATE_LIMIT_VIRAL: usize = 250;
 pub const CANDIDATE_LIMIT_DISCOVERY: usize = 150;
