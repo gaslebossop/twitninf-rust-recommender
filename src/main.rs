@@ -1,3 +1,4 @@
+mod admin;     // Noeud admin : bans, shadowbans, contrôle algo
 mod ads;       // Targeted advertising
 mod algorithm;
 mod bandit;    // Phase 3: Contextual Bandit
@@ -7,7 +8,7 @@ mod constants;
 mod error;
 mod handlers;
 mod middleware;
-mod ml;        // Phase 2: ML CTR Predictor
+mod ml;        // Phase 2: ML CTR Predictor + AutoTuner
 mod models;
 mod services;
 mod utils;
@@ -32,11 +33,17 @@ use tracing_subscriber::EnvFilter;
 
 use handlers::{
     AppState,
+    admin::{
+        admin_algo_stats_handler, admin_ban_handler, admin_filters_handler,
+        admin_get_weights_handler, admin_reset_weights_handler, admin_set_shadowban_handler,
+        admin_set_weights_handler, admin_unban_handler,
+    },
     health::health_handler,
     invalidate::invalidate_handler,
     recommendations::recommend_handler,
     tracking::track_handler,
 };
+use ml::AutoTuner;
 use services::{cache_manager::CacheManager, recommender::RecommenderService};
 
 #[tokio::main]
@@ -73,12 +80,17 @@ async fn main() -> Result<()> {
     info!("Redis connected");
 
     // Construire le state partagé
-    let recommender = Arc::new(RecommenderService::new(pg_pool.clone(), cache.clone()));
+    let auto_tuner  = Arc::new(AutoTuner::new());
+    let recommender = Arc::new(RecommenderService::new_with_tuner(
+        pg_pool.clone(), cache.clone(), auto_tuner.clone(),
+    ));
 
     let state = AppState {
         pg: pg_pool,
         cache,
         recommender,
+        auto_tuner,
+        admin_secret: cfg.admin_secret.clone(),
         start_time: SystemTime::now(),
     };
 
@@ -88,6 +100,15 @@ async fn main() -> Result<()> {
         .route("/recommendations", post(recommend_handler))
         .route("/track", post(track_handler))
         .route("/invalidate", post(invalidate_handler))
+        // ── Admin node ──────────────────────────────────────────────────────
+        .route("/admin/filters",         get(admin_filters_handler))
+        .route("/admin/shadowban",       post(admin_set_shadowban_handler))
+        .route("/admin/ban",             post(admin_ban_handler))
+        .route("/admin/unban",           post(admin_unban_handler))
+        .route("/admin/algo/weights",    get(admin_get_weights_handler))
+        .route("/admin/algo/weights",    post(admin_set_weights_handler))
+        .route("/admin/algo/weights/reset", post(admin_reset_weights_handler))
+        .route("/admin/algo/stats",      get(admin_algo_stats_handler))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

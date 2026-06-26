@@ -177,6 +177,13 @@ impl CtrPredictor {
         let m = self.0.read().unwrap();
         (m.samples_seen, m.global_ctr())
     }
+
+    /// Retourne les 8 premiers poids (D1-D8) pour l'auto-tuner
+    pub fn dimension_weights_snapshot(&self) -> [f64; 8] {
+        let m = self.0.read().unwrap();
+        let w = &m.weights;
+        [w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]
+    }
 }
 
 #[inline]
