@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use redis::AsyncCommands;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::services::cache_manager::CacheManager;
 use crate::shadowban::ShadowbanLevel;
@@ -86,7 +86,14 @@ impl CacheManager {
                     "monitoring"  => ShadowbanLevel::Monitoring,
                     "suppressed"  => ShadowbanLevel::Suppressed,
                     "ghosted"     => ShadowbanLevel::Ghosted,
-                    _             => ShadowbanLevel::Clean,
+                    unknown => {
+                        // Données Redis corrompues ou valeur future inconnue.
+                        // On traite comme Suppressed par sécurité plutôt que Clean,
+                        // pour ne pas lever accidentellement un ban.
+                        error!(user_id = %uid, value = unknown,
+                               "Unknown shadowban level in Redis — defaulting to Suppressed");
+                        ShadowbanLevel::Suppressed
+                    }
                 };
                 map.insert(uid.clone(), level);
             }

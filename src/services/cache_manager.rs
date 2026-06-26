@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -9,6 +9,7 @@ use crate::models::UserProfile;
 const TTL_SEEN_TWEETS: u64 = 86400;
 const TTL_USER_PROFILE: u64 = 300;
 const TWEET_SCORES_KEY: &str = "twitninf:tweet_scores";
+const MAX_TWEET_SCORE: f64 = 500.0; // plafond absolu pour éviter l'inflation Redis
 
 #[derive(Clone)]
 pub struct CacheManager {
@@ -65,8 +66,17 @@ impl CacheManager {
     // ─── Scores de tweets ─────────────────────────────────────────────────────
 
     pub async fn update_tweet_score(&self, tweet_id: &str, weight: f64) -> Result<f64> {
+        // Valider que tweet_id est un UUID avant de l'utiliser comme membre Redis
+        if uuid::Uuid::parse_str(tweet_id).is_err() {
+            bail!("tweet_id must be a valid UUID");
+        }
         let mut c = self.conn.lock().await;
         let new_score: f64 = c.zincr(TWEET_SCORES_KEY, tweet_id, weight).await?;
+        // Plafonner le score pour éviter l'inflation illimitée via fausses interactions
+        if new_score > MAX_TWEET_SCORE {
+            let _: Result<(), _> = c.zadd(TWEET_SCORES_KEY, tweet_id, MAX_TWEET_SCORE).await;
+            return Ok(MAX_TWEET_SCORE);
+        }
         Ok(new_score)
     }
 
