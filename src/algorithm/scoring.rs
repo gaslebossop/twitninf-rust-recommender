@@ -22,15 +22,16 @@ use crate::models::{
     UserProfile, UserType,
 };
 
-// ─── Poids globaux des 12 dimensions ─────────────────────────────────────────
-const W_D1_ENGAGEMENT_VELOCITY: f64  = 0.25;
-const W_D2_CONTENT_INTELLIGENCE: f64 = 0.20;
+// ─── Poids globaux des 8 dimensions (Phase 1 CTR Optimization) ───────────────
+// D1 boosted: engagement velocity est le meilleur prédicteur de CTR
+const W_D1_ENGAGEMENT_VELOCITY: f64  = 0.32; // +0.07 vs baseline
+const W_D2_CONTENT_INTELLIGENCE: f64 = 0.18; // -0.02
 const W_D3_SOCIAL_GRAPH: f64         = 0.15;
 const W_D4_TEMPORAL: f64             = 0.10;
-const W_D5_BEHAVIORAL: f64           = 0.10;
-const W_D6_DIVERSITY: f64            = 0.08;
+const W_D5_BEHAVIORAL: f64           = 0.08; // -0.02
+const W_D6_DIVERSITY: f64            = 0.06; // -0.02 (acceptable)
 const W_D7_VIRAL: f64                = 0.07;
-const W_D8_PERSONALIZATION: f64      = 0.05;
+const W_D8_PERSONALIZATION: f64      = 0.04; // -0.01
 // Total = 1.00
 
 /// Score final d'un tweet, toutes dimensions combinées.
@@ -68,8 +69,14 @@ pub fn score_tweet(
     trace!(d6, "D6 Content Diversity");
 
     // ── D7 : Viral Prediction ────────────────────────────────────────────────
-    let d7 = d7_viral_prediction(tweet);
-    trace!(d7, "D7 Viral Prediction");
+    let d7_raw = d7_viral_prediction(tweet);
+    // Phase 1: boost trending tweets de 20% en D7 (potentiel viral prouvé)
+    let d7 = if tweet.source == TweetSource::Trending {
+        (d7_raw * 1.2).clamp(0.0, 1.0)
+    } else {
+        d7_raw
+    };
+    trace!(d7, d7_raw, source = ?tweet.source, "D7 Viral Prediction (with trending boost)");
 
     // ── D8 : Personalization Depth ───────────────────────────────────────────
     let d8 = d8_personalization_depth(tweet, profile);
@@ -95,12 +102,13 @@ pub fn score_tweet(
     trace!(mod_penalty, report_count = tweet.report_count, "Moderation penalty");
 
     // ── Mod C : Source weight (bonus selon la source de collecte) ────────────
+    // Phase 1: source_bonus trending doublé (0.02 → 0.04) pour booster le CTR
     let source_bonus = match tweet.source {
         TweetSource::SocialGraph  => 0.08,  // boost fort : personne suivie
         TweetSource::Personalized => 0.05,
         TweetSource::Viral        => 0.04,
         TweetSource::Influencer   => 0.03,
-        TweetSource::Trending     => 0.02,
+        TweetSource::Trending     => 0.04,  // Phase 1: +0.02 (était 0.02)
         TweetSource::Temporal     => 0.02,
         TweetSource::Discovery    => 0.01,
         TweetSource::Quality      => 0.01,
@@ -158,8 +166,18 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
            shares = t.share_count, bookmarks = t.bookmark_count, views = t.view_count,
            eng_total, "D1 Raw engagement total");
 
-    // Vélocité = engagement / âge pondéré logarithmiquement
-    let velocity_raw = eng_total / (1.0 + (age_h / 6.0).ln().max(0.0) * 2.0);
+    // Phase 1: boost multiplicatif pour les tweets très récents (CTR signal fort)
+    let recency_boost = if age_h < 0.5 {
+        1.5 // tweets < 30 min : engagement en cours → CTR maximal
+    } else if age_h < 2.0 {
+        1.3 // tweets < 2h : momentum fort
+    } else {
+        1.0
+    };
+    trace!(recency_boost, age_h, "D1 Recency boost multiplier (Phase 1)");
+
+    // Vélocité = engagement / âge pondéré logarithmiquement + recency boost
+    let velocity_raw = (eng_total / (1.0 + (age_h / 6.0).ln().max(0.0) * 2.0)) * recency_boost;
     trace!(velocity_raw, "D1 Raw velocity (engagement/age)");
 
     // Engagement récent (1h) : signal d'accélération
@@ -330,9 +348,9 @@ fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile) -> f64 {
     let age_h = age_hours(t);
     trace!(age_h, "D4 Tweet age in hours");
 
-    // Récence : demi-vie de 6h (inspiration Twitter), décroissance exponentielle
-    let recency = (-0.115 * age_h).exp(); // ln(2)/6h ≈ 0.115
-    trace!(recency, "D4 Recency (6h half-life)");
+    // Phase 1: demi-vie réduite de 6h → 4h pour favoriser contenu frais (+CTR)
+    let recency = (-0.173 * age_h).exp(); // ln(2)/4h ≈ 0.173
+    trace!(recency, "D4 Recency (4h half-life, Phase 1 optimization)");
 
     // Alignement heure d'activité utilisateur
     let pub_hour = t.created_at.format("%H").to_string().parse::<u32>().unwrap_or(12) as usize;
