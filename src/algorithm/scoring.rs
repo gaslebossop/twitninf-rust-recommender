@@ -23,6 +23,7 @@ use crate::models::{
     ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
     UserProfile, UserType,
 };
+use crate::shadowban::ShadowbanEnforcer;
 
 // ─── Poids globaux des 8 dimensions (Phase 1 CTR Optimization) ───────────────
 // D1 boosted: engagement velocity est le meilleur prédicteur de CTR
@@ -125,9 +126,16 @@ pub fn score_tweet(
     };
     trace!(source_bonus, source = ?tweet.source, "Source bonus");
 
-    let final_score = ((base_score + source_bonus) * diversity_mult + mod_penalty)
+    let score_before_shadowban = ((base_score + source_bonus) * diversity_mult + mod_penalty)
         .clamp(0.0, 1.0);
-    debug!(final_score, base_score, source_bonus, diversity_mult, mod_penalty, "━━━ FINAL SCORE ━━━");
+
+    // ── Mod D : Shadowban — suppression graduelle des comptes poubelle ────────
+    let enforcer = ShadowbanEnforcer::new();
+    let shadowban_mult = enforcer.multiplier(tweet.author_shadowban_level);
+    let final_score = enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
+    debug!(final_score, score_before_shadowban, shadowban_mult,
+           level = tweet.author_shadowban_level.label(),
+           "━━━ FINAL SCORE (with shadowban Mod D) ━━━");
 
     ScoredTweet {
         tweet_id: tweet.id.clone(),
@@ -150,6 +158,7 @@ pub fn score_tweet(
             diversity_multiplier:   diversity_mult,
             moderation_penalty:     mod_penalty,
             source_weight:          tweet.source_weight,
+            shadowban_multiplier:   shadowban_mult,
             final_score,
         },
     }

@@ -1,6 +1,7 @@
 mod ads;       // Targeted advertising
 mod algorithm;
 mod bandit;    // Phase 3: Contextual Bandit
+mod shadowban; // Suppression des comptes contenu poubelle
 mod config;
 mod constants;
 mod error;
