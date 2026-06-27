@@ -57,6 +57,29 @@ pub async fn track_handler(
             }
             state.cache.invalidate_recommendations(&req.user_id).await;
 
+            // Alimente le modèle ML CTR avec un vecteur de features simplifié
+            // basé sur le type d'interaction (clicked = engagement positif)
+            let clicked = total_weight > 0.0;
+            let dwell_normalized = req.dwell_ms.map(|ms| ms.min(MAX_DWELL_MS) as f64 / MAX_DWELL_MS as f64).unwrap_or(0.0);
+            let is_strong = total_weight >= 3.5; // comment, share, retweet
+            let ctr_features: [f64; 14] = [
+                new_score.min(10.0) / 10.0, // d1: score normalisé comme proxy engagement
+                if is_strong { 1.0 } else { 0.5 }, // d2: content quality proxy
+                0.5,                          // d3: social graph (inconnu)
+                0.5,                          // d4: temporal (inconnu)
+                dwell_normalized,             // d5: behavioral (dwell time)
+                0.5,                          // d6: diversity
+                0.5,                          // d7: viral
+                0.5,                          // d8: personalization
+                0.5,                          // age_h normalisé
+                0.0,                          // is_trending
+                0.0,                          // has_media
+                0.5,                          // log(followers)/20
+                1.0,                          // is_recent
+                dwell_normalized,             // engagement_acceleration
+            ];
+            state.recommender.record_ctr_event(ctr_features, clicked);
+
             info!(
                 user_id = %req.user_id,
                 tweet_id = %req.tweet_id,

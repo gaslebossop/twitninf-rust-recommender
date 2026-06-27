@@ -282,3 +282,163 @@ pub async fn admin_algo_stats_handler(
         algorithm_version: "2.1.0 — 8D + ML CTR + bandit + garbage filter + admin node",
     })))
 }
+
+// ─── GET /admin/logs ──────────────────────────────────────────────────────────
+
+pub async fn admin_logs_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    // Essaie les deux noms de service (nouveau puis ancien)
+    let service_names = ["rust-recommender", "twitninf-rust-recommender"];
+    let mut raw_logs: Vec<serde_json::Value> = vec![];
+
+    for service in &service_names {
+        let output = std::process::Command::new("journalctl")
+            .args(&["-u", service, "-n", "100", "--no-pager", "-o", "json"])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let parsed: Vec<serde_json::Value> = stdout.lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                if !parsed.is_empty() {
+                    raw_logs = parsed;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Transformer en format lisible: extraire le message depuis la structure journald/tracing
+    let logs: Vec<serde_json::Value> = raw_logs.into_iter()
+        .rev() // plus récents en premier
+        .filter_map(|entry| {
+            let raw_msg = entry.get("MESSAGE")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            if raw_msg.is_empty() { return None; }
+
+            // Priorité journald → niveau
+            let priority = entry.get("PRIORITY").and_then(|p| p.as_str()).unwrap_or("6");
+            let default_level = match priority {
+                "0"|"1"|"2"|"3" => "ERROR",
+                "4"|"5"         => "WARN",
+                "7"             => "DEBUG",
+                _               => "INFO",
+            };
+
+            // Timestamp depuis __REALTIME_TIMESTAMP (microsecondes)
+            let timestamp = entry.get("__REALTIME_TIMESTAMP")
+                .and_then(|t| t.as_str())
+                .and_then(|t| t.parse::<u64>().ok())
+                .map(|us| {
+                    let secs = us / 1_000_000;
+                    let ms = (us % 1_000_000) / 1000;
+                    format!("{}.{:03}", secs, ms)
+                })
+                .unwrap_or_else(|| "-".to_string());
+
+            // Tenter de parser le JSON tracing dans MESSAGE
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_msg) {
+                let level = parsed.get("level").and_then(|l| l.as_str()).unwrap_or(default_level);
+                let ts = parsed.get("timestamp").and_then(|t| t.as_str()).unwrap_or(&timestamp);
+                let fields = parsed.get("fields").cloned().unwrap_or(json!({}));
+                let main_msg = fields.get("message").and_then(|m| m.as_str()).unwrap_or("");
+
+                // Extraire les champs supplémentaires (tout sauf "message")
+                let extras: Vec<String> = fields.as_object()
+                    .map(|obj| obj.iter()
+                        .filter(|(k, _)| *k != "message")
+                        .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or(&v.to_string())))
+                        .collect())
+                    .unwrap_or_default();
+
+                let full_msg = if extras.is_empty() {
+                    main_msg.to_string()
+                } else {
+                    format!("{} {}", main_msg, extras.join(" "))
+                };
+
+                if full_msg.trim().is_empty() { return None; }
+
+                Some(json!({
+                    "timestamp": ts,
+                    "level": level,
+                    "message": full_msg,
+                    "target": parsed.get("target").and_then(|t| t.as_str()).unwrap_or(""),
+                }))
+            } else {
+                // Message texte plain
+                if raw_msg.contains("Address already in use") { return None; } // filtrer le bruit du crash loop
+                Some(json!({
+                    "timestamp": timestamp,
+                    "level": default_level,
+                    "message": raw_msg,
+                    "target": "",
+                }))
+            }
+        })
+        .take(50)
+        .collect();
+
+    let count = logs.len();
+    if count == 0 {
+        return (StatusCode::OK, Json(json!({
+            "logs": [{"timestamp": "-", "level": "WARN", "message": "No logs available", "target": ""}],
+            "count": 0,
+        })));
+    }
+
+    (StatusCode::OK, Json(json!({
+        "logs": logs,
+        "count": logs.len(),
+    })))
+}
+
+// ─── GET /admin/data ──────────────────────────────────────────────────────────
+
+pub async fn admin_data_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    let (ctr_samples, global_ctr) = state.recommender.ctr_stats();
+    let admin_override = state.cache.admin_load_weights().await;
+    let auto_tuned = state.auto_tuner.is_auto_tuned() && admin_override.is_none();
+    let weights = state.auto_tuner.active_weights(admin_override.as_ref());
+    let ml_active = ctr_samples >= 200;
+
+    // Récupère les listes de bans
+    let shadowbanned = state.cache.admin_get_shadowbanned_users().await;
+    let hard_banned = state.cache.admin_get_banned_users().await;
+
+    (StatusCode::OK, Json(json!({
+        "algorithm": {
+            "ctr_samples": ctr_samples,
+            "global_ctr": global_ctr,
+            "ml_active": ml_active,
+            "auto_tuned": auto_tuned,
+            "weights": weights,
+        },
+        "filters": {
+            "shadowbanned_count": shadowbanned.len(),
+            "hard_banned_count": hard_banned.len(),
+            "shadowbanned": shadowbanned,
+            "hard_banned": hard_banned,
+        },
+        "uptime": state.start_time.elapsed()
+            .map(|d| format!("{:.0}s", d.as_secs_f64()))
+            .unwrap_or_else(|_| "unknown".to_string()),
+    })))
+}
+
+// ─── GET /admin/panel ─────────────────────────────────────────────────────────
+
+pub use crate::admin::ui::admin_ui_handler;
