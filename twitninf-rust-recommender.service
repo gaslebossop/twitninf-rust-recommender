@@ -22,6 +22,8 @@ Environment=REDIS_URL=redis://:linecraft_redis_2024@127.0.0.1:6379
 Environment=LOG_LEVEL=debug
 Environment=DB_POOL_SIZE=10
 Environment=RUST_LOG=twitninf_recommender=debug
+Environment=ADMIN_SECRET=admin-panel-secret-4a8f2b9e7c3d1a6f5e2b8c4d9a3f7e1b
+Environment=INTERNAL_SECRET=internal-service-secret-x9z7w5v3u1t6r4q2p8o6n5m3l2k9j8h7
 
 # Sécurité
 NoNewPrivileges=true

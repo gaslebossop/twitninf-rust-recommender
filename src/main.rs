@@ -37,7 +37,8 @@ use handlers::{
     admin::{
         admin_algo_stats_handler, admin_ban_handler, admin_filters_handler,
         admin_get_weights_handler, admin_reset_weights_handler, admin_set_shadowban_handler,
-        admin_set_weights_handler, admin_unban_handler,
+        admin_set_weights_handler, admin_unban_handler, admin_ui_handler,
+        admin_logs_handler, admin_data_handler,
     },
     health::health_handler,
     invalidate::invalidate_handler,
@@ -83,15 +84,18 @@ async fn main() -> Result<()> {
         start_time: SystemTime::now(),
     };
 
-    // CORS : restreint à l'origine du backend Node.js uniquement.
-    // Ce service est un microservice interne — il ne doit pas être accessible
-    // depuis des origines web arbitraires.
-    let allowed_origin = cfg.node_api_url
+    // CORS : autorise le backend Node.js et l'IP publique (pour le panel admin)
+    let node_origin = cfg.node_api_url
         .parse::<HeaderValue>()
         .unwrap_or_else(|_| HeaderValue::from_static("http://localhost:3001"));
 
+    let public_origin = std::env::var("PUBLIC_ORIGIN")
+        .unwrap_or_else(|_| "http://51.210.11.74".to_string())
+        .parse::<HeaderValue>()
+        .unwrap_or_else(|_| HeaderValue::from_static("http://51.210.11.74"));
+
     let cors = CorsLayer::new()
-        .allow_origin(allowed_origin)
+        .allow_origin([node_origin, public_origin])
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -108,6 +112,7 @@ async fn main() -> Result<()> {
         .route("/track",           post(track_handler))
         .route("/invalidate",      post(invalidate_handler))
         // ── Admin node ────────────────────────────────────────────────────────
+        .route("/admin/panel",                get(admin_ui_handler))
         .route("/admin/filters",              get(admin_filters_handler))
         .route("/admin/shadowban",            post(admin_set_shadowban_handler))
         .route("/admin/ban",                  post(admin_ban_handler))
@@ -116,6 +121,8 @@ async fn main() -> Result<()> {
         .route("/admin/algo/weights",         post(admin_set_weights_handler))
         .route("/admin/algo/weights/reset",   post(admin_reset_weights_handler))
         .route("/admin/algo/stats",           get(admin_algo_stats_handler))
+        .route("/admin/logs",                 get(admin_logs_handler))
+        .route("/admin/data",                 get(admin_data_handler))
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
