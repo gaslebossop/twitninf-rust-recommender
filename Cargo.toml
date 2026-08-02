@@ -11,7 +11,7 @@ path = "src/main.rs"
 # HTTP server
 axum = { version = "0.7", features = ["json", "query", "tracing"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "catch-panic"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -51,4 +51,7 @@ dotenvy = "0.15"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# `panic = "abort"` a été retiré : le service est un serveur multi-tenant, et
+# un panic dans le scoring d'UN tweet (indexation, comparaison NaN…) tuait le
+# processus entier, donc le feed de tout le monde. Avec unwind, `CatchPanicLayer`
+# transforme ce panic en 500 sur la seule requête concernée.

@@ -161,6 +161,7 @@ mod tests {
             tweet_id: id.to_string(),
             score,
             breakdown: Default::default(),
+            ctr_features: None,
         }
     }
 

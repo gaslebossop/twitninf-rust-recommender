@@ -32,6 +32,7 @@ pub struct SetWeightsRequest {
     pub d6: Option<f64>,
     pub d7: Option<f64>,
     pub d8: Option<f64>,
+    pub d9: Option<f64>,
 }
 
 // ─── Réponses admin ───────────────────────────────────────────────────────────
@@ -73,25 +74,36 @@ pub struct AlgoWeights {
     pub d6_diversity: f64,
     pub d7_viral: f64,
     pub d8_personalization: f64,
+    /// D9 — compréhension du contenu par le LLM annotateur.
+    /// Absent des poids persistés avant son introduction : `serde(default)`
+    /// évite qu'une config déjà enregistrée en Redis devienne illisible.
+    #[serde(default = "default_d9")]
+    pub d9_llm_understanding: f64,
 }
+
+fn default_d9() -> f64 { 0.10 }
 
 impl Default for AlgoWeights {
     fn default() -> Self {
+        // D9 est financée par un prélèvement sur D1/D2 plutôt que par une
+        // inflation du total : la somme reste à 1.0, sinon tous les scores
+        // dérivent vers le haut et les seuils calibrés ailleurs sautent.
         Self {
-            d1_engagement_velocity:  0.32,
-            d2_content_intelligence: 0.18,
+            d1_engagement_velocity:  0.27,
+            d2_content_intelligence: 0.14,
             d3_social_graph:         0.15,
             d4_temporal:             0.10,
             d5_behavioral:           0.08,
             d6_diversity:            0.06,
             d7_viral:                0.07,
-            d8_personalization:      0.04,
+            d8_personalization:      0.03,
+            d9_llm_understanding:    0.10,
         }
     }
 }
 
 impl AlgoWeights {
-    pub fn as_array(&self) -> [f64; 8] {
+    pub fn as_array(&self) -> [f64; 9] {
         [
             self.d1_engagement_velocity,
             self.d2_content_intelligence,
@@ -101,6 +113,7 @@ impl AlgoWeights {
             self.d6_diversity,
             self.d7_viral,
             self.d8_personalization,
+            self.d9_llm_understanding,
         ]
     }
 }
