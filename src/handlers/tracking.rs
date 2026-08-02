@@ -1,8 +1,9 @@
 use axum::{extract::State, http::{HeaderMap, StatusCode}, Json};
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::handlers::AppState;
+use crate::experiments;
 use crate::models::{TrackInteractionRequest, TrackResponse};
 
 const MAX_DWELL_MS: u32 = 60_000; // 1 minute max — rejeter les valeurs absurdes
@@ -37,6 +38,14 @@ pub async fn track_handler(
         return (StatusCode::BAD_REQUEST,
             Json(json!({ "success": false, "error": "tweet_id must be a valid UUID" })));
     }
+    if req.experiment_id.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_err()) {
+        return (StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": "experiment_id must be a valid UUID" })));
+    }
+    if req.variant_id.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_err()) {
+        return (StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": "variant_id must be a valid UUID" })));
+    }
 
     let weight = req.interaction_type.weight();
 
@@ -50,6 +59,33 @@ pub async fn track_handler(
 
     let total_weight = weight + dwell_bonus;
 
+    // Le suivi A/B est persistant en PostgreSQL et ne dépend pas de Redis.
+    // Une panne du cache ne doit donc pas faire perdre l'échantillon.
+    match experiments::record_interaction(
+        &state.pg,
+        &req.user_id,
+        &req.tweet_id,
+        req.variant_id.as_deref(),
+        total_weight,
+        req.interaction_type == crate::models::InteractionType::View,
+    ).await {
+        Ok(Some(winner)) => {
+            info!(
+                experiment_id = %winner.experiment_id,
+                variant_id = %winner.variant_id,
+                "A/B winner promoted"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                tweet_id = %req.tweet_id,
+                error = ?error,
+                "A/B tracking failed without blocking NeuralRank tracking"
+            );
+        }
+    }
+
     match state.cache.update_tweet_score(&req.tweet_id, total_weight).await {
         Ok(new_score) => {
             if total_weight > 0.0 {
@@ -57,28 +93,30 @@ pub async fn track_handler(
             }
             state.cache.invalidate_recommendations(&req.user_id).await;
 
-            // Alimente le modèle ML CTR avec un vecteur de features simplifié
-            // basé sur le type d'interaction (clicked = engagement positif)
-            let clicked = total_weight > 0.0;
-            let dwell_normalized = req.dwell_ms.map(|ms| ms.min(MAX_DWELL_MS) as f64 / MAX_DWELL_MS as f64).unwrap_or(0.0);
-            let is_strong = total_weight >= 3.5; // comment, share, retweet
-            let ctr_features: [f64; 14] = [
-                new_score.min(10.0) / 10.0, // d1: score normalisé comme proxy engagement
-                if is_strong { 1.0 } else { 0.5 }, // d2: content quality proxy
-                0.5,                          // d3: social graph (inconnu)
-                0.5,                          // d4: temporal (inconnu)
-                dwell_normalized,             // d5: behavioral (dwell time)
-                0.5,                          // d6: diversity
-                0.5,                          // d7: viral
-                0.5,                          // d8: personalization
-                0.5,                          // age_h normalisé
-                0.0,                          // is_trending
-                0.0,                          // has_media
-                0.5,                          // log(followers)/20
-                1.0,                          // is_recent
-                dwell_normalized,             // engagement_acceleration
-            ];
-            state.recommender.record_ctr_event(ctr_features, clicked);
+            // Alimente le modèle CTR avec le vecteur de features réellement
+            // utilisé pour classer ce tweet dans le feed de ce lecteur. On ne
+            // l'invente plus ici : on le relit depuis l'impression mémorisée.
+            // Pas d'impression retrouvée (feed servi avant ce correctif, TTL
+            // dépassé, ou interaction hors feed) → on n'entraîne pas, plutôt
+            // que d'entraîner sur des valeurs fabriquées.
+            match req.interaction_type.ctr_label() {
+                Some(clicked) => {
+                    match state.cache.take_impression(&req.user_id, &req.tweet_id).await {
+                        Some(features) => {
+                            state.recommender.record_ctr_event(&features, clicked);
+                        }
+                        None => {
+                            debug!(user_id = %req.user_id, tweet_id = %req.tweet_id,
+                                   "CTR: impression absente, entraînement ignoré");
+                        }
+                    }
+                }
+                None => {
+                    // Vue : l'impression a déjà été mémorisée au moment où le
+                    // feed a été servi. Rien à faire, la fenêtre d'attribution
+                    // court.
+                }
+            }
 
             info!(
                 user_id = %req.user_id,

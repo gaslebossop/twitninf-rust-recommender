@@ -208,6 +208,7 @@ pub async fn admin_set_weights_handler(
         d6_diversity:            req.d6.unwrap_or(current.d6_diversity),
         d7_viral:                req.d7.unwrap_or(current.d7_viral),
         d8_personalization:      req.d8.unwrap_or(current.d8_personalization),
+        d9_llm_understanding:    req.d9.unwrap_or(current.d9_llm_understanding),
     };
 
     let arr = new_weights.as_array();

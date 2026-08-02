@@ -10,12 +10,24 @@
 /// les utilisateurs, sans intervention humaine.
 use std::sync::{Arc, RwLock};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::admin::AlgoWeights;
 use crate::ml::CtrPredictor;
 
 const MIN_SAMPLES_FOR_TUNING: u64 = 500;
+
+/// Bande de CTR global considérée comme plausible. En dehors, on refuse de
+/// réécrire les poids de scoring.
+///
+/// L'auto-tuner écrase les 8 poids qui pilotent tout le feed à partir de ce que
+/// le modèle a appris. Si l'étiquetage est dégénéré — tous les samples positifs,
+/// ou tous négatifs — les poids appris ne veulent rien dire et les propager
+/// casserait le classement pour tout le monde. C'est exactement ce qui serait
+/// arrivé avec l'ancien label (`weight > 0.0`, donc une vue comptait comme un
+/// clic) : un CTR global de ~100 % et des poids de bruit poussés en production.
+const MIN_PLAUSIBLE_CTR: f64 = 0.005;
+const MAX_PLAUSIBLE_CTR: f64 = 0.80;
 
 #[derive(Clone)]
 pub struct AutoTuner {
@@ -53,7 +65,7 @@ impl AutoTuner {
             return;
         }
 
-        let (samples, _) = ctr.stats();
+        let (samples, global_ctr) = ctr.stats();
 
         // Vérifier si on a assez de données ET si on a de nouvelles données depuis le dernier tune
         let last_tune = self.current.read().unwrap().last_tune_at;
@@ -61,7 +73,19 @@ impl AutoTuner {
             return;
         }
 
-        let learned = ctr.extract_dimension_weights();
+        // Garde-fou : un CTR global aberrant signale un étiquetage cassé, pas un
+        // apprentissage réussi. On garde les poids en place plutôt que de
+        // propager du bruit à l'ensemble du feed.
+        if !(MIN_PLAUSIBLE_CTR..=MAX_PLAUSIBLE_CTR).contains(&global_ctr) {
+            warn!(
+                samples, global_ctr,
+                "AutoTuner: CTR global hors bande plausible — poids inchangés"
+            );
+            return;
+        }
+
+        let current_d9 = self.current.read().unwrap().weights.d9_llm_understanding;
+        let learned = ctr.extract_dimension_weights(current_d9);
         if let Some(weights) = learned {
             let mut state = self.current.write().unwrap();
             state.weights = weights;
@@ -98,7 +122,13 @@ impl Default for AutoTuner {
 impl CtrPredictor {
     /// Extrait et normalise les poids D1-D8 appris par le modèle CTR.
     /// Retourne None si pas assez de données ou poids incohérents.
-    pub fn extract_dimension_weights(&self) -> Option<AlgoWeights> {
+    ///
+    /// `keep_d9` : poids de D9 à préserver tel quel. D9 ne fait pas partie du
+    /// vecteur de features du modèle CTR — il n'a donc rien appris à son sujet
+    /// et n'a aucune légitimité à le réécrire. Les 8 dimensions apprises se
+    /// partagent le budget restant (`1 - keep_d9`), pour que le total reste à
+    /// 1.0 et que l'échelle des scores ne dérive pas.
+    pub fn extract_dimension_weights(&self, keep_d9: f64) -> Option<AlgoWeights> {
         let (samples, _) = self.stats();
         if samples < MIN_SAMPLES_FOR_TUNING {
             return None;
@@ -114,8 +144,11 @@ impl CtrPredictor {
             return None;
         }
 
-        // Normaliser pour que la somme = 1.0
-        let norm: Vec<f64> = clipped.iter().map(|w| w / sum).collect();
+        let d9 = keep_d9.clamp(0.0, 0.9);
+        let budget = 1.0 - d9;
+
+        // Normaliser pour que la somme des 9 dimensions = 1.0
+        let norm: Vec<f64> = clipped.iter().map(|w| w / sum * budget).collect();
 
         debug!(
             d1 = norm[0], d2 = norm[1], d3 = norm[2], d4 = norm[3],
@@ -133,6 +166,7 @@ impl CtrPredictor {
             d6_diversity:            norm[5],
             d7_viral:                norm[6],
             d8_personalization:      norm[7],
+            d9_llm_understanding:    d9,
         })
     }
 }

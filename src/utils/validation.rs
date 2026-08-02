@@ -28,12 +28,16 @@ pub fn validate_pagination(limit: Option<i64>, offset: Option<i64>) -> AppResult
         return Err(AppError::InvalidInput("Offset cannot be negative".to_string()));
     }
 
-    let limit_usize = limit as usize;
-    if limit_usize < API_MIN_LIMIT || limit_usize > API_MAX_LIMIT {
+    // Une limite trop haute est plafonnée, pas rejetée — c'est déjà ce que fait
+    // `recommend()` (`.clamp(1, 200)`) et ce que ce test attend. La version
+    // précédente renvoyait une erreur : les deux comportements coexistaient
+    // pour la même règle métier.
+    if limit < API_MIN_LIMIT as i64 {
         return Err(AppError::InvalidInput(
-            format!("Limit must be between {} and {}", API_MIN_LIMIT, API_MAX_LIMIT),
+            format!("Limit must be at least {}", API_MIN_LIMIT),
         ));
     }
+    let limit_usize = (limit as usize).min(API_MAX_LIMIT);
 
     Ok((limit_usize, offset as usize))
 }

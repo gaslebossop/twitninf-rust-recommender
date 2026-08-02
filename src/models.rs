@@ -13,6 +13,8 @@ pub struct RecommendRequest {
     pub mode: Option<RecommendMode>,
     pub exclude_seen: Option<bool>,
     pub force_refresh: Option<bool>,
+    /// Déploiement progressif : seul le client Windows le demande pour le moment.
+    pub enable_experiments: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -34,6 +36,10 @@ pub struct TrackInteractionRequest {
     pub tweet_id: String,  // UUID
     pub interaction_type: InteractionType,
     pub dwell_ms: Option<u32>,
+    /// Indices renvoyés avec le tweet. Facultatifs pour rester compatible avec
+    /// les anciens clients ; le moteur retombe alors sur l'affectation stockée.
+    pub experiment_id: Option<String>,
+    pub variant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Serialize)]
@@ -58,6 +64,36 @@ impl InteractionType {
             InteractionType::Skip        => -0.5,
             InteractionType::Report      => -12.0,
             InteractionType::Block       => -20.0,
+        }
+    }
+
+    /// Label d'entraînement du modèle CTR pour cette interaction.
+    ///
+    /// `Some(true)`  → engagement positif avéré, exemple positif.
+    /// `Some(false)` → rejet explicite, exemple négatif.
+    /// `None`        → l'interaction ne tranche pas. Une `View` est
+    ///   l'impression elle-même : elle ouvre la fenêtre d'attribution au lieu
+    ///   de conclure. Si rien ne suit, le balayage la comptera en négatif.
+    ///
+    /// Piège corrigé : le label se déduisait de `weight() > 0.0`, or une `View`
+    /// pèse 0.2 — toute impression était donc étiquetée « cliquée » et le
+    /// modèle ne pouvait apprendre qu'une seule chose, « tout est un clic ».
+    pub fn ctr_label(self) -> Option<bool> {
+        match self {
+            InteractionType::Like
+            | InteractionType::Comment
+            | InteractionType::Retweet
+            | InteractionType::Share
+            | InteractionType::Bookmark
+            | InteractionType::ProfileView => Some(true),
+
+            InteractionType::Skip
+            | InteractionType::Report
+            | InteractionType::Block
+            | InteractionType::Unlike
+            | InteractionType::Unretweet => Some(false),
+
+            InteractionType::View => None,
         }
     }
 }
@@ -119,6 +155,35 @@ pub enum PersonalityType {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum UserType { PowerUser, Regular, #[default] Casual }
 
+// ─── Palier d'abonnement de l'auteur ─────────────────────────────────────────
+
+/// Palier payant du compte qui publie.
+///
+/// Deux colonnes décrivent la même chose en base : `subscription_tier` (l'ENUM
+/// courant) et `premium` (l'ancien booléen, encore vrai sur des comptes
+/// historiques qui n'ont jamais eu de palier). `resolve` applique la même règle
+/// que l'API (`customizationTier` dans `userRoutes.js`) : le palier explicite
+/// gagne, `premium` seul vaut Pro.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorTier {
+    #[default]
+    Free,
+    Plus,
+    Pro,
+}
+
+impl AuthorTier {
+    pub fn resolve(tier: &str, legacy_premium: bool) -> Self {
+        match tier {
+            "pro" => Self::Pro,
+            "plus" => Self::Plus,
+            _ if legacy_premium => Self::Pro,
+            _ => Self::Free,
+        }
+    }
+}
+
 // ─── Tweet candidat brut ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -155,27 +220,136 @@ pub struct RawTweet {
     pub author_following: i64,
     pub author_is_verified: bool,
     pub author_is_premium: bool,
+    /// Palier d'abonnement de l'auteur (`users.subscription_tier`). Distinct de
+    /// `author_is_premium`, qui est l'ancien drapeau booléen : les deux
+    /// coexistent en base, voir `AuthorTier::resolve`.
+    pub author_tier: AuthorTier,
     pub author_account_age_days: i32,
     pub author_tweet_count: i64,
 
     pub moderation_status: String,
     pub recommendation_group: Option<String>,
 
+    /// Tweet auquel celui-ci répond.
+    ///
+    /// C'est le seul champ fiable pour savoir si un tweet est une réponse :
+    /// en base, 98 tweets typés `'tweet'` ont un `parent_tweet_id` renseigné.
+    /// Ne pas se fier à `tweet_type`.
+    pub parent_tweet_id: Option<String>,
+    /// Tweet d'origine quand celui-ci est un retweet ou une citation.
+    ///
+    /// Attention : les réponses le renseignent aussi (elles pointent la racine
+    /// du fil). Ne l'utiliser comme identité de contenu que si `is_retweet`.
+    pub original_tweet_id: Option<String>,
+    /// Vrai retweet (réaffiche l'original sans texte propre).
+    pub is_retweet: bool,
+
+    /// Nombre de fois que CE lecteur a déjà vu ce tweet passer dans son fil
+    /// (`user_behavior_data.tweet_view`). Une exposition répétée sans
+    /// engagement est un signal négatif fort : c'est un refus implicite.
+    pub viewer_impressions: i64,
+
+    /// `users.algorithmic_visibility_multiplier` — levier de visibilité par
+    /// compte déjà présent en base, mais qu'aucun scoring ne lisait.
+    pub author_visibility_multiplier: f64,
+
     pub source: TweetSource,
     pub source_weight: f64,
 
     pub author_shadowban_level: ShadowbanLevel,
+
+    /// Étiquettes produites par l'annotateur LLM (`tweet_llm_labels`).
+    /// `None` = tweet pas encore annoté : D9 reste alors neutre au lieu de
+    /// pénaliser un contenu dont on ne sait simplement rien.
+    pub llm: Option<LlmLabels>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Compréhension du contenu produite hors-ligne par le LLM annotateur.
+///
+/// Ces signaux n'existent nulle part ailleurs dans la base : le corpus est trop
+/// petit pour qu'un modèle les apprenne depuis l'engagement (203 paires
+/// impression→like au moment de la conception). Le LLM apporte la connaissance,
+/// la base ne fournit que les items à annoter.
+#[derive(Debug, Clone)]
+pub struct LlmLabels {
+    pub theme: String,
+    /// [0,1] — agression envers une personne ou un groupe.
+    pub toxicity_score: f64,
+    pub toxicity_category: String,
+    /// [0,1] — apport réel du message (informe, fait rire, lance un échange).
+    pub quality_score: f64,
+    pub tone: String,
+    /// [0,1] — confiance de l'annotation, utilisée pour amortir son effet.
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum TweetSource {
     Trending, SocialGraph, Personalized, Viral,
-    Temporal, Discovery, Influencer, Quality,
+    Temporal, Discovery,
+    #[default]
+    Influencer,
+    Quality,
+}
+
+// `RawTweet` est construit dans les tests via `..Default::default()`, mais le
+// dérive était impossible : `DateTime<Utc>` n'implémente pas `Default`. Le test
+// de D1 ne compilait donc pas. Impl manuelle, avec l'epoch comme date neutre.
+impl Default for RawTweet {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            user_id: String::new(),
+            content: String::new(),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now),
+            view_count: 0,
+            like_count: 0,
+            comment_count: 0,
+            retweet_count: 0,
+            share_count: 0,
+            bookmark_count: 0,
+            report_count: 0,
+            likes_1h: 0,
+            likes_6h: 0,
+            comments_1h: 0,
+            retweets_1h: 0,
+            has_media: false,
+            hashtag_count: 0,
+            mention_count: 0,
+            content_length: 0,
+            emoji_count: 0,
+            exclamation_count: 0,
+            question_count: 0,
+            url_count: 0,
+            words: Vec::new(),
+            author_followers: 0,
+            author_following: 0,
+            author_is_verified: false,
+            author_is_premium: false,
+            author_tier: AuthorTier::Free,
+            author_account_age_days: 0,
+            author_tweet_count: 0,
+            moderation_status: "approved".to_string(),
+            recommendation_group: None,
+            parent_tweet_id: None,
+            original_tweet_id: None,
+            is_retweet: false,
+            viewer_impressions: 0,
+            author_visibility_multiplier: 1.0,
+            source: TweetSource::default(),
+            source_weight: 1.0,
+            author_shadowban_level: ShadowbanLevel::default(),
+            llm: None,
+        }
+    }
 }
 
 // ─── Score ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+// `Default` est requis par les helpers de test du bandit contextuel, qui
+// construisaient un breakdown vide via `Default::default()` sans que le dérive
+// existe — le crate ne compilait donc pas en mode test.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ScoreBreakdown {
     pub engagement_velocity: f64,
     pub content_intelligence: f64,
@@ -199,6 +373,8 @@ pub struct ScoreBreakdown {
     pub source_weight: f64,
     pub shadowban_multiplier: f64,
     pub garbage_penalty: f64,
+    /// Mod I — coup de pouce d'abonné (1.0 pour un compte gratuit).
+    pub subscription_boost: f64,
 
     /// Métadonnée portée pour le calcul de diversité de format du feed (D6).
     pub has_media: bool,
@@ -211,6 +387,12 @@ pub struct ScoredTweet {
     pub tweet_id: String,
     pub score: f64,
     pub breakdown: ScoreBreakdown,
+    /// Vecteur de features réellement utilisé pour classer ce tweet. Mémorisé
+    /// à l'affichage puis rejoué à l'interaction : c'est la seule façon
+    /// d'entraîner le modèle CTR sur ce qu'il a effectivement vu.
+    /// Interne au scoring, jamais exposé dans la réponse API.
+    #[serde(skip)]
+    pub ctr_features: Option<Vec<f64>>,
 }
 
 // ─── Réponses API ─────────────────────────────────────────────────────────────
@@ -226,6 +408,7 @@ pub struct RecommendResponse {
     pub mode: String,
     pub latency_ms: u64,
     pub cache_hit: bool,
+    pub experiments: Vec<crate::experiments::ExperimentAssignment>,
     pub metadata: RecommendMetadata,
 }
 

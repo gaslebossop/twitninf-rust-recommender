@@ -6,6 +6,7 @@ mod shadowban;
 mod config;
 mod constants;
 mod error;
+mod experiments;
 mod handlers;
 mod middleware;
 mod ml;
@@ -25,6 +26,7 @@ use axum::{
 use deadpool_postgres::Runtime;
 use tokio_postgres::NoTls;
 use tower_http::{
+    catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
     cors::CorsLayer,
     trace::TraceLayer,
@@ -65,14 +67,20 @@ async fn main() -> Result<()> {
     let pg_pool = cfg.pg_config().create_pool(Some(Runtime::Tokio1), NoTls)?;
     let _ = pg_pool.get().await.expect("Cannot connect to PostgreSQL");
     info!("PostgreSQL connected (pool size: {})", cfg.db_pool_size);
+    experiments::ensure_schema(&pg_pool).await?;
+    info!("A/B experiment schema ready");
 
     let cache = CacheManager::new(&cfg.redis_url).await?;
     info!("Redis connected");
 
     let auto_tuner  = Arc::new(AutoTuner::new());
-    let recommender = Arc::new(RecommenderService::new_with_tuner(
+    let recommender = Arc::new(RecommenderService::new_with_tuner_and_ml(
         pg_pool.clone(), cache.clone(), auto_tuner.clone(),
-    ));
+    ).await);
+
+    // Boucle d'attribution CTR : convertit les impressions ignorées en exemples
+    // négatifs et persiste le modèle. C'est elle qui rend l'apprentissage réel.
+    ml::ctr_sweeper::spawn(recommender.clone(), cache.clone());
 
     let state = AppState {
         pg: pg_pool,
@@ -125,6 +133,10 @@ async fn main() -> Result<()> {
         .route("/admin/data",                 get(admin_data_handler))
         .layer(cors)
         .layer(CompressionLayer::new())
+        // Un panic pendant le scoring d'un seul tweet ne doit pas emporter le
+        // processus — et donc le fil de tous les utilisateurs. Il devient un
+        // 500 sur la requête fautive.
+        .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
