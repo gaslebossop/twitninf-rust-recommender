@@ -137,6 +137,16 @@ impl CtrPredictor {
         // Récupérer les 8 premiers poids via snapshot du modèle
         let raw_weights = self.dimension_weights_snapshot();
 
+        // Si aucune des 8 dimensions n'a un poids positif, le modèle n'a
+        // extrait aucun signal discriminant — écrêter au plancher donnerait
+        // une fausse distribution uniforme (toutes tombent sur 0.001) au lieu
+        // de refléter une absence de signal. On refuse la mise à jour plutôt
+        // que de la maquiller.
+        if raw_weights.iter().all(|&w| w <= 0.0) {
+            warn!("AutoTuner: 8/8 poids de dimension non-positifs — aucun signal exploitable, poids inchangés");
+            return None;
+        }
+
         // Forcer les poids positifs (contribution au CTR)
         let clipped: Vec<f64> = raw_weights.iter().map(|&w| w.max(0.001)).collect();
         let sum: f64 = clipped.iter().sum();
