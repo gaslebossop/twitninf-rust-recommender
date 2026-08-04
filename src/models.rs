@@ -397,11 +397,45 @@ pub struct ScoredTweet {
 
 // ─── Réponses API ─────────────────────────────────────────────────────────────
 
+/// Une place dans le fil : un tweet, et le tweet auquel il répond quand ce
+/// dernier est servi JUSTE au-dessus de lui.
+///
+/// C'est la forme mise en cache, et non plus une simple liste d'identifiants :
+/// le lien de fil est calculé au moment de la mise en forme, à l'unique endroit
+/// où l'on connaît encore les tweets complets. Le recalculer à la lecture du
+/// cache aurait exigé de recharger les parents depuis la base à chaque page
+/// servie — pour retrouver une information qu'on avait déjà.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+}
+
+/// Lien de conversation exposé au client : « ce tweet répond à celui-là, et le
+/// fil part de cette racine ».
+///
+/// Redondant avec l'ordre de `tweet_ids` — l'adjacence dit déjà la même chose —
+/// et c'est voulu : l'ordre est une convention fragile qu'un intermédiaire peut
+/// casser sans s'en rendre compte, ce champ est une affirmation explicite. Un
+/// client qui reçoit les deux peut vérifier qu'ils concordent.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadLink {
+    pub tweet_id: String,
+    pub parent_id: String,
+    pub root_id: String,
+    /// 1 pour une réponse au tweet racine, 2 pour une réponse à cette réponse…
+    pub depth: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecommendResponse {
     pub success: bool,
     pub user_id: String,
     pub tweet_ids: Vec<String>,
+    /// Liens de fil entre les `tweet_ids` de CETTE page. Vide quand la page ne
+    /// contient aucune réponse.
+    pub threads: Vec<ThreadLink>,
     pub count: usize,
     pub algorithm: &'static str,
     pub algorithm_version: &'static str,

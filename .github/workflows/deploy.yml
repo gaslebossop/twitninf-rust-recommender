@@ -1,0 +1,112 @@
+name: Tests et déploiement
+
+# Ce dépôt EST le crate : la racine du dépôt contient `Cargo.toml`. Pas de
+# `working-directory` ni de filtre `rust-recommender/**` — un chemin qui
+# n'existe pas ici, et qui empêcherait le workflow de se déclencher.
+#
+# Déploiement AUTOMATIQUE sur `main` : chaque poussée qui touche le code part
+# en production, après des tests verts. Le `needs: test` n'est donc pas
+# décoratif — c'est la seule chose entre une poussée et le fil de tous les
+# utilisateurs.
+#
+# `paths-ignore` évite qu'une correction de README redémarre le service.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '*.txt'
+      - 'LICENSE'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Déployer sur le VPS après des tests verts'
+        type: boolean
+        default: true
+
+concurrency:
+  # Deux déploiements simultanés compileraient dans le même dossier du VPS et
+  # redémarreraient le service l'un sous l'autre. On sérialise, sans annuler :
+  # une bascule à moitié faite est pire qu'une bascule en retard.
+  group: deploiement-vps
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Compilation et tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer la chaîne Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --lib
+
+      # Non bloquant : la base compte déjà plus de 200 avertissements hérités.
+      # Les faire échouer maintenant rendrait le pipeline rouge en permanence,
+      # donc ignoré. On les affiche pour ne pas en ajouter en silence.
+      - name: Clippy (informatif)
+        run: cargo clippy --lib --no-deps 2>&1 | tail -40
+        continue-on-error: true
+
+      - name: Compilation en release
+        run: cargo build --release
+
+  deploy:
+    name: Déploiement sur le VPS
+    needs: test
+    # Jamais sur une pull request : on ne déploie que ce qui est sur `main`.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy)
+    runs-on: ubuntu-latest
+    # Permet d'exiger une approbation manuelle dans les réglages du dépôt si
+    # l'automatisme devient trop brutal, sans retoucher ce fichier.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Préparer la clé SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          test -n "$SSH_KEY" || { echo "secret VPS_SSH_KEY absent"; exit 1; }
+          test -n "$VPS_HOST" || { echo "secret VPS_HOST absent"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/vps
+          chmod 600 ~/.ssh/vps
+          # `${VPS_HOST#*@}` retire le `debian@` : ssh-keyscan veut un hôte nu.
+          ssh-keyscan -H "${VPS_HOST#*@}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # Le script porte toute la connaissance du déploiement (bonne unité
+      # systemd, dates de modification à repousser, contrôles de santé). Le
+      # workflow ne fait que l'appeler : il n'existe pas deux procédures qui
+      # pourraient diverger.
+      #
+      # Il relance `cargo test` avant l'envoi. Redondant avec le job `test`,
+      # et gardé tel quel : le script doit rester utilisable seul depuis un
+      # poste, sans supposer qu'une CI l'a précédé.
+      - name: Déployer
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_KEY: /home/runner/.ssh/vps
+        run: |
+          chmod +x deploy-vps.sh
+          ./deploy-vps.sh
+
+      - name: État final du service
+        if: always()
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_KEY: /home/runner/.ssh/vps
+        run: ./deploy-vps.sh --check

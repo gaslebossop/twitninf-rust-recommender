@@ -138,13 +138,21 @@ impl RecommenderService {
         if !force_refresh {
             if let Some(cached) = self.cache.get_recommendations(&req.user_id, mode_str).await {
                 let cached_total = cached.len();
-                let page: Vec<String> = cached.into_iter().skip(offset).take(limit).collect();
+                let page: Vec<FeedEntry> = cached.into_iter().skip(offset).take(limit).collect();
                 let count = page.len();
                 debug!(cache_hit = true, cached_total, page_size = count, "Cache hit!");
+                // ⚠ Une page peut couper un fil en deux : le parent finit la
+                // page N, sa réponse ouvre la page N+1. `thread_links` ne
+                // rattache alors rien pour cette réponse, et les clients
+                // l'écartent comme orpheline — un tweet perdu par page, contre
+                // une pagination qui reste alignée sur des bornes fixes.
+                let threads = thread_links(&page);
+                let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
                 let mut response = self.build_empty_response(
-                    &req.user_id, page, count, mode_str,
+                    &req.user_id, page_ids, count, mode_str,
                     start.elapsed().as_millis() as u64, true,
                 );
+                response.threads = threads;
                 if req.enable_experiments.unwrap_or(false) {
                     response.experiments = experiments::assign_variants(
                         &self.pg,
@@ -179,7 +187,19 @@ impl RecommenderService {
         debug!(banned_count = banned_set.len(), "Hard-banned set loaded");
 
         debug!("Collecting candidates from {} sources...", 8);
-        let (sources, source_stats) = self.collect_candidates(&req.user_id, &profile, &mode, &banned_set).await?;
+        let (mut sources, source_stats) = self.collect_candidates(&req.user_id, &profile, &mode, &banned_set).await?;
+
+        // Remonter les parents AVANT la déduplication et le plancher de qualité :
+        // un parent est un tweet comme un autre et doit subir exactement les
+        // mêmes contrôles. L'entrer plus tard reviendrait à le faire passer par
+        // une porte que les candidats normaux n'ont pas.
+        if let Err(error) = self.hydrate_thread_parents(&req.user_id, &mut sources, &banned_set).await {
+            // Échec non bloquant : sans les parents, `shape_feed` retombe sur
+            // son comportement d'avant — il écarte les réponses. Le fil est plus
+            // pauvre, il n'est pas cassé.
+            warn!(error = ?error, "Remontée des parents de fil impossible, les réponses seront écartées");
+        }
+
         let total_candidates = sources.len();
         debug!(total_candidates,
                trending = source_stats.trending, social_graph = source_stats.social_graph,
@@ -267,12 +287,18 @@ impl RecommenderService {
                relevance_score = metrics.relevance_score, viral_potential = metrics.viral_potential,
                novelty_score = metrics.novelty_score, "Feed metrics calculated");
 
+        // Le lien de fil est figé ICI, tant qu'on a encore les tweets complets :
+        // après la mise en cache il ne reste que des identifiants.
+        let all_entries = as_feed_entries(&all_ids, &tweet_map);
+
         let adaptive_ttl = adaptive_ttl(&profile, &mode);
         debug!(ttl_seconds = adaptive_ttl, "Setting cache TTL");
-        self.cache.set_recommendations_ttl(&req.user_id, mode_str, &all_ids, adaptive_ttl).await;
+        self.cache.set_recommendations_ttl(&req.user_id, mode_str, &all_entries, adaptive_ttl).await;
 
         let total_available = self.count_available(&req.user_id).await.unwrap_or(1000);
-        let page_ids: Vec<String> = all_ids.into_iter().skip(offset).take(limit).collect();
+        let page: Vec<FeedEntry> = all_entries.into_iter().skip(offset).take(limit).collect();
+        let threads = thread_links(&page);
+        let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
         let count = page_ids.len();
         debug!(pagination_offset = offset, pagination_limit = limit, page_size = count, total_available, "Pagination applied");
 
@@ -306,6 +332,7 @@ impl RecommenderService {
             success: true,
             user_id: req.user_id.clone(),
             tweet_ids: page_ids,
+            threads,
             count,
             algorithm: "NeuralRank Fusion",
             algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
@@ -715,7 +742,7 @@ impl RecommenderService {
             .collect();
 
         let client = self.pg.get().await?;
-        let rows = client.query(CANDIDATES_SQL, &[
+        let rows = client.query(CANDIDATES_SQL.as_str(), &[
             &uid,                 // $1
             &following_uuids,     // $2
             &top_author_uuids,    // $3
@@ -758,6 +785,75 @@ impl RecommenderService {
         Ok((all, stats))
     }
 
+    /// Remonte les parents manquants des réponses candidates.
+    ///
+    /// Sans cette passe, `shape_feed` écartait la quasi-totalité des réponses :
+    /// il exige que toute la chaîne d'ancêtres soit dans le vivier, or aucune
+    /// des 8 sources ne collecte un tweet parce qu'il est le parent d'un autre.
+    /// Une réponse n'était donc servie que si son parent avait été retenu par
+    /// ailleurs, par pure coïncidence. Le fil de discussion existait dans le
+    /// code sans jamais atteindre l'écran.
+    ///
+    /// La remontée est itérative — le parent d'une réponse peut lui-même être
+    /// une réponse — et bornée par `MAX_THREAD_DEPTH`, la même profondeur que
+    /// celle que `shape_feed` accepte d'afficher : remonter plus loin
+    /// ramènerait des tweets qu'il écarterait de toute façon.
+    async fn hydrate_thread_parents(
+        &self,
+        user_id: &str,
+        tweets: &mut Vec<RawTweet>,
+        banned_set: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let uid = uuid::Uuid::parse_str(user_id)?;
+        let banned_uuids: Vec<uuid::Uuid> = banned_set.iter()
+            .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+            .collect();
+
+        let mut known: HashSet<String> = tweets.iter().map(|t| t.id.clone()).collect();
+        let mut added = 0usize;
+
+        for _ in 0..MAX_THREAD_DEPTH {
+            let missing: Vec<uuid::Uuid> = tweets.iter()
+                .filter_map(|t| t.parent_tweet_id.as_deref())
+                .filter(|id| !known.contains(*id))
+                .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+                .collect::<HashSet<_>>()   // un même parent peut manquer à plusieurs réponses
+                .into_iter()
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+
+            let client = self.pg.get().await?;
+            let rows = client.query(PARENTS_SQL.as_str(), &[&uid, &missing, &banned_uuids]).await?;
+            let parents = map_rows(rows);
+            if parents.is_empty() {
+                // Les parents restants sont invisibles pour ce lecteur.
+                // `shape_feed` écartera leurs réponses, ce qui est le
+                // comportement voulu : insister ne ferait que reposer la même
+                // question à la base.
+                break;
+            }
+
+            // Les identifiants demandés qui n'ont RIEN renvoyé sont marqués
+            // connus malgré tout : sans ça, la passe suivante les redemanderait
+            // à l'identique jusqu'à épuiser les tours.
+            for id in &missing {
+                known.insert(id.to_string());
+            }
+            for parent in parents {
+                known.insert(parent.id.clone());
+                tweets.push(parent);
+                added += 1;
+            }
+        }
+
+        if added > 0 {
+            debug!(parents_added = added, "Parents de fil remontés pour rendre les réponses lisibles");
+        }
+        Ok(added)
+    }
+
     async fn count_available(&self, user_id: &str) -> Result<i64> {
         let client = self.pg.get().await?;
         let uid = uuid::Uuid::parse_str(user_id)?;
@@ -780,7 +876,7 @@ impl RecommenderService {
         mode: &str, latency_ms: u64, cache_hit: bool,
     ) -> RecommendResponse {
         RecommendResponse {
-            success: true, user_id: user_id.to_string(), tweet_ids, count,
+            success: true, user_id: user_id.to_string(), tweet_ids, threads: Vec::new(), count,
             algorithm: "NeuralRank Fusion",
             algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
             mode: mode.to_string(), latency_ms, cache_hit,
@@ -806,14 +902,19 @@ impl RecommenderService {
 
 // ─── SQL constants ────────────────────────────────────────────────────────────
 
-/// Collecte + déduplication + métriques, en une seule requête paramétrée.
+/// Sélection des candidats : 8 sources, dédupliquées et plafonnées par auteur.
+///
+/// Se termine sur le CTE `picked (id, src, w)` que `PROJECTION_SQL` vient lire.
+/// La coupure est là, et pas ailleurs, parce que c'est le seul point où la
+/// requête de collecte et celle d'hydratation des parents se rejoignent : les
+/// deux produisent un `picked`, les deux l'habillent du même projection.
 ///
 /// Paramètres :
 ///   $1 user_id · $2 following[] · $3 top_authors[] · $4 hard_banned[]
 ///   $5 fenêtre trending (h) · $6 social (h) · $7 discovery (h) · $8 viral (h)
 ///   $9 horizon global (h) · $10 heure d'activité de l'utilisateur
 ///   $11 plafond de candidats par auteur (voir `MAX_CANDIDATES_PER_AUTHOR`)
-const CANDIDATES_SQL: &str = r#"
+const CANDIDATES_CTE: &str = r#"
 WITH visible AS (
     SELECT t.id, t.user_id, t.created_at, u.verified, u.premium
     FROM tweets t
@@ -945,6 +1046,17 @@ picked AS (
     ) ranked
     WHERE rn <= $11
 )
+"#;
+
+/// Habillage commun : transforme un `picked (id, src, w)` en lignes `RawTweet`.
+///
+/// Partagé mot pour mot entre la collecte et l'hydratation des parents, pour
+/// que `map_rows` puisse indexer les colonnes par position sans jamais se
+/// demander de laquelle des deux requêtes vient la ligne. Toute colonne ajoutée
+/// ici profite aux deux — et surtout, aucune ne peut n'en servir qu'une.
+///
+/// Paramètre lu : `$1` (le lecteur, pour ses impressions déjà servies).
+const PROJECTION_SQL: &str = r#"
 SELECT
     t.id::text, t.user_id::text,
     COALESCE(t.content, '') AS content,
@@ -1018,6 +1130,49 @@ LEFT JOIN LATERAL (
 -- sinon au tweet lui-même.
 LEFT JOIN tweet_llm_labels ll ON ll.tweet_id = COALESCE(t.original_tweet_id, t.id)
 "#;
+
+/// Sélectionne des tweets par identifiant, aux mêmes conditions de visibilité
+/// que le vivier — pour remonter le parent d'une réponse bien classée.
+///
+/// ⚠ Les filtres sont recopiés plutôt que délégués au fait « son enfant est
+/// passé ». Le vivier vérifie déjà que le parent est affichable, mais par une
+/// clause distincte, qui pourrait diverger : ce serait alors par ici qu'un
+/// tweet supprimé, privé ou d'un compte suspendu rentrerait dans le fil, sans
+/// jamais avoir été candidat. Une porte dérobée ne se laisse pas ouverte au
+/// motif qu'une autre porte est fermée.
+///
+/// Deux différences assumées avec `visible` :
+///   * le tweet du LECTEUR est admis — « quelqu'un a répondu à ton message »
+///     est précisément un fil qui mérite d'être lu ;
+///   * le plafond par auteur n'est pas appliqué : un parent n'est pas là pour
+///     concourir, il est là pour rendre sa réponse lisible. `spread_by_author`
+///     borne de toute façon sa présence à l'écran.
+///
+/// Paramètres : $1 lecteur · $2 identifiants de parents · $3 hard_banned[]
+const PARENTS_CTE: &str = r#"
+WITH picked AS (
+    SELECT t.id, 0 AS src, 0.05::float8 AS w
+    FROM tweets t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.id = ANY($2)
+      AND t.deleted_at IS NULL
+      AND t.moderation_status = 'approved'
+      AND t.is_private = false
+      AND COALESCE(t.is_data_test, false) = false
+      AND u.is_active = true
+      AND COALESCE(u.is_suspended, false) = false
+      AND NOT (t.user_id = ANY($3))
+)
+"#;
+
+/// Les deux requêtes complètes, assemblées une fois pour toutes.
+///
+/// `concat!` ne sait pas coller des constantes, et refaire le `format!` à
+/// chaque requête réallouerait plusieurs kilo-octets par recommandation.
+static CANDIDATES_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{CANDIDATES_CTE}{PROJECTION_SQL}"));
+static PARENTS_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{PARENTS_CTE}{PROJECTION_SQL}"));
 
 // ─── Mapping rows → RawTweet ──────────────────────────────────────────────────
 
@@ -1169,12 +1324,21 @@ const PAGE_WINDOW: usize = 50;
 ///    quoi elle répond.
 /// 3. Les réponses sont plafonnées à `MAX_REPLY_RATIO` du fil.
 ///
-/// Le parent n'est **pas** ajouté à la liste : le client affiche déjà le tweet
-/// parent au-dessus d'une réponse. Une version antérieure l'insérait aussi côté
-/// serveur, ce qui faisait apparaître le même tweet deux fois à l'écran — une
-/// fois en carte de contexte, une fois en entrée de feed. C'est le rôle de
-/// cette fonction de garantir qu'un fil n'est représenté qu'une seule fois ;
-/// le rendu du contexte reste au client.
+/// Le parent **est** émis dans la liste, juste avant sa réponse.
+///
+/// C'est le contrat que les clients appliquent réellement : mobile comme
+/// Windows rendent une liste plate et déduisent le fil de l'ADJACENCE
+/// (`isThreadParent` = « l'élément suivant a mon id pour parent »). Aucun ne
+/// reconstruit un fil depuis un champ de contexte.
+///
+/// Une version antérieure n'émettait que la réponse et marquait ses ancêtres
+/// comme « à l'écran », en comptant sur le client pour dessiner une carte de
+/// contexte au-dessus. Personne ne la dessinait : la réponse arrivait seule,
+/// illisible, et l'API devait ensuite l'écarter. On émet donc la chaîne
+/// entière — le fil est du ressort de celui qui décide de l'ordre.
+///
+/// ⚠ L'invariant tient tant que rien ne réordonne la liste ensuite :
+/// `spread_by_author` déplace les fils par BLOCS pour cette raison.
 fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<String> {
     let max_replies = ((scored.len() as f64) * MAX_REPLY_RATIO).ceil() as usize;
 
@@ -1220,21 +1384,39 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
             replies_dropped += 1;
             continue;
         }
-        // Un ancêtre déjà à l'écran signifie que ce fil est déjà représenté.
-        if chain.iter().skip(1).any(|a| shown.contains(&a.id)) {
-            if is_reply { replies_dropped += 1; }
-            continue;
-        }
         if is_reply && replies_kept >= max_replies {
             replies_dropped += 1;
             continue;
         }
 
-        out.push(t.id.clone());
-        // Le tweet ET tous ses ancêtres deviennent « à l'écran » : les ancêtres
-        // seront rendus en contexte par le client, les resservir plus bas
-        // afficherait deux fois le même contenu.
-        for a in &chain {
+        // Le parent vient juste d'être émis : la réponse PROLONGE ce fil au lieu
+        // d'en ouvrir un second. On l'ajoute telle quelle, sans réémettre la
+        // chaîne — c'est le cas d'un tweet et de sa réponse tous deux bien
+        // classés, où le fil se lit naturellement de haut en bas.
+        let extends_last = chain.get(1)
+            .zip(out.last())
+            .is_some_and(|(parent, previous)| parent.id == *previous);
+        if extends_last {
+            out.push(t.id.clone());
+            shown.insert(t.id.clone());
+            replies_kept += 1;
+            continue;
+        }
+
+        // Un ancêtre est à l'écran, mais PLUS HAUT : réémettre la réponse ici la
+        // séparerait de son parent de plusieurs tweets, ce qui la rend illisible
+        // — et le client ne tracerait aucun trait de conversation entre les
+        // deux. Le fil est déjà représenté, on passe.
+        if chain.iter().skip(1).any(|a| shown.contains(&a.id)) {
+            if is_reply { replies_dropped += 1; }
+            continue;
+        }
+
+        // Émission de la racine vers la feuille : `chain` a été construite en
+        // remontant, elle se lit donc à l'envers. C'est cet ordre-là qui fait
+        // le fil à l'écran.
+        for a in chain.iter().rev() {
+            out.push(a.id.clone());
             shown.insert(a.id.clone());
         }
         if is_reply {
@@ -1264,30 +1446,41 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
 /// `PAGE_WINDOW` entrées quand il n'y a pas assez d'auteurs distincts — c'est le
 /// prix assumé du plafond, et il vaut mieux une page courte et variée qu'une
 /// page pleine signée trois fois par la même personne.
+/// ⚠ L'unité déplacée est le FIL, pas le tweet. `shape_feed` vient de garantir
+/// qu'une réponse suit immédiatement son parent ; déplacer les tweets un par un
+/// aurait cassé cette adjacence dès que le parent et la réponse ont le même
+/// auteur — le parent partait en page suivante et la réponse restait seule,
+/// exactement l'orpheline qu'on cherche à éviter. Un fil compte donc pour ses
+/// auteurs, mais se déplace d'un bloc.
 fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<String> {
     let author_of = |id: &str| -> Option<&str> { tweets.get(id).map(|t| t.user_id.as_str()) };
 
-    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    let total = ids.len();
+    let mut out: Vec<String> = Vec::with_capacity(total);
     // Auteurs présents dans les `PAGE_WINDOW` dernières positions émises, et
     // leur compte. Tenu à jour au fil de l'eau plutôt que recalculé : le
     // recalcul à chaque candidat rendait la fonction quadratique en la fenêtre.
     let mut window: HashMap<String, u32> = HashMap::new();
-    let mut pending: Vec<String> = ids;
+    let mut pending: Vec<Vec<String>> = group_threads(ids, tweets);
     let mut deferrals = 0usize;
     let mut forced = 0usize;
+
+    // Place d'un bloc dans la fenêtre : le fil ne passe que si CHACUN de ses
+    // auteurs a encore de la place. Un fil de trois tweets du même auteur
+    // compte pour trois, sinon un compte prolifique reprendrait par le fil ce
+    // que le plafond lui refuse au tweet.
+    let fits = |block: &[String], window: &HashMap<String, u32>| -> bool {
+        let mut need: HashMap<&str, u32> = HashMap::new();
+        block.iter().filter_map(|id| author_of(id)).for_each(|a| {
+            *need.entry(a).or_insert(0) += 1;
+        });
+        need.iter().all(|(a, n)| window.get(*a).unwrap_or(&0) + n <= MAX_PER_AUTHOR_PER_PAGE)
+    };
 
     while !pending.is_empty() {
         // Premier candidat, dans l'ordre du score, dont l'auteur n'a pas encore
         // saturé son quota sur la fenêtre courante.
-        let pick = pending.iter().position(|id| {
-            match author_of(id) {
-                // Un candidat sans auteur connu ne peut pas être plafonné.
-                // `shape_feed` les a déjà écartés ; s'il en restait un, mieux
-                // vaut le laisser passer que le perdre silencieusement.
-                None => true,
-                Some(a) => *window.get(a).unwrap_or(&0) < MAX_PER_AUTHOR_PER_PAGE,
-            }
-        });
+        let pick = pending.iter().position(|block| fits(block, &window));
 
         let index = match pick {
             Some(i) => {
@@ -1316,8 +1509,15 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
                 pending
                     .iter()
                     .enumerate()
-                    .min_by_key(|(i, id)| {
-                        let seen = author_of(id).map_or(0, |a| *window.get(a).unwrap_or(&0));
+                    .min_by_key(|(i, block)| {
+                        // Présence de l'auteur le PLUS installé du fil : c'est
+                        // lui qui décide si le servir maintenant déséquilibre
+                        // la fenêtre.
+                        let seen = block.iter()
+                            .filter_map(|id| author_of(id))
+                            .map(|a| *window.get(a).unwrap_or(&0))
+                            .max()
+                            .unwrap_or(0);
                         // À égalité de présence, l'ordre du score tranche.
                         (seen, *i)
                     })
@@ -1325,28 +1525,34 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
             }
         };
 
-        let id = pending.remove(index);
-        if let Some(a) = author_of(&id) {
-            *window.entry(a.to_string()).or_insert(0) += 1;
-        }
-        out.push(id);
+        // Le bloc entier part d'un coup : c'est ce qui garde la réponse collée
+        // à son parent.
+        for id in pending.remove(index) {
+            if let Some(a) = author_of(&id) {
+                *window.entry(a.to_string()).or_insert(0) += 1;
+            }
+            out.push(id);
 
-        // La fenêtre glisse : l'auteur qui sort des `PAGE_WINDOW` dernières
-        // positions retrouve son quota. C'est ce glissement qui rend la garantie
-        // valable pour N'IMPORTE quelle page, quels que soient `offset` et
-        // `limit` — et pas seulement pour un découpage aligné sur 50.
-        if out.len() > PAGE_WINDOW {
-            let leaving = &out[out.len() - PAGE_WINDOW - 1];
-            if let Some(a) = author_of(leaving) {
-                if let Some(count) = window.get_mut(a) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        window.remove(a);
+            // La fenêtre glisse : l'auteur qui sort des `PAGE_WINDOW` dernières
+            // positions retrouve son quota. C'est ce glissement qui rend la
+            // garantie valable pour N'IMPORTE quelle page, quels que soient
+            // `offset` et `limit` — et pas seulement pour un découpage aligné
+            // sur 50.
+            if out.len() > PAGE_WINDOW {
+                let leaving = &out[out.len() - PAGE_WINDOW - 1];
+                if let Some(a) = author_of(leaving) {
+                    if let Some(count) = window.get_mut(a) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            window.remove(a);
+                        }
                     }
                 }
             }
         }
     }
+
+    debug_assert_eq!(out.len(), total, "l'étalement réordonne, il ne filtre pas");
 
     if deferrals > 0 || forced > 0 {
         debug!(
@@ -1356,6 +1562,78 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
     }
 
     out
+}
+
+/// Annote la liste finale du lien de fil de chaque entrée.
+///
+/// Le parent n'est retenu que s'il occupe la position PRÉCÉDENTE. Un parent
+/// présent ailleurs dans la liste ne compte pas : ce champ décrit ce que
+/// l'écran montre — « le tweet juste au-dessus est celui auquel je réponds » —
+/// et pas la généalogie du tweet, que la base connaît déjà.
+fn as_feed_entries(ids: &[String], tweets: &HashMap<&str, &RawTweet>) -> Vec<FeedEntry> {
+    ids.iter().enumerate().map(|(i, id)| {
+        let parent_id = tweets
+            .get(id.as_str())
+            .and_then(|t| t.parent_tweet_id.as_deref())
+            .filter(|parent| i > 0 && ids[i - 1] == *parent)
+            .map(String::from);
+        FeedEntry { id: id.clone(), parent_id }
+    }).collect()
+}
+
+/// Traduit les entrées d'une PAGE en liens de conversation exposables.
+///
+/// Travaille sur la page servie, pas sur la liste complète : un lien vers un
+/// parent que le client n'a pas reçu ne lui servirait à rien, sinon à lui faire
+/// afficher un fil troué.
+fn thread_links(page: &[FeedEntry]) -> Vec<ThreadLink> {
+    // Racine de chaque fil rencontré, propagée de proche en proche : la racine
+    // d'une réponse est celle de son parent, ou le parent lui-même.
+    let mut root_of: HashMap<&str, &str> = HashMap::new();
+    let mut depth_of: HashMap<&str, usize> = HashMap::new();
+    let mut links = Vec::new();
+
+    for entry in page {
+        let Some(parent) = entry.parent_id.as_deref() else { continue };
+        let root = root_of.get(parent).copied().unwrap_or(parent);
+        let depth = depth_of.get(parent).copied().unwrap_or(0) + 1;
+        root_of.insert(entry.id.as_str(), root);
+        depth_of.insert(entry.id.as_str(), depth);
+        links.push(ThreadLink {
+            tweet_id: entry.id.clone(),
+            parent_id: parent.to_string(),
+            root_id: root.to_string(),
+            depth,
+        });
+    }
+
+    links
+}
+
+/// Regroupe une liste plate en blocs indéplaçables : un fil, ou un tweet seul.
+///
+/// Le fil est reconnu à l'ADJACENCE — un tweet dont le parent est l'élément qui
+/// le précède immédiatement rejoint son bloc — et pas à une structure d'arbre.
+/// C'est exactement la règle que les clients appliquent pour tracer le trait de
+/// conversation : grouper autrement produirait des blocs que l'écran ne
+/// dessinerait pas comme des fils.
+fn group_threads(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<Vec<String>> {
+    let mut blocks: Vec<Vec<String>> = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        let follows_previous = tweets
+            .get(id.as_str())
+            .and_then(|t| t.parent_tweet_id.as_deref())
+            .zip(blocks.last().and_then(|b| b.last()))
+            .is_some_and(|(parent, previous)| parent == previous.as_str());
+
+        match blocks.last_mut() {
+            Some(block) if follows_previous => block.push(id),
+            _ => blocks.push(vec![id]),
+        }
+    }
+
+    blocks
 }
 
 /// Identité de contenu d'un candidat : ce que le lecteur va réellement lire.
@@ -1665,6 +1943,126 @@ mod tests {
             parent_tweet_id: Some(parent.to_string()),
             ..Default::default()
         }
+    }
+
+    fn reply_by(id: &str, parent: &str, author: &str) -> RawTweet {
+        RawTweet {
+            id: id.to_string(),
+            user_id: author.to_string(),
+            parent_tweet_id: Some(parent.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Vérifie l'invariant dont dépend le rendu du fil côté client : toute
+    /// réponse servie est IMMÉDIATEMENT précédée de son parent.
+    fn assert_replies_follow_their_parent(out: &[String], raw: &[RawTweet]) {
+        let by_id: HashMap<&str, &RawTweet> = raw.iter().map(|t| (t.id.as_str(), t)).collect();
+        for (i, id) in out.iter().enumerate() {
+            let Some(parent) = by_id.get(id.as_str()).and_then(|t| t.parent_tweet_id.as_deref())
+            else { continue };
+            assert_eq!(
+                out.get(i.wrapping_sub(1)).map(String::as_str),
+                Some(parent),
+                "la reponse {id} n'est pas collee a son parent {parent} : {out:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn le_lien_de_fil_decrit_la_chaine_complete() {
+        let raw = vec![
+            tweet("racine"),
+            reply("mid", "racine"),
+            reply("feuille", "mid"),
+            tweet("autre"),
+        ];
+        let ids: Vec<String> = ["racine", "mid", "feuille", "autre"]
+            .iter().map(|s| s.to_string()).collect();
+
+        let links = thread_links(&as_feed_entries(&ids, &index(&raw)));
+
+        assert_eq!(links.len(), 2, "deux reponses, deux liens : {links:?}");
+        assert_eq!(links[0].tweet_id, "mid");
+        assert_eq!(links[0].parent_id, "racine");
+        assert_eq!(links[0].root_id, "racine");
+        assert_eq!(links[0].depth, 1);
+        // La racine se propage : `feuille` répond à `mid`, mais le fil part
+        // toujours de `racine`.
+        assert_eq!(links[1].tweet_id, "feuille");
+        assert_eq!(links[1].parent_id, "mid");
+        assert_eq!(links[1].root_id, "racine");
+        assert_eq!(links[1].depth, 2);
+    }
+
+    #[test]
+    fn un_parent_hors_page_ne_produit_aucun_lien() {
+        // Cas de la coupure de pagination : la page commence par une réponse
+        // dont le parent fermait la page précédente. Sans parent à l'écran, il
+        // n'y a pas de fil à annoncer — surtout pas un lien vers un tweet que
+        // le client n'a pas reçu.
+        let raw = vec![reply("rep", "parent_hors_page"), tweet("autre")];
+        let ids: Vec<String> = ["rep", "autre"].iter().map(|s| s.to_string()).collect();
+
+        let entries = as_feed_entries(&ids, &index(&raw));
+        assert_eq!(entries[0].parent_id, None, "aucun parent adjacent : {entries:?}");
+        assert!(thread_links(&entries).is_empty());
+    }
+
+    #[test]
+    fn l_etalement_ne_separe_jamais_une_reponse_de_son_parent() {
+        // Le fil et sa réponse sont du MÊME auteur : c'est le cas qui cassait,
+        // puisque le plafond par auteur pousse le second tweet plus bas.
+        // Assez de tweets pour saturer plusieurs fenêtres et forcer l'étalement.
+        let mut raw: Vec<RawTweet> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..30 {
+            let parent = format!("p{i}");
+            let child = format!("r{i}");
+            raw.push(by(&parent, &format!("auteur{}", i % 3)));
+            raw.push(reply_by(&child, &parent, &format!("auteur{}", i % 3)));
+            ids.push(parent);
+            ids.push(child);
+        }
+
+        let out = spread_by_author(ids.clone(), &index(&raw));
+
+        assert_eq!(out.len(), ids.len(), "aucune perte a l'etalement");
+        assert_replies_follow_their_parent(&out, &raw);
+    }
+
+    #[test]
+    fn une_reponse_prolonge_le_fil_quand_son_parent_vient_d_etre_servi() {
+        // Parent et réponse tous deux bien classés : le fil se lit de haut en
+        // bas, la réponse ne doit pas être écartée sous prétexte que son
+        // ancêtre est « déjà à l'écran ».
+        let raw = vec![tweet("parent"), reply("rep", "parent"), tweet("autre")];
+        let out = shape(&scored_of(&["parent", "rep", "autre"]), &raw);
+
+        assert_eq!(out, vec!["parent", "rep", "autre"]);
+        assert_replies_follow_their_parent(&out, &raw);
+    }
+
+    #[test]
+    fn une_reponse_n_est_pas_reservie_loin_de_son_parent() {
+        // `parent` est servi en tête, `rep` n'est bien classée que beaucoup plus
+        // bas : la resservir là-bas la couperait de son contexte. Mieux vaut
+        // l'écarter que produire une orpheline.
+        let mut raw = vec![tweet("parent"), reply("rep", "parent")];
+        let mut ids = vec!["parent".to_string()];
+        for i in 0..8 {
+            let id = format!("f{i}");
+            raw.push(tweet(&id));
+            ids.push(id);
+        }
+        ids.push("rep".to_string());
+
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let out = shape(&scored_of(&refs), &raw);
+
+        assert!(!out.contains(&"rep".to_string()),
+                "reponse resservie loin de son parent : {out:?}");
+        assert_replies_follow_their_parent(&out, &raw);
     }
 
     fn retweet(id: &str, original: &str) -> RawTweet {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::models::UserProfile;
+use crate::models::{FeedEntry, UserProfile};
 
 const TTL_SEEN_TWEETS: u64 = 86400;
 const TTL_USER_PROFILE: u64 = 300;
@@ -32,16 +32,32 @@ impl CacheManager {
 
     // ─── Recommandations ─────────────────────────────────────────────────────
 
-    pub async fn get_recommendations(&self, user_id: &str, mode: &str) -> Option<Vec<String>> {
+    /// ⚠ Deux formats cohabitent dans Redis pendant la durée d'un TTL.
+    ///
+    /// La clé contenait une simple liste d'identifiants ; elle contient
+    /// désormais des `FeedEntry`, qui portent en plus le lien de fil. Au
+    /// déploiement, les clés déjà écrites par la version précédente restent
+    /// valides jusqu'à 180 s — les lire en `FeedEntry` échoue, et sans ce repli
+    /// chaque utilisateur ayant un feed en cache aurait vu son fil recalculé
+    /// intégralement à sa prochaine requête. On les relit donc à l'ancienne,
+    /// sans lien de fil : elles ne contenaient de toute façon aucune réponse.
+    pub async fn get_recommendations(&self, user_id: &str, mode: &str) -> Option<Vec<FeedEntry>> {
         let key = format!("twitninf:reco:{}:{}", user_id, mode);
         let mut c = self.conn.lock().await;
         let json: Option<String> = c.get(&key).await.ok()?;
-        json.and_then(|j| serde_json::from_str(&j).ok())
+        let json = json?;
+
+        if let Ok(entries) = serde_json::from_str::<Vec<FeedEntry>>(&json) {
+            return Some(entries);
+        }
+        serde_json::from_str::<Vec<String>>(&json).ok().map(|ids| {
+            ids.into_iter().map(|id| FeedEntry { id, parent_id: None }).collect()
+        })
     }
 
-    pub async fn set_recommendations_ttl(&self, user_id: &str, mode: &str, ids: &[String], ttl: u64) {
+    pub async fn set_recommendations_ttl(&self, user_id: &str, mode: &str, entries: &[FeedEntry], ttl: u64) {
         let key = format!("twitninf:reco:{}:{}", user_id, mode);
-        if let Ok(json) = serde_json::to_string(ids) {
+        if let Ok(json) = serde_json::to_string(entries) {
             let mut c = self.conn.lock().await;
             let _: Result<(), _> = c.set_ex(&key, json, ttl).await;
         }
