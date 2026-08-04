@@ -39,3 +39,9 @@ coverage/
 # Build artifacts
 dist/
 build/
+
+# Identifiants : jamais dans le depot.
+*.env
+.env
+*.service
+!*.service.example

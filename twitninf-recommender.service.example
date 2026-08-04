@@ -1,0 +1,69 @@
+# Unité systemd du recommandeur — MODÈLE.
+#
+# ⚠ Ce fichier remplace `twitninf-rust-recommender.service`, retiré du dépôt et
+# de son historique : il contenait de VRAIS identifiants de production en clair
+# (mot de passe PostgreSQL, mot de passe Redis, clés admin et interne), et le
+# dépôt est public.
+#
+# Ne jamais réintroduire de valeur réelle ici. Les identifiants vivent
+# uniquement dans l'unité installée sur le VPS, sous /etc/systemd/system/, qui
+# n'est pas versionnée.
+#
+# ⚠ Le nom de l'unité en production est `rust-recommender.service`, PAS
+# `twitninf-rust-recommender.service`. Les deux existent sur la machine ; la
+# seconde est un doublon périmé, inactif et désactivé, dont les identifiants
+# sont faux — la démarrer produit une boucle de crash toutes les 5 s et un
+# échec de bind, le port 3002 étant déjà tenu par la vraie unité.
+#
+# Installation :
+#   sudo cp twitninf-recommender.service.example /etc/systemd/system/rust-recommender.service
+#   sudo systemctl edit --full rust-recommender   # y renseigner les vraies valeurs
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rust-recommender
+
+[Unit]
+Description=TwitNinf Rust Recommender — NeuralRank Fusion Engine
+After=network.target postgresql.service redis-server.service
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=debian
+WorkingDirectory=/home/debian/rust-recommender
+ExecStart=/home/debian/rust-recommender/target/release/twitninf-recommender
+Restart=always
+RestartSec=5
+
+Environment=RUST_PORT=3002
+Environment=DB_HOST=localhost
+Environment=DB_PORT=5432
+Environment=DB_NAME=twitninf
+Environment=DB_USER=admin
+Environment=DB_PASSWORD=<a-renseigner-sur-le-vps>
+Environment=REDIS_URL=redis://:<a-renseigner-sur-le-vps>@127.0.0.1:6379
+Environment=LOG_LEVEL=info
+Environment=DB_POOL_SIZE=10
+Environment=RUST_LOG=twitninf_recommender=info
+
+# Générer chacune avec `openssl rand -hex 32`. Le service REFUSE de démarrer
+# tant qu'elles valent leur sentinelle par défaut (voir `src/config.rs`).
+Environment=ADMIN_SECRET=<openssl rand -hex 32>
+# Doit être identique à l'INTERNAL_SECRET de l'API, sinon le suivi des
+# interactions échoue en silence.
+Environment=INTERNAL_SECRET=<openssl rand -hex 32>
+
+# Sécurité
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/debian/rust-recommender
+
+# Limites
+LimitNOFILE=65536
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=twitninf-recommender
+
+[Install]
+WantedBy=multi-user.target
