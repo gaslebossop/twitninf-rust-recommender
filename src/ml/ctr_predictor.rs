@@ -15,6 +15,21 @@ use tracing::{debug, info, warn};
 const N_FEATURES: usize = 14;
 const MODEL_PATH: &str = "data/ctr_model.json";
 
+/// CTR de référence avant tout entraînement — cohérent avec le prior de
+/// `global_ctr()` ci-dessous.
+const PRIOR_CTR: f64 = 0.07;
+
+/// Multiplicateur de taux d'apprentissage appliqué au seul biais.
+///
+/// Avec un CTR réel de l'ordre de 1-2 %, la correction de calibration à froid
+/// est massive : partie d'un biais mal calé, elle doit être encaissée par un
+/// seul paramètre plutôt que diffusée sur les 8 poids de dimension. Sans ce
+/// multiplicateur, observé en prod après 10k samples : les 8 poids D1-D8
+/// finissent tous négatifs (le biais seul n'avait pas assez convergé), et
+/// l'auto-tuner (voir `extract_dimension_weights`) n'a alors plus aucun signal
+/// de dimension à extraire.
+const BIAS_LR_MULTIPLIER: f64 = 8.0;
+
 /// Modèle logistique entraînable en ligne (SGD)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CtrModel {
@@ -46,7 +61,7 @@ impl Default for CtrModel {
                 0.05,  // is_recent (< 2h)
                 0.07,  // engagement_acceleration
             ],
-            bias: -0.5,
+            bias: -2.5867, // logit(PRIOR_CTR) — au lieu d'un -0.5 arbitraire qui prédisait ~38 % de CTR à froid
             learning_rate: 0.01,
             samples_seen: 0,
             total_clicks: 0,
@@ -73,7 +88,7 @@ impl CtrModel {
         // Learning rate avec décroissance inverse de racine (Robbins-Monro)
         let lr = self.learning_rate / (1.0 + 0.001 * self.samples_seen as f64).sqrt();
 
-        self.bias += lr * error;
+        self.bias += lr * BIAS_LR_MULTIPLIER * error;
         for (w, f) in self.weights.iter_mut().zip(features.iter()) {
             *w += lr * error * f;
             // L2 regularisation légère (λ=0.0001) pour éviter overfitting
@@ -86,7 +101,7 @@ impl CtrModel {
     }
 
     pub fn global_ctr(&self) -> f64 {
-        if self.total_views == 0 { return 0.07; } // prior
+        if self.total_views == 0 { return PRIOR_CTR; }
         self.total_clicks as f64 / self.total_views as f64
     }
 }
@@ -176,6 +191,13 @@ impl CtrPredictor {
     pub fn stats(&self) -> (u64, f64) {
         let m = self.0.read().unwrap();
         (m.samples_seen, m.global_ctr())
+    }
+
+    /// Retourne les 8 premiers poids (D1-D8) pour l'auto-tuner
+    pub fn dimension_weights_snapshot(&self) -> [f64; 8] {
+        let m = self.0.read().unwrap();
+        let w = &m.weights;
+        [w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]
     }
 }
 

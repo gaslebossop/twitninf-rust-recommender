@@ -17,25 +17,38 @@
 use chrono::Utc;
 use tracing::{debug, trace};
 
+use crate::admin::AlgoWeights;
+use crate::algorithm::d9_llm_understanding::{
+    d9_llm_understanding as calculate_d9, quality_boost, toxicity_penalty,
+};
 use crate::ml::ctr_predictor::{extract_features, CtrPredictor};
 use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
-    ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
+    AuthorTier, ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
     UserProfile, UserType,
 };
 use crate::shadowban::{GarbageContentDetector, ShadowbanEnforcer};
 
-// ─── Poids globaux des 8 dimensions (Phase 1 CTR Optimization) ───────────────
-// D1 boosted: engagement velocity est le meilleur prédicteur de CTR
-const W_D1_ENGAGEMENT_VELOCITY: f64  = 0.32; // +0.07 vs baseline
-const W_D2_CONTENT_INTELLIGENCE: f64 = 0.18; // -0.02
-const W_D3_SOCIAL_GRAPH: f64         = 0.15;
-const W_D4_TEMPORAL: f64             = 0.10;
-const W_D5_BEHAVIORAL: f64           = 0.08; // -0.02
-const W_D6_DIVERSITY: f64            = 0.06; // -0.02 (acceptable)
-const W_D7_VIRAL: f64                = 0.07;
-const W_D8_PERSONALIZATION: f64      = 0.04; // -0.01
-// Total = 1.00
+// Les poids par défaut des 8 dimensions vivent dans `AlgoWeights::default()`
+// (source unique, aussi utilisée par l'admin et l'auto-tuner). Les constantes
+// dupliquées qui traînaient ici pouvaient diverger silencieusement de ce
+// défaut : deux barèmes pour le même calcul.
+
+/// Au-delà de ce nombre d'expositions sans engagement, un tweet est considéré
+/// comme refusé implicitement par le lecteur.
+const IMPRESSION_FATIGUE_START: i64 = 2;
+
+/// Coup de pouce de visibilité des comptes abonnés (Mod I).
+///
+/// Volontairement MINUSCULE : c'est un départage, pas un classement parallèle.
+/// À +3 %/+6 %, un tweet d'abonné passe devant un tweet gratuit de qualité
+/// équivalente, mais aucun contenu médiocre ne remonte au-dessus d'un bon —
+/// l'écart entre deux tweets réellement différents se compte en dizaines de
+/// pour cent sur ces dimensions. Le reste des modificateurs (fatigue,
+/// shadowban, toxicité) continue de s'appliquer par-dessus, donc payer
+/// n'achète pas l'immunité.
+const SUBSCRIPTION_BOOST_PLUS: f64 = 1.03;
+const SUBSCRIPTION_BOOST_PRO: f64 = 1.06;
 
 /// Score final d'un tweet, toutes dimensions combinées.
 /// `author_feed_count` = combien de fois cet auteur apparaît déjà dans le feed courant.
@@ -47,108 +60,123 @@ pub fn score_tweet(
     author_feed_count: u32,
     feed_tweets_so_far: &[ScoredTweet],
 ) -> ScoredTweet {
-    debug!(tweet_id = %tweet.id, author_feed_count, "━━━ SCORING TWEET START ━━━");
+    // Délègue à la variante pondérée avec les poids par défaut : les deux
+    // fonctions calculaient auparavant la même chose en double, et toute
+    // correction apportée à l'une manquait à l'autre.
+    score_tweet_with_weights(
+        tweet, profile, author_feed_count, feed_tweets_so_far,
+        &AlgoWeights::default(),
+    )
+}
 
-    // ── D1 : Engagement Velocity ─────────────────────────────────────────────
+/// Variante de `score_tweet` avec poids de dimensions injectés (admin/auto-tuner).
+pub fn score_tweet_with_weights(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    author_feed_count: u32,
+    feed_tweets_so_far: &[ScoredTweet],
+    weights: &AlgoWeights,
+) -> ScoredTweet {
     let (d1, ev_raw, ev_accel, viral_vel) = d1_engagement_velocity(tweet);
-    trace!(d1, ev_raw, ev_accel, viral_vel, "D1 Engagement Velocity");
-
-    // ── D2 : Content Intelligence ────────────────────────────────────────────
     let d2 = d2_content_intelligence(tweet, profile);
-    trace!(d2, "D2 Content Intelligence");
-
-    // ── D3 : Social Graph Dynamics ───────────────────────────────────────────
     let (d3, d_follow, d_mutual, d_second) = d3_social_graph(tweet, profile);
-    trace!(d3, d_follow, d_mutual, d_second, "D3 Social Graph Dynamics");
-
-    // ── D4 : Temporal Dynamics ───────────────────────────────────────────────
     let d4 = d4_temporal_dynamics(tweet, profile);
-    trace!(d4, "D4 Temporal Dynamics");
-
-    // ── D5 : Behavioral Prediction ───────────────────────────────────────────
     let d5 = d5_behavioral_prediction(tweet, profile);
-    trace!(d5, "D5 Behavioral Prediction");
-
-    // ── D6 : Content Diversity ───────────────────────────────────────────────
     let d6 = d6_content_diversity(tweet, profile, feed_tweets_so_far);
-    trace!(d6, "D6 Content Diversity");
-
-    // ── D7 : Viral Prediction ────────────────────────────────────────────────
     let d7_raw = d7_viral_prediction(tweet);
-    // Phase 1: boost trending tweets de 20% en D7 (potentiel viral prouvé)
-    let d7 = if tweet.source == TweetSource::Trending {
-        (d7_raw * 1.2).clamp(0.0, 1.0)
-    } else {
-        d7_raw
-    };
-    trace!(d7, d7_raw, source = ?tweet.source, "D7 Viral Prediction (with trending boost)");
-
-    // ── D8 : Personalization Depth ───────────────────────────────────────────
+    let d7 = if tweet.source == TweetSource::Trending { (d7_raw * 1.2).clamp(0.0, 1.0) } else { d7_raw };
     let d8 = d8_personalization_depth(tweet, profile);
-    trace!(d8, "D8 Personalization Depth");
+    // D9 juge le texte lui-même via les étiquettes du LLM annotateur. Neutre
+    // (0.5) tant qu'un tweet n'est pas annoté, donc sans effet sur le classement
+    // existant.
+    let d9 = calculate_d9(tweet);
 
-    // ── Phase 2 : User-Specific Weights ─────────────────────────────────────
     let user_weights = UserDimensionWeights::for_profile(profile);
     let user_weighted_score = user_weights.apply(d1, d2, d3, d4, d5, d6, d7, d8);
 
-    // ── Pondération principale : blend global + user-specific (60/40) ────────
-    let global_score = d1 * W_D1_ENGAGEMENT_VELOCITY
-        + d2 * W_D2_CONTENT_INTELLIGENCE
-        + d3 * W_D3_SOCIAL_GRAPH
-        + d4 * W_D4_TEMPORAL
-        + d5 * W_D5_BEHAVIORAL
-        + d6 * W_D6_DIVERSITY
-        + d7 * W_D7_VIRAL
-        + d8 * W_D8_PERSONALIZATION;
+    // Pondération avec les poids actifs (admin/auto-tuner) au lieu des constantes
+    let w = weights;
+    let global_score =
+          d1 * w.d1_engagement_velocity
+        + d2 * w.d2_content_intelligence
+        + d3 * w.d3_social_graph
+        + d4 * w.d4_temporal
+        + d5 * w.d5_behavioral
+        + d6 * w.d6_diversity
+        + d7 * w.d7_viral
+        + d8 * w.d8_personalization
+        + d9 * w.d9_llm_understanding;
     let base_score = global_score * 0.60 + user_weighted_score * 0.40;
-    debug!(base_score, global_score, user_weighted_score, d1, d2, d3, d4, d5, d6, d7, d8,
-           "Base score (60% global + 40% user-specific weights)");
 
-    // ── Mod A : Diversity Multiplier (anti-bulle) ────────────────────────────
     let diversity_mult = diversity_multiplier(author_feed_count);
-    debug!(diversity_mult, author_feed_count, "Diversity multiplier applied");
-
-    // ── Mod B : Modération ───────────────────────────────────────────────────
-    let mod_penalty = moderation_penalty(tweet);
-    trace!(mod_penalty, report_count = tweet.report_count, "Moderation penalty");
-
-    // ── Mod C : Source weight (bonus selon la source de collecte) ────────────
-    // Phase 1: source_bonus trending doublé (0.02 → 0.04) pour booster le CTR
+    let mod_penalty    = moderation_penalty(tweet);
     let source_bonus = match tweet.source {
-        TweetSource::SocialGraph  => 0.08,  // boost fort : personne suivie
+        TweetSource::SocialGraph  => 0.08,
         TweetSource::Personalized => 0.05,
         TweetSource::Viral        => 0.04,
         TweetSource::Influencer   => 0.03,
-        TweetSource::Trending     => 0.04,  // Phase 1: +0.02 (était 0.02)
+        TweetSource::Trending     => 0.04,
         TweetSource::Temporal     => 0.02,
         TweetSource::Discovery    => 0.01,
         TweetSource::Quality      => 0.01,
     };
-    trace!(source_bonus, source = ?tweet.source, "Source bonus");
 
     let score_before_shadowban = ((base_score + source_bonus) * diversity_mult + mod_penalty)
         .clamp(0.0, 1.0);
 
-    // ── Mod D : Shadowban — suppression graduelle des comptes poubelle ────────
     let enforcer = ShadowbanEnforcer::new();
     let shadowban_mult = enforcer.multiplier(tweet.author_shadowban_level);
     let score_after_shadowban = enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
 
-    // ── Mod E : Garbage-content penalty (qualité par tweet, temps réel) ───────
-    // Pénalise le tweet individuel selon ses signaux de contenu poubelle.
-    // Complète le shadowban (niveau compte) par un filtrage au grain du tweet.
     let garbage_signals = GarbageContentDetector::new().detect(tweet);
-    let garbage_score = garbage_signals.score();
-    // Pénalité multiplicative douce : un tweet 100% poubelle perd 60% de son score.
+    let garbage_score   = garbage_signals.score();
     let garbage_penalty = 1.0 - 0.60 * garbage_score;
-    let final_score = (score_after_shadowban * garbage_penalty).clamp(0.0, 1.0);
-    if garbage_score > 0.0 {
-        debug!(garbage_score, garbage_penalty, signals = ?garbage_signals.active_signals(),
-               "Mod E: garbage-content penalty applied");
+
+    // ── Mod F : fatigue d'exposition ─────────────────────────────────────────
+    // Un tweet déjà servi plusieurs fois à ce lecteur sans qu'il l'engage est
+    // un refus implicite — c'est le signal le plus dense dont on dispose
+    // (`user_behavior_data` compte 5× plus d'impressions que de likes). Le
+    // lecteur reste libre de le revoir une fois : la pénalité ne démarre qu'à
+    // partir de la 3e exposition, puis décroît géométriquement.
+    let fatigue = impression_fatigue(tweet.viewer_impressions);
+
+    // ── Mod G : levier de visibilité par compte ──────────────────────────────
+    // `users.algorithmic_visibility_multiplier` existait en base et pilotait
+    // déjà l'affichage ailleurs, mais aucun scoring ne le lisait : le réglage
+    // n'avait donc aucun effet sur les recommandations.
+    let visibility = tweet.author_visibility_multiplier.clamp(0.0, 3.0);
+
+    // ── Mod H : toxicité détectée par le LLM ─────────────────────────────────
+    // Multiplicateur séparé de D9, et non un terme de son score : mettre le
+    // poids de D9 à zéro dans le panel admin ne doit pas désactiver au passage
+    // la rétrogradation du contenu agressif.
+    let toxicity_mult = toxicity_penalty(tweet);
+
+    // ── Mod I : coup de pouce d'abonné ───────────────────────────────────────
+    // Appliqué en dernier, sur le score déjà pénalisé : un compte abonné dont
+    // le tweet est toxique ou sur-exposé reste rétrogradé, le boost porte alors
+    // sur une valeur déjà écrasée.
+    let subscription_boost = subscription_boost(tweet.author_tier);
+
+    // ── Mod J : appui de qualité ─────────────────────────────────────────────
+    // Pendant de Mod H : la toxicité rétrograde, la qualité relève. Multiplicatif
+    // et non additif, donc il n'exhume pas un tweet par ailleurs pénalisé — un
+    // contenu sur-exposé ou toxique reste écrasé, même bien écrit.
+    let quality_mult = quality_boost(tweet);
+
+    let final_score = (score_after_shadowban
+        * garbage_penalty
+        * fatigue
+        * visibility
+        * toxicity_mult
+        * quality_mult
+        * subscription_boost)
+        .clamp(0.0, 1.0);
+
+    if tweet.viewer_impressions > 0 || (visibility - 1.0).abs() > f64::EPSILON {
+        trace!(tweet_id = %tweet.id, impressions = tweet.viewer_impressions, fatigue,
+               visibility, "Mod F/G appliqués");
     }
-    debug!(final_score, score_before_shadowban, shadowban_mult, garbage_penalty,
-           level = tweet.author_shadowban_level.label(),
-           "━━━ FINAL SCORE (with shadowban Mod D + garbage Mod E) ━━━");
 
     ScoredTweet {
         tweet_id: tweet.id.clone(),
@@ -173,9 +201,11 @@ pub fn score_tweet(
             source_weight:          tweet.source_weight,
             shadowban_multiplier:   shadowban_mult,
             garbage_penalty,
+            subscription_boost,
             has_media:              tweet.has_media,
             final_score,
         },
+        ctr_features: None,
     }
 }
 
@@ -193,25 +223,16 @@ pub fn score_tweet_ml(
     // Score de base (Phase 1 + Phase 2 user weights)
     let mut scored = score_tweet(tweet, profile, author_feed_count, feed_tweets_so_far);
 
+    // Les features sont extraites systématiquement, même quand le blending ML
+    // est encore désactivé : c'est ce vecteur qu'on mémorise pour entraîner le
+    // modèle. Le gater sur `use_ml` créait un blocage circulaire — pas de
+    // features stockées → pas d'entraînement → jamais assez de samples pour
+    // activer le ML.
+    let features = ctr_feature_vector(tweet, &scored);
+    scored.ctr_features = Some(features.to_vec());
+
     // Phase 2 : blending ML CTR predictor (40% ML + 60% règles)
     if let Some(ctr_model) = ctr {
-        let age_h = age_hours(tweet);
-        let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
-        let features = extract_features(
-            d1,
-            scored.breakdown.content_intelligence,
-            scored.breakdown.social_graph_dynamics,
-            scored.breakdown.temporal_dynamics,
-            scored.breakdown.behavioral_prediction,
-            scored.breakdown.content_diversity,
-            scored.breakdown.viral_prediction,
-            scored.breakdown.personalization_depth,
-            age_h,
-            tweet.source == TweetSource::Trending,
-            tweet.has_media,
-            tweet.author_followers,
-            ev_accel,
-        );
         let ml_ctr = ctr_model.predict_ctr(&features);
         let blended = scored.score * 0.60 + ml_ctr * 0.40;
         debug!(base = scored.score, ml_ctr, blended, "Phase 2: ML CTR blend (60% rules + 40% ML)");
@@ -226,6 +247,60 @@ pub fn score_tweet_ml(
 
     scored.breakdown.final_score = scored.score;
     scored
+}
+
+/// Variante ML avec poids de dimensions injectés (admin/auto-tuner).
+pub fn score_tweet_ml_with_weights(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    author_feed_count: u32,
+    feed_tweets_so_far: &[ScoredTweet],
+    ctr: Option<&CtrPredictor>,
+    realtime_boost: f64,
+    weights: &AlgoWeights,
+) -> ScoredTweet {
+    let mut scored = score_tweet_with_weights(tweet, profile, author_feed_count, feed_tweets_so_far, weights);
+
+    let features = ctr_feature_vector(tweet, &scored);
+    scored.ctr_features = Some(features.to_vec());
+
+    if let Some(ctr_model) = ctr {
+        let ml_ctr = ctr_model.predict_ctr(&features);
+        scored.score = (scored.score * 0.60 + ml_ctr * 0.40).clamp(0.0, 1.0);
+    }
+
+    if realtime_boost.abs() > 0.001 {
+        scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
+    }
+
+    scored.breakdown.final_score = scored.score;
+    scored
+}
+
+/// Construit le vecteur de features CTR d'un tweet déjà scoré.
+///
+/// Source unique : la prédiction, la mémorisation de l'impression et
+/// l'entraînement doivent tous partir d'ici. Deux constructions parallèles du
+/// vecteur, c'était précisément le bug — le modèle s'entraînait sur des
+/// constantes et prédisait sur les vraies dimensions.
+fn ctr_feature_vector(tweet: &RawTweet, scored: &ScoredTweet) -> [f64; 14] {
+    let age_h = age_hours(tweet);
+    let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
+    extract_features(
+        d1,
+        scored.breakdown.content_intelligence,
+        scored.breakdown.social_graph_dynamics,
+        scored.breakdown.temporal_dynamics,
+        scored.breakdown.behavioral_prediction,
+        scored.breakdown.content_diversity,
+        scored.breakdown.viral_prediction,
+        scored.breakdown.personalization_depth,
+        age_h,
+        tweet.source == TweetSource::Trending,
+        tweet.has_media,
+        tweet.author_followers,
+        ev_accel,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -681,15 +756,51 @@ fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile) -> f64 {
 // Modificateurs globaux
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Multiplicateur de fatigue d'exposition.
+///
+/// 0-2 impressions → 1.0 (aucune pénalité : on laisse une seconde chance,
+/// un tweet manqué au scroll n'est pas un tweet refusé).
+/// Ensuite chaque exposition supplémentaire retire 35 %, avec un plancher à
+/// 0.05 pour ne jamais bannir définitivement un contenu de la sélection.
+pub fn impression_fatigue(impressions: i64) -> f64 {
+    if impressions <= IMPRESSION_FATIGUE_START {
+        return 1.0;
+    }
+    let excess = (impressions - IMPRESSION_FATIGUE_START) as f64;
+    (0.65_f64).powf(excess).max(0.05)
+}
+
+/// Multiplicateur de visibilité lié au palier d'abonnement de l'auteur.
+///
+/// Ce n'est pas une dimension de qualité : c'est un avantage acheté, assumé
+/// comme tel, et gardé assez petit pour ne jamais faire remonter un mauvais
+/// tweet — voir les constantes.
+pub fn subscription_boost(tier: AuthorTier) -> f64 {
+    match tier {
+        AuthorTier::Free => 1.0,
+        AuthorTier::Plus => SUBSCRIPTION_BOOST_PLUS,
+        AuthorTier::Pro => SUBSCRIPTION_BOOST_PRO,
+    }
+}
+
 /// Anti-bulle de filtre : pénalise progressivement les auteurs sur-représentés.
 pub fn diversity_multiplier(author_count_in_feed: u32) -> f64 {
+    // Décroissance rendue plus franche : au-delà de trois tweets, un auteur ne
+    // doit plus concurrencer sérieusement les autres. Trois est aussi le
+    // plafond dur appliqué à la mise en page (`MAX_PER_AUTHOR_PER_PAGE`), et les
+    // deux mécanismes se complètent plutôt que de se doubler : celui-ci décide
+    // de l'ORDRE — quel tweet mérite d'être vu en premier — et le plafond décide
+    // du REMPLISSAGE. Sans la pente, le plafond se contentait de repousser à la
+    // page suivante des tweets qui restaient malgré tout mieux classés que du
+    // contenu varié ; sans le plafond, la pente ne faisait que ralentir un
+    // compte qui finissait quand même par occuper la page faute de concurrence.
     let mult = match author_count_in_feed {
         0 | 1 => 1.00,
-        2     => 0.88,
-        3     => 0.72,
-        4     => 0.55,
-        5     => 0.38,
-        _     => 0.22,
+        2     => 0.82,
+        3     => 0.62,
+        4     => 0.36,
+        5     => 0.20,
+        _     => 0.10,
     };
     trace!(author_count_in_feed, mult, "Diversity multiplier applied (anti-filter bubble)");
     mult
@@ -783,4 +894,36 @@ pub fn sigmoid(x: f64) -> f64 {
 fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
     let z = (x - mu) / sigma;
     (-0.5 * z * z).exp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abonnes_devant_gratuits_a_qualite_egale() {
+        assert!(subscription_boost(AuthorTier::Pro) > subscription_boost(AuthorTier::Plus));
+        assert!(subscription_boost(AuthorTier::Plus) > subscription_boost(AuthorTier::Free));
+        assert_eq!(subscription_boost(AuthorTier::Free), 1.0);
+    }
+
+    /// Le boost doit rester un départage. Un tweet gratuit nettement meilleur
+    /// (ici +15 % de score brut) doit continuer de passer devant un tweet Pro :
+    /// si ce test casse, c'est que l'avantage acheté est devenu un classement
+    /// parallèle.
+    #[test]
+    fn un_meilleur_tweet_gratuit_reste_devant_un_tweet_pro() {
+        let gratuit = 0.50 * subscription_boost(AuthorTier::Free);
+        let pro = 0.435 * subscription_boost(AuthorTier::Pro);
+        assert!(gratuit > pro, "gratuit={gratuit} pro={pro}");
+    }
+
+    #[test]
+    fn palier_resolu_depuis_les_deux_colonnes() {
+        assert_eq!(AuthorTier::resolve("pro", false), AuthorTier::Pro);
+        assert_eq!(AuthorTier::resolve("plus", false), AuthorTier::Plus);
+        // Compte historique : `premium` seul, sans palier explicite.
+        assert_eq!(AuthorTier::resolve("free", true), AuthorTier::Pro);
+        assert_eq!(AuthorTier::resolve("free", false), AuthorTier::Free);
+    }
 }

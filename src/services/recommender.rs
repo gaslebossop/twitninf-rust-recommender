@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -6,9 +6,11 @@ use deadpool_postgres::Pool as PgPool;
 use tokio::join;
 use tracing::{info, warn, debug, trace};
 
-use crate::algorithm::scoring::{compute_feed_metrics, score_tweet, score_tweet_ml};
+use crate::algorithm::scoring::{compute_feed_metrics, score_tweet_ml_with_weights};
 use crate::algorithm::trending::trending_score;
 use crate::bandit::bandit_select;
+use crate::experiments;
+use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
@@ -18,32 +20,98 @@ use crate::shadowban::GarbageContentDetector;
 /// retiré du feed avant scoring (le reste est seulement pénalisé via Mod E).
 const GARBAGE_HARD_DROP: f64 = 0.60;
 
+/// Convertit un vecteur de features sérialisé en tableau de taille fixe.
+/// Rejette toute taille inattendue : un vecteur tronqué décalerait chaque
+/// feature d'un cran et corromprait le modèle silencieusement.
+fn to_feature_array(features: &[f64]) -> Option<[f64; 14]> {
+    if features.len() != 14 {
+        return None;
+    }
+    let mut out = [0.0f64; 14];
+    out.copy_from_slice(features);
+    Some(out)
+}
+
 pub struct RecommenderService {
     pg: PgPool,
     cache: CacheManager,
     ctr_predictor: CtrPredictor,
+    auto_tuner: std::sync::Arc<AutoTuner>,
 }
 
 impl RecommenderService {
     pub fn new(pg: PgPool, cache: CacheManager) -> Self {
-        Self { pg, cache, ctr_predictor: CtrPredictor::new() }
+        Self {
+            pg, cache,
+            ctr_predictor: CtrPredictor::new(),
+            auto_tuner: std::sync::Arc::new(AutoTuner::new()),
+        }
+    }
+
+    pub fn new_with_tuner(pg: PgPool, cache: CacheManager, auto_tuner: std::sync::Arc<AutoTuner>) -> Self {
+        Self { pg, cache, ctr_predictor: CtrPredictor::new(), auto_tuner }
+    }
+
+    /// Variante de production : recharge le modèle CTR persisté au lieu de
+    /// repartir des poids par défaut. Sans ça, chaque redémarrage jetait
+    /// l'intégralité de l'apprentissage accumulé.
+    pub async fn new_with_tuner_and_ml(
+        pg: PgPool,
+        cache: CacheManager,
+        auto_tuner: std::sync::Arc<AutoTuner>,
+    ) -> Self {
+        let ctr_predictor = CtrPredictor::load_or_default().await;
+        Self { pg, cache, ctr_predictor, auto_tuner }
     }
 
     pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
-        Self { pg, cache, ctr_predictor }
+        Self { pg, cache, ctr_predictor, auto_tuner: std::sync::Arc::new(AutoTuner::new()) }
     }
 
-    /// Enregistre un click/skip et met à jour le modèle ML en temps réel
-    pub fn record_ctr_event(
-        &self,
-        features: [f64; 14],
-        clicked: bool,
-    ) {
-        self.ctr_predictor.record_interaction(features, clicked);
+    /// Enregistre un engagement/rejet et met à jour le modèle ML en temps réel.
+    /// `features` provient de l'impression mémorisée à l'affichage.
+    pub fn record_ctr_event(&self, features: &[f64], clicked: bool) {
+        let Some(vec) = to_feature_array(features) else {
+            warn!(len = features.len(), "CTR: vecteur de features de taille invalide, ignoré");
+            return;
+        };
+        self.ctr_predictor.record_interaction(vec, clicked);
         let (samples, global_ctr) = self.ctr_predictor.stats();
         if samples % 100 == 0 {
             info!(samples, global_ctr, "CTR model checkpoint — 100 new samples");
+        }
+    }
+
+    /// Expose les stats CTR pour l'admin node
+    pub fn ctr_stats(&self) -> (u64, f64) {
+        self.ctr_predictor.stats()
+    }
+
+    /// Persiste le modèle CTR sur disque.
+    pub async fn persist_ctr_model(&self) {
+        self.ctr_predictor.save().await;
+    }
+
+    pub fn ctr_predictor(&self) -> &CtrPredictor {
+        &self.ctr_predictor
+    }
+
+    /// Mémorise le vecteur de features de chaque tweet servi, pour pouvoir
+    /// entraîner le modèle sur ce qu'il a réellement produit.
+    async fn record_impressions(&self, user_id: &str, page_ids: &[String], scored: &[ScoredTweet]) {
+        let by_id: HashMap<&str, &ScoredTweet> =
+            scored.iter().map(|s| (s.tweet_id.as_str(), s)).collect();
+
+        let mut stored = 0usize;
+        for tweet_id in page_ids {
+            let Some(s) = by_id.get(tweet_id.as_str()) else { continue };
+            let Some(features) = s.ctr_features.as_ref() else { continue };
+            self.cache.record_impression(user_id, tweet_id, features).await;
+            stored += 1;
+        }
+        if stored > 0 {
+            debug!(user_id, stored, "Impressions CTR mémorisées");
         }
     }
 
@@ -73,11 +141,32 @@ impl RecommenderService {
                 let page: Vec<String> = cached.into_iter().skip(offset).take(limit).collect();
                 let count = page.len();
                 debug!(cache_hit = true, cached_total, page_size = count, "Cache hit!");
-                return Ok(self.build_empty_response(
+                let mut response = self.build_empty_response(
                     &req.user_id, page, count, mode_str,
                     start.elapsed().as_millis() as u64, true,
-                ));
+                );
+                if req.enable_experiments.unwrap_or(false) {
+                    response.experiments = experiments::assign_variants(
+                        &self.pg,
+                        &req.user_id,
+                        &response.tweet_ids,
+                    ).await.unwrap_or_else(|error| {
+                        warn!(error = ?error, "A/B assignment failed on cached recommendations");
+                        Vec::new()
+                    });
+                }
+                return Ok(response);
             }
+        }
+
+        // ── Vérification hard-ban sur le demandeur lui-même ──────────────────────
+        // Un compte hard-banni ne reçoit plus de recommandations personnalisées
+        if self.cache.admin_is_hard_banned(&req.user_id).await {
+            warn!(user_id = %req.user_id, "Hard-banned user requested recommendations — returning empty");
+            return Ok(self.build_empty_response(
+                &req.user_id, vec![], 0, mode_str,
+                start.elapsed().as_millis() as u64, false,
+            ));
         }
 
         debug!("Building user profile...");
@@ -85,8 +174,12 @@ impl RecommenderService {
         trace!(following_count = profile.following_ids.len(), top_authors = profile.top_authors.len(),
                user_type = ?profile.user_type, "User profile built");
 
+        // ── Charger la liste des hard-bannis pour filtrage SQL ───────────────────
+        let banned_set = self.cache.admin_get_hard_banned_set().await;
+        debug!(banned_count = banned_set.len(), "Hard-banned set loaded");
+
         debug!("Collecting candidates from {} sources...", 8);
-        let (sources, source_stats) = self.collect_candidates(&req.user_id, &profile, &mode).await?;
+        let (sources, source_stats) = self.collect_candidates(&req.user_id, &profile, &mode, &banned_set).await?;
         let total_candidates = sources.len();
         debug!(total_candidates,
                trending = source_stats.trending, social_graph = source_stats.social_graph,
@@ -104,21 +197,66 @@ impl RecommenderService {
         }
 
         debug!("Deduplicating {} candidates...", total_candidates);
-        let deduped = deduplicate(sources);
+        let mut deduped = deduplicate(sources);
         let deduped_count = deduped.len();
+
+        // ── Charger les niveaux de shadowban depuis Redis ────────────────────────
+        // On collecte les author_ids uniques puis on fait un batch lookup Redis.
+        let author_ids: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            deduped.iter().filter_map(|t| {
+                if seen.insert(t.user_id.clone()) { Some(t.user_id.clone()) } else { None }
+            }).collect()
+        };
+        let shadowban_levels = self.cache.admin_load_shadowban_levels(&author_ids).await;
+        if !shadowban_levels.is_empty() {
+            debug!(count = shadowban_levels.len(), "Shadowban levels loaded from Redis");
+            for tweet in deduped.iter_mut() {
+                if let Some(&level) = shadowban_levels.get(&tweet.user_id) {
+                    tweet.author_shadowban_level = level;
+                }
+            }
+        }
         debug!(deduped_count, removed = total_candidates - deduped_count, "Deduplication complete");
 
+        // ── Plancher de qualité ─────────────────────────────────────────────────
+        // Écarté AVANT le scoring, et pas rétrogradé : un tweet sans apport
+        // remonterait sinon dès que le vivier est maigre. Les tweets non annotés
+        // et les étiquettes hésitantes passent (voir `below_quality_floor`).
+        let before_quality = deduped.len();
+        deduped.retain(|t| !crate::algorithm::d9_llm_understanding::below_quality_floor(t));
+        let dropped_low_quality = before_quality - deduped.len();
+        if dropped_low_quality > 0 {
+            debug!(
+                dropped = dropped_low_quality,
+                remaining = deduped.len(),
+                floor = crate::algorithm::d9_llm_understanding::MIN_QUALITY,
+                "Low-quality tweets excluded from recommendations"
+            );
+        }
+
+        // ── Charger les poids actifs (admin override > auto-tuner > defaults) ────
+        let admin_weights = self.cache.admin_load_weights().await;
+        self.auto_tuner.maybe_update(&self.ctr_predictor, admin_weights.as_ref());
+        let active_weights = self.auto_tuner.active_weights(admin_weights.as_ref());
+
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
-        let scored = self.score_all(&deduped, &profile, &mode);
+        let scored = self.score_all(&deduped, &profile, &mode, &active_weights);
         debug!(scored_count = scored.len(), "Scoring complete");
 
         // Show top 5 scores
         let top_5: Vec<_> = scored.iter().take(5).map(|s| (&s.tweet_id, s.score)).collect();
         trace!("Top 5 scores: {:?}", top_5);
 
-        let all_ids: Vec<String> = scored.iter().map(|s| s.tweet_id.clone()).collect();
-
         let tweet_map: HashMap<&str, &RawTweet> = deduped.iter().map(|t| (t.id.as_str(), t)).collect();
+
+        // Mise en forme du fil : plafonne les réponses et fait précéder chacune
+        // du tweet auquel elle répond.
+        let all_ids = shape_feed(&scored, &tweet_map);
+        // Puis étalement par auteur — appliqué AVANT la mise en cache, donc les
+        // pages servies depuis Redis en héritent aussi.
+        let all_ids = spread_by_author(all_ids, &tweet_map);
+
         let pairs: Vec<(&RawTweet, &ScoredTweet)> = scored.iter()
             .filter_map(|s| tweet_map.get(s.tweet_id.as_str()).map(|t| (*t, s)))
             .collect();
@@ -138,6 +276,24 @@ impl RecommenderService {
         let count = page_ids.len();
         debug!(pagination_offset = offset, pagination_limit = limit, page_size = count, total_available, "Pagination applied");
 
+        // ── Mémoriser les impressions servies pour l'entraînement CTR ────────────
+        // Uniquement les tweets réellement renvoyés : ceux qui sortent de la
+        // pagination n'ont jamais été exposés au lecteur, les compter en
+        // négatif fabriquerait des rejets qui n'ont pas eu lieu.
+        self.record_impressions(&req.user_id, &page_ids, &scored).await;
+        let experiment_assignments = if req.enable_experiments.unwrap_or(false) {
+            experiments::assign_variants(
+                &self.pg,
+                &req.user_id,
+                &page_ids,
+            ).await.unwrap_or_else(|error| {
+                warn!(error = ?error, "A/B assignment failed on recommendations");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+
         info!(
             user_id = %req.user_id, mode = mode_str,
             candidates = total_candidates, deduped = deduped_count,
@@ -152,10 +308,11 @@ impl RecommenderService {
             tweet_ids: page_ids,
             count,
             algorithm: "NeuralRank Fusion",
-            algorithm_version: "2.1.0 — 8 dimensions + ML CTR + bandit + garbage filter",
+            algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
             mode: mode_str.to_string(),
             latency_ms: start.elapsed().as_millis() as u64,
             cache_hit: false,
+            experiments: experiment_assignments,
             metadata: RecommendMetadata {
                 candidates_collected: total_candidates,
                 sources: SourceStats {
@@ -191,7 +348,7 @@ impl RecommenderService {
         })
     }
 
-    fn score_all(&self, tweets: &[RawTweet], profile: &UserProfile, mode: &RecommendMode) -> Vec<ScoredTweet> {
+    fn score_all(&self, tweets: &[RawTweet], profile: &UserProfile, mode: &RecommendMode, weights: &crate::admin::AlgoWeights) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
         let (ctr_samples, _) = self.ctr_predictor.stats();
@@ -215,11 +372,12 @@ impl RecommenderService {
             }
 
             let ac = *author_count.get(&tweet.user_id).unwrap_or(&0);
-            // Phase 2+3: score_tweet_ml intègre user weights + CTR predictor + realtime boost
-            let mut s = score_tweet_ml(
+            // Phase 2+3: score_tweet_ml_with_weights intègre poids actifs + CTR predictor + realtime boost
+            let mut s = score_tweet_ml_with_weights(
                 tweet, profile, ac, &scored_feed,
                 if use_ml { Some(&self.ctr_predictor) } else { None },
                 0.0, // realtime_boost: 0.0 ici (appliqué via feedback_loop dans le handler)
+                weights,
             );
             let base_score = s.score;
 
@@ -309,29 +467,50 @@ impl RecommenderService {
 
         debug!(user_id, "Building user profile from database...");
         let client = self.pg.get().await?;
-        let uid = user_id;
+        let uid = uuid::Uuid::parse_str(user_id)?;
 
         // Pipeline : tokio-postgres multiplexe plusieurs requêtes concurrentes sur
-        // une même connexion. On lance les 7 requêtes de profil en parallèle via
+        // une même connexion. On lance les requêtes de profil en parallèle via
         // join! au lieu de les enchaîner — la latence devient celle de la plus
-        // lente, pas la somme.
-        let sql_social = format!("SELECT following_id::text, EXISTS(SELECT 1 FROM user_follows f2 WHERE f2.follower_id = following_id AND f2.following_id = '{uid}'::uuid) AS is_mutual FROM user_follows WHERE follower_id = '{uid}'::uuid LIMIT 1000");
-        let sql_engagement = format!("SELECT SUM(CASE WHEN created_at > NOW() - INTERVAL '1 day' THEN 1 ELSE 0 END) AS daily, SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS weekly FROM tweet_likes WHERE user_id = '{uid}'::uuid");
-        let sql_temporal = format!("SELECT EXTRACT(HOUR FROM created_at)::int AS h, EXTRACT(DOW FROM created_at)::int AS d, COUNT(*) AS cnt FROM tweet_likes WHERE user_id = '{uid}'::uuid AND created_at > NOW() - INTERVAL '60 days' GROUP BY h, d ORDER BY h, d");
-        let sql_content = format!("SELECT AVG(LENGTH(t.content))::float8 AS avg_len, SUM(CASE WHEN t.media_urls IS NOT NULL AND t.media_urls != '[]'::jsonb THEN 1 ELSE 0 END)::float8 / GREATEST(COUNT(*), 1) AS media_ratio, AVG(COALESCE(jsonb_array_length(t.hashtags), 0))::float8 AS avg_hashtags FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = '{uid}'::uuid AND tl.created_at > NOW() - INTERVAL '30 days'");
-        let sql_behavior = format!("SELECT (SELECT COUNT(*) FROM tweet_retweets WHERE user_id = '{uid}'::uuid) AS rt_count, (SELECT COUNT(*) FROM tweet_likes WHERE user_id = '{uid}'::uuid) AS like_count, (SELECT COUNT(*) FROM tweets WHERE user_id = '{uid}'::uuid AND parent_tweet_id IS NOT NULL) AS reply_count, (SELECT COUNT(*) FROM user_follows WHERE following_id = '{uid}'::uuid) AS followers, (SELECT COUNT(*) FROM user_follows WHERE follower_id = '{uid}'::uuid) AS following");
-        let sql_affinity = format!("SELECT t.user_id::text AS author_id, COUNT(*)::float8 AS affinity FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = '{uid}'::uuid AND tl.created_at > NOW() - INTERVAL '60 days' GROUP BY t.user_id ORDER BY affinity DESC LIMIT 20");
-        let sql_seen = format!("SELECT tweet_id::text FROM tweet_likes WHERE user_id = '{uid}'::uuid ORDER BY created_at DESC LIMIT 500");
+        // lente, pas la somme. Toutes sont paramétrées ($1), plus construites
+        // par `format!`.
+        //
+        // `status = 'active'` est décisif : sans ce filtre, un compte bloqué ou
+        // mis en sourdine restait compté comme « suivi », donc boosté de +30 %
+        // en mode Feed et de +0.55 en D3. On se retrouvait à pousser en tête de
+        // fil le contenu des comptes que l'utilisateur avait explicitement
+        // écartés.
+        const SQL_SOCIAL: &str = "SELECT following_id::text, EXISTS(SELECT 1 FROM user_follows f2 WHERE f2.follower_id = user_follows.following_id AND f2.following_id = $1 AND f2.status = 'active') AS is_mutual FROM user_follows WHERE follower_id = $1 AND status = 'active' LIMIT 1000";
+        const SQL_ENGAGEMENT: &str = "SELECT SUM(CASE WHEN created_at > NOW() - INTERVAL '1 day' THEN 1 ELSE 0 END) AS daily, SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS weekly FROM tweet_likes WHERE user_id = $1";
+        const SQL_TEMPORAL: &str = "SELECT EXTRACT(HOUR FROM created_at)::int AS h, EXTRACT(DOW FROM created_at)::int AS d, COUNT(*) AS cnt FROM tweet_likes WHERE user_id = $1 AND created_at > NOW() - INTERVAL '60 days' GROUP BY h, d ORDER BY h, d";
+        const SQL_CONTENT: &str = "SELECT AVG(LENGTH(t.content))::float8 AS avg_len, SUM(CASE WHEN t.media_urls IS NOT NULL AND t.media_urls != '[]'::jsonb THEN 1 ELSE 0 END)::float8 / GREATEST(COUNT(*), 1) AS media_ratio, AVG(COALESCE(jsonb_array_length(t.hashtags), 0))::float8 AS avg_hashtags FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = $1 AND tl.created_at > NOW() - INTERVAL '30 days'";
+        const SQL_BEHAVIOR: &str = "SELECT (SELECT COUNT(*) FROM tweet_retweets WHERE user_id = $1) AS rt_count, (SELECT COUNT(*) FROM tweet_likes WHERE user_id = $1) AS like_count, (SELECT COUNT(*) FROM tweets WHERE user_id = $1 AND parent_tweet_id IS NOT NULL) AS reply_count, (SELECT COUNT(*) FROM user_follows WHERE following_id = $1 AND status = 'active') AS followers, (SELECT COUNT(*) FROM user_follows WHERE follower_id = $1 AND status = 'active') AS following";
+        const SQL_AFFINITY: &str = "SELECT t.user_id::text AS author_id, COUNT(*)::float8 AS affinity FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = $1 AND tl.created_at > NOW() - INTERVAL '60 days' GROUP BY t.user_id ORDER BY affinity DESC LIMIT 20";
+        const SQL_SEEN: &str = "SELECT tweet_id::text FROM tweet_likes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 500";
+        const SQL_RETWEETED: &str = "SELECT tweet_id::text FROM tweet_retweets WHERE user_id = $1 ORDER BY created_at DESC LIMIT 300";
+        // Contenu réellement aimé — sert à reconstruire les centres d'intérêt
+        // (`top_words`) et le style préféré, deux champs que le profil laissait
+        // vides et que D2 comme D8 lisent pourtant.
+        const SQL_LIKED_TEXT: &str = "SELECT COALESCE(t.content, '') FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = $1 AND tl.created_at > NOW() - INTERVAL '90 days' ORDER BY tl.created_at DESC LIMIT 200";
+        const SQL_SECOND_DEGREE: &str = "SELECT DISTINCT f2.following_id::text FROM user_follows f JOIN user_follows f2 ON f2.follower_id = f.following_id AND f2.status = 'active' WHERE f.follower_id = $1 AND f.status = 'active' AND f2.following_id <> $1 AND f2.following_id NOT IN (SELECT following_id FROM user_follows WHERE follower_id = $1 AND status = 'active') LIMIT 200";
+
+        // Lié à une variable : `&[&uid]` en argument direct crée un temporaire
+        // détruit avant la fin du `join!`.
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&uid];
 
         let (social_res, engagement_res, temporal_res, content_pref_res,
-             behavior_res, author_affinity_res, seen_ids_res) = join!(
-            client.query(sql_social.as_str(), &[]),
-            client.query(sql_engagement.as_str(), &[]),
-            client.query(sql_temporal.as_str(), &[]),
-            client.query(sql_content.as_str(), &[]),
-            client.query(sql_behavior.as_str(), &[]),
-            client.query(sql_affinity.as_str(), &[]),
-            client.query(sql_seen.as_str(), &[]),
+             behavior_res, author_affinity_res, seen_ids_res,
+             retweeted_res, liked_text_res, second_degree_res) = join!(
+            client.query(SQL_SOCIAL, &params),
+            client.query(SQL_ENGAGEMENT, &params),
+            client.query(SQL_TEMPORAL, &params),
+            client.query(SQL_CONTENT, &params),
+            client.query(SQL_BEHAVIOR, &params),
+            client.query(SQL_AFFINITY, &params),
+            client.query(SQL_SEEN, &params),
+            client.query(SQL_RETWEETED, &params),
+            client.query(SQL_LIKED_TEXT, &params),
+            client.query(SQL_SECOND_DEGREE, &params),
         );
 
         let mut profile = UserProfile::default();
@@ -436,17 +615,32 @@ impl RecommenderService {
         }
         profile.seen_tweet_ids = self.cache.get_seen_tweet_ids(user_id).await;
 
-        // Amis d'amis
-        if let Ok(c2) = self.pg.get().await {
-            if let Ok(rows) = c2.query(
-                &*format!("SELECT DISTINCT f2.following_id::text FROM user_follows f JOIN user_follows f2 ON f2.follower_id = f.following_id WHERE f.follower_id = '{user_id}'::uuid AND f2.following_id != '{user_id}'::uuid AND f2.following_id NOT IN (SELECT following_id FROM user_follows WHERE follower_id = '{user_id}'::uuid) LIMIT 200"),
-                &[]
-            ).await {
-                profile.second_degree_ids = rows.iter()
-                    .filter_map(|r| r.try_get::<_, String>(0).ok())
-                    .collect();
-                trace!(second_degree_count = profile.second_degree_ids.len(), "Second degree network loaded");
-            }
+        if let Ok(rows) = retweeted_res {
+            // Sans ces ids, `profile_retweet_rate` valait 0/N = 0 dans D5 et le
+            // bonus « prédiction de partage » ne se déclenchait jamais.
+            profile.retweeted_tweet_ids = rows.iter()
+                .filter_map(|r| r.try_get::<_, String>(0).ok())
+                .collect();
+            trace!(retweeted = profile.retweeted_tweet_ids.len(), "Retweet history loaded");
+        }
+
+        if let Ok(rows) = liked_text_res {
+            let texts: Vec<String> = rows.iter()
+                .filter_map(|r| r.try_get::<_, String>(0).ok())
+                .collect();
+            let (words, personality, positivity) = profile_from_liked_text(&texts);
+            profile.top_words = words;
+            profile.personality_type = personality;
+            profile.emotional_positivity = positivity;
+            trace!(top_words = profile.top_words.len(), positivity,
+                   personality = ?profile.personality_type, "Interests derived from liked content");
+        }
+
+        if let Ok(rows) = second_degree_res {
+            profile.second_degree_ids = rows.iter()
+                .filter_map(|r| r.try_get::<_, String>(0).ok())
+                .collect();
+            trace!(second_degree_count = profile.second_degree_ids.len(), "Second degree network loaded");
         }
 
         debug!(profile_confidence = profile.profile_confidence, "User profile built and cached");
@@ -454,241 +648,129 @@ impl RecommenderService {
         Ok(profile)
     }
 
+    /// Collecte les candidats des 8 sources en UNE requête paramétrée.
+    ///
+    /// L'ancienne version envoyait 8 requêtes construites par `format!`, chacune
+    /// répétant 5 sous-requêtes corrélées par ligne (jusqu'à ~1700 lignes), et
+    /// ne calculait l'engagement récent que pour 2 sources sur 8 — le même tweet
+    /// obtenait donc un D1 différent selon la source qui l'avait trouvé. Ici les
+    /// sources ne sélectionnent que des ids, la déduplication se fait en SQL, et
+    /// les métriques sont calculées une seule fois par candidat unique.
     async fn collect_candidates(
         &self,
         user_id: &str,
         profile: &UserProfile,
         mode: &RecommendMode,
+        banned_set: &std::collections::HashSet<String>,
     ) -> Result<(Vec<RawTweet>, SourceStats)> {
-        let (window_trending, window_social, window_discover, window_viral) = match mode {
-            RecommendMode::Trending  => ("6 hours",  "24 hours", "48 hours", "3 hours"),
-            RecommendMode::Feed      => ("12 hours", "72 hours", "48 hours", "6 hours"),
-            RecommendMode::Discover  => ("24 hours", "48 hours", "96 hours", "12 hours"),
-            RecommendMode::ForYou    => ("72 hours", "72 hours", "96 hours", "24 hours"),
+        // ⚠ La fenêtre DÉCOUVERTE est volontairement bien plus large que les
+        // autres. C'est la seule source qui tire au hasard parmi les auteurs
+        // NON suivis : c'est elle, et elle seule, qui fait entrer des comptes
+        // nouveaux dans le vivier.
+        //
+        // Elle valait 96 h, ce qui paraît généreux mais ne l'est pas du tout à
+        // l'échelle réelle de la plateforme. Relevé en prod le 2026-07-29 :
+        //   24 h →  7 auteurs ·  72 h → 10 auteurs
+        //    7 j → 16 auteurs ·  30 j → 69 auteurs
+        // Le vivier ne contenait donc que ~10 auteurs, dont un qui publie
+        // presque la moitié du corpus — et le fil servi comptait 37 tweets du
+        // même compte sur 50, avec des séries de 38 d'affilée. Aucun réglage de
+        // score ni plafond de mise en page ne peut corriger ça : on ne
+        // diversifie pas un vivier qui ne contient personne d'autre.
+        //
+        // Les fenêtres trending / social / viral restent courtes : c'est ce qui
+        // garde le haut du fil frais. Seule la découverte remonte loin, et son
+        // poids (0.05) fait qu'elle apporte de la variété sans noyer l'actualité.
+        let (window_trending, window_social, window_discover, window_viral): (i32, i32, i32, i32) = match mode {
+            RecommendMode::Trending  => (6,  24, 24 * 7,  3),
+            RecommendMode::Feed      => (12, 72, 24 * 14, 6),
+            RecommendMode::Discover  => (24, 48, 24 * 30, 12),
+            RecommendMode::ForYou    => (72, 72, 24 * 30, 24),
         };
+        // Horizon global : aucune source ne remonte plus loin, le CTE `visible`
+        // n'a donc pas à balayer toute la table.
+        let horizon = window_trending
+            .max(window_social)
+            .max(window_discover)
+            .max(window_viral)
+            .max(24 * 7);
         debug!(mode = ?mode, trending_window = window_trending, social_window = window_social,
                discover_window = window_discover, viral_window = window_viral, "Collecting candidates with time windows");
 
-        let following_list = &profile.following_ids;
         let active_hour = profile.most_active_hour as i32;
 
-        // Formater une liste d'UUIDs pour une clause IN SQL.
-        // On ne garde que les entrées qui sont des UUID valides : défense en
-        // profondeur contre toute valeur malformée venant du graphe social.
-        let format_uuid_list = |ids: &[String]| -> String {
-            let valid: Vec<String> = ids.iter()
-                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-                .map(|id| format!("'{}'", id))
-                .collect();
-            if valid.is_empty() { return "'00000000-0000-0000-0000-000000000000'".to_string(); }
-            valid.join(",")
+        // Les listes d'ids partent en paramètres `uuid[]`, plus jamais
+        // concaténées dans le SQL : une liste vide donne `= ANY('{}')` qui vaut
+        // simplement `false`, sans sentinelle bidon ni branche spéciale.
+        let to_uuids = |ids: &[String]| -> Vec<uuid::Uuid> {
+            ids.iter().filter_map(|id| uuid::Uuid::parse_str(id).ok()).collect()
         };
-
-        let following_sql = format_uuid_list(following_list);
-        let top_authors_sql = format_uuid_list(
+        let uid = uuid::Uuid::parse_str(user_id)?;
+        let following_uuids = to_uuids(&profile.following_ids);
+        let top_author_uuids = to_uuids(
             &profile.top_authors.iter().take(10).map(|(id, _)| id.clone()).collect::<Vec<_>>()
         );
+        let banned_uuids: Vec<uuid::Uuid> = banned_set.iter()
+            .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+            .collect();
 
-        // Source 1 : Trending
-        let sql_trending = format!(
-            "SELECT {COLS}, likes_1h, likes_6h, comments_1h, 0::bigint AS retweets_1h \
-             FROM tweets t JOIN users u ON u.id = t.user_id \
-             LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS likes_1h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '6 hours') AS likes_6h FROM tweet_likes WHERE tweet_id = t.id) lk ON true \
-             LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS comments_1h FROM tweets WHERE parent_tweet_id = t.id AND deleted_at IS NULL) cm ON true \
-             WHERE {WHERE} AND t.created_at > NOW() - INTERVAL '{w}' AND t.user_id != '{uid}'::uuid \
-             ORDER BY (COALESCE(t.view_count,0) + lk.likes_1h * 10) DESC LIMIT 400",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_trending, uid = user_id
-        );
+        let client = self.pg.get().await?;
+        let rows = client.query(CANDIDATES_SQL, &[
+            &uid,                 // $1
+            &following_uuids,     // $2
+            &top_author_uuids,    // $3
+            &banned_uuids,        // $4
+            &window_trending,     // $5
+            &window_social,       // $6
+            &window_discover,     // $7
+            &window_viral,        // $8
+            &horizon,             // $9
+            &active_hour,         // $10
+            &MAX_CANDIDATES_PER_AUTHOR, // $11
+        ]).await?;
 
-        // Source 2 : Social graph
-        let sql_social = if following_list.is_empty() {
-            "SELECT 1 WHERE false".to_string()
-        } else {
-            format!(
-                "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
-                 FROM tweets t JOIN users u ON u.id = t.user_id \
-                 WHERE {WHERE} AND t.user_id IN ({ids}) AND t.created_at > NOW() - INTERVAL '{w}' \
-                 ORDER BY t.created_at DESC LIMIT 300",
-                COLS = TWEET_COLS, WHERE = WHERE_BASE, ids = following_sql, w = window_social
-            )
-        };
+        let all = map_rows(rows);
 
-        // Source 3 : Viral
-        let sql_viral = format!(
-            "SELECT {COLS}, likes_1h, likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
-             FROM tweets t JOIN users u ON u.id = t.user_id \
-             LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS likes_1h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '6 hours') AS likes_6h FROM tweet_likes WHERE tweet_id = t.id) lk ON true \
-             WHERE {WHERE} AND t.created_at > NOW() - INTERVAL '{w}' AND t.user_id != '{uid}'::uuid \
-             ORDER BY (lk.likes_1h * 10 + lk.likes_6h) DESC LIMIT 250",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_viral, uid = user_id
-        );
+        let mut stats = SourceStats::default();
+        for tweet in &all {
+            match tweet.source {
+                TweetSource::Trending     => stats.trending += 1,
+                TweetSource::SocialGraph  => stats.social_graph += 1,
+                TweetSource::Viral        => stats.viral += 1,
+                TweetSource::Discovery    => stats.discovery += 1,
+                TweetSource::Temporal     => stats.temporal += 1,
+                TweetSource::Influencer   => stats.influencer += 1,
+                TweetSource::Personalized => stats.personalized += 1,
+                TweetSource::Quality      => stats.quality += 1,
+            }
+        }
+        stats.deduplicated_total = all.len();
 
-        // Source 4 : Discovery
-        let exclude_following_sql = if following_list.is_empty() {
-            String::new()
-        } else {
-            format!("AND t.user_id NOT IN ({})", following_sql)
-        };
-        let sql_discovery = format!(
-            "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
-             FROM tweets t JOIN users u ON u.id = t.user_id \
-             WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '{w}' {excl} \
-             ORDER BY RANDOM() LIMIT 150",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, w = window_discover, excl = exclude_following_sql, uid = user_id
-        );
-
-        // Source 5 : Temporal
-        let sql_temporal = format!(
-            "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
-             FROM tweets t JOIN users u ON u.id = t.user_id \
-             WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '72 hours' \
-             AND EXTRACT(HOUR FROM t.created_at) BETWEEN {h_lo} AND {h_hi} \
-             ORDER BY t.created_at DESC LIMIT 150",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE,
-            h_lo = (active_hour - 1).max(0), h_hi = (active_hour + 1).min(23), uid = user_id
-        );
-
-        // Source 6 : Influenceurs (verified or premium)
-        let sql_influencer = format!(
-            "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
-             FROM tweets t JOIN users u ON u.id = t.user_id \
-             WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '48 hours' \
-             AND (u.verified = true OR u.premium = true) \
-             ORDER BY t.created_at DESC LIMIT 150",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, uid = user_id
-        );
-
-        // Source 7 : Personnalisé
-        let sql_personalized = if profile.top_authors.is_empty() {
-            "SELECT 1 WHERE false".to_string()
-        } else {
-            format!(
-                "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
-                 FROM tweets t JOIN users u ON u.id = t.user_id \
-                 WHERE {WHERE} AND t.user_id IN ({ids}) AND t.created_at > NOW() - INTERVAL '7 days' \
-                 ORDER BY t.created_at DESC LIMIT 200",
-                COLS = TWEET_COLS, WHERE = WHERE_BASE, ids = top_authors_sql
-            )
-        };
-
-        // Source 8 : Qualité
-        let sql_quality = format!(
-            "SELECT {COLS}, 0::bigint AS likes_1h, 0::bigint AS likes_6h, 0::bigint AS comments_1h, 0::bigint AS retweets_1h \
-             FROM tweets t JOIN users u ON u.id = t.user_id \
-             WHERE {WHERE} AND t.user_id != '{uid}'::uuid AND t.created_at > NOW() - INTERVAL '72 hours' \
-             AND (u.verified = true OR u.premium = true) \
-             ORDER BY t.created_at DESC LIMIT 100",
-            COLS = TWEET_COLS, WHERE = WHERE_BASE, uid = user_id
-        );
-
-        debug!("Running 8 parallel database queries for candidate sources...");
-        let (r1, r2, r3, r4, r5, r6, r7, r8) = join!(
-            async {
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_trending.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::Trending, 0.15),
-                        Err(e) => { warn!("Trending error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-            async {
-                if following_list.is_empty() { return vec![]; }
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_social.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::SocialGraph, 0.12),
-                        Err(e) => { warn!("Social error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-            async {
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_viral.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::Viral, 0.08),
-                        Err(e) => { warn!("Viral error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-            async {
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_discovery.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::Discovery, 0.05),
-                        Err(e) => { warn!("Discovery error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-            async {
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_temporal.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::Temporal, 0.06),
-                        Err(e) => { warn!("Temporal error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-            async {
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_influencer.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::Influencer, 0.04),
-                        Err(e) => { warn!("Influencer error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-            async {
-                if profile.top_authors.is_empty() { return vec![]; }
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_personalized.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::Personalized, 0.10),
-                        Err(e) => { warn!("Personalized error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-            async {
-                match self.pg.get().await {
-                    Ok(c) => match c.query(sql_quality.as_str(), &[]).await {
-                        Ok(rows) => map_rows(rows, TweetSource::Quality, 0.02),
-                        Err(e) => { warn!("Quality error: {}", e); vec![] }
-                    },
-                    Err(_) => vec![]
-                }
-            },
-        );
-
-        let stats = SourceStats {
-            trending: r1.len(), social_graph: r2.len(), viral: r3.len(),
-            discovery: r4.len(), temporal: r5.len(), influencer: r6.len(),
-            personalized: r7.len(), quality: r8.len(), deduplicated_total: 0,
-        };
-
-        trace!(
+        debug!(
+            candidates = all.len(),
             trending = stats.trending, social_graph = stats.social_graph,
             viral = stats.viral, discovery = stats.discovery,
             temporal = stats.temporal, influencer = stats.influencer,
             personalized = stats.personalized, quality = stats.quality,
-            "All 8 sources completed"
+            "Candidates collected (single parameterized query, deduped in SQL)"
         );
 
-        let mut all = Vec::with_capacity(
-            stats.trending + stats.social_graph + stats.viral + stats.discovery
-            + stats.temporal + stats.influencer + stats.personalized + stats.quality
-        );
-        all.extend(r1); all.extend(r2); all.extend(r3); all.extend(r4);
-        all.extend(r5); all.extend(r6); all.extend(r7); all.extend(r8);
-
-        debug!("Merged {} candidates from 8 sources", all.len());
         Ok((all, stats))
     }
 
     async fn count_available(&self, user_id: &str) -> Result<i64> {
         let client = self.pg.get().await?;
+        let uid = uuid::Uuid::parse_str(user_id)?;
+        // Aligné sur les filtres de `visible` : compter des tweets privés ou de
+        // comptes suspendus faussait `has_more`, qui promettait des pages
+        // supplémentaires que la pagination ne pouvait pas servir.
         let row = client.query_one(
-            &*format!("SELECT COUNT(*) FROM tweets t WHERE t.deleted_at IS NULL AND t.moderation_status = 'approved' AND t.user_id != '{user_id}'::uuid AND t.parent_tweet_id IS NULL"),
-            &[]
+            "SELECT COUNT(*) FROM tweets t JOIN users u ON u.id = t.user_id \
+             WHERE t.deleted_at IS NULL AND t.moderation_status = 'approved' \
+               AND t.is_private = false AND COALESCE(t.is_data_test, false) = false \
+               AND u.is_active = true AND COALESCE(u.is_suspended, false) = false \
+               AND t.user_id <> $1",
+            &[&uid]
         ).await?;
         Ok(row.get(0))
     }
@@ -700,8 +782,9 @@ impl RecommenderService {
         RecommendResponse {
             success: true, user_id: user_id.to_string(), tweet_ids, count,
             algorithm: "NeuralRank Fusion",
-            algorithm_version: "2.1.0 — 8 dimensions + ML CTR + bandit + garbage filter",
+            algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
             mode: mode.to_string(), latency_ms, cache_hit,
+            experiments: Vec::new(),
             metadata: RecommendMetadata {
                 candidates_collected: 0,
                 sources: SourceStats::default(),
@@ -723,39 +806,222 @@ impl RecommenderService {
 
 // ─── SQL constants ────────────────────────────────────────────────────────────
 
-const TWEET_COLS: &str = r#"
-    t.id::text,
-    t.user_id::text,
+/// Collecte + déduplication + métriques, en une seule requête paramétrée.
+///
+/// Paramètres :
+///   $1 user_id · $2 following[] · $3 top_authors[] · $4 hard_banned[]
+///   $5 fenêtre trending (h) · $6 social (h) · $7 discovery (h) · $8 viral (h)
+///   $9 horizon global (h) · $10 heure d'activité de l'utilisateur
+///   $11 plafond de candidats par auteur (voir `MAX_CANDIDATES_PER_AUTHOR`)
+const CANDIDATES_SQL: &str = r#"
+WITH visible AS (
+    SELECT t.id, t.user_id, t.created_at, u.verified, u.premium
+    FROM tweets t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.deleted_at IS NULL
+      AND t.moderation_status = 'approved'
+      -- Un tweet privé, de compte désactivé ou suspendu était collecté puis
+      -- jeté par la couche Node : autant de places de feed gaspillées.
+      AND t.is_private = false
+      AND COALESCE(t.is_data_test, false) = false
+      AND u.is_active = true
+      AND COALESCE(u.is_suspended, false) = false
+      AND t.user_id <> $1
+      AND NOT (t.user_id = ANY($4))
+      AND t.created_at > NOW() - make_interval(hours => $9)
+      -- Un retweet pur sans original affichable ne rend qu'une carte vide.
+      AND (
+        COALESCE(t.content, '') <> ''
+        OR (t.media_urls IS NOT NULL AND t.media_urls <> '[]'::jsonb)
+        OR EXISTS (
+             SELECT 1 FROM tweets o
+             WHERE o.id = t.original_tweet_id
+               AND o.deleted_at IS NULL
+               AND o.moderation_status = 'approved'
+               AND o.is_private = false
+           )
+      )
+      -- Une réponse doit avoir au moins un like pour entrer dans le pool.
+      -- Sans engagement, elle n'apporte rien hors de son fil : le lecteur voit
+      -- un bout de conversation sans le contexte. L'exception « auteur suivi »
+      -- a été retirée : suivre quelqu'un ne rend pas sa réponse vide
+      -- intéressante, et c'est par là que passait l'essentiel du bruit.
+      AND (
+        t.parent_tweet_id IS NULL
+        OR (SELECT COUNT(*) FROM tweet_likes WHERE tweet_id = t.id) >= 1
+      )
+      -- Son parent doit être affichable POUR CE LECTEUR : il sera injecté
+      -- au-dessus d'elle dans le feed, donc il doit passer exactement les mêmes
+      -- contrôles que n'importe quel candidat. Sans la vérification sur
+      -- l'auteur, répondre à un compte bloqué ou suspendu aurait suffi à faire
+      -- réapparaître son tweet dans le fil par la porte de derrière.
+      AND (
+        t.parent_tweet_id IS NULL
+        OR EXISTS (
+             SELECT 1 FROM tweets p
+             JOIN users pu ON pu.id = p.user_id
+             WHERE p.id = t.parent_tweet_id
+               AND p.deleted_at IS NULL
+               AND p.moderation_status = 'approved'
+               AND p.is_private = false
+               AND pu.is_active = true
+               AND COALESCE(pu.is_suspended, false) = false
+               AND NOT (p.user_id = ANY($4))
+           )
+      )
+),
+cand AS (
+        (SELECT id, 1 AS src, 0.15::float8 AS w FROM visible v
+          WHERE v.created_at > NOW() - make_interval(hours => $5)
+          ORDER BY (SELECT COUNT(*) FROM tweet_likes l
+                     WHERE l.tweet_id = v.id AND l.created_at > NOW() - INTERVAL '1 hour') DESC,
+                   v.created_at DESC
+          LIMIT 400)
+  UNION ALL
+        (SELECT id, 2, 0.12 FROM visible v
+          WHERE v.user_id = ANY($2) AND v.created_at > NOW() - make_interval(hours => $6)
+          ORDER BY v.created_at DESC LIMIT 300)
+  UNION ALL
+        (SELECT id, 3, 0.08 FROM visible v
+          WHERE v.created_at > NOW() - make_interval(hours => $8)
+          ORDER BY (SELECT COUNT(*) FROM tweet_likes l
+                     WHERE l.tweet_id = v.id AND l.created_at > NOW() - INTERVAL '6 hours') DESC
+          LIMIT 250)
+  UNION ALL
+        (SELECT id, 4, 0.05 FROM visible v
+          WHERE NOT (v.user_id = ANY($2))
+            AND v.created_at > NOW() - make_interval(hours => $7)
+          ORDER BY RANDOM() LIMIT 150)
+  UNION ALL
+        (SELECT id, 5, 0.06 FROM visible v
+          WHERE v.created_at > NOW() - INTERVAL '72 hours'
+            AND EXTRACT(HOUR FROM v.created_at) BETWEEN GREATEST($10 - 1, 0) AND LEAST($10 + 1, 23)
+          ORDER BY v.created_at DESC LIMIT 150)
+  UNION ALL
+        (SELECT id, 6, 0.04 FROM visible v
+          WHERE v.created_at > NOW() - INTERVAL '48 hours'
+            AND (v.verified = true OR v.premium = true)
+          ORDER BY v.created_at DESC LIMIT 150)
+  UNION ALL
+        (SELECT id, 7, 0.10 FROM visible v
+          WHERE v.user_id = ANY($3) AND v.created_at > NOW() - INTERVAL '7 days'
+          ORDER BY v.created_at DESC LIMIT 200)
+  UNION ALL
+        -- « Qualité » sélectionne désormais sur le taux d'engagement réel.
+        -- L'ancienne version reprenait le filtre verified/premium de la source
+        -- influenceur : deux sources sur huit renvoyaient les mêmes lignes.
+        (SELECT id, 8, 0.02 FROM visible v
+          WHERE v.created_at > NOW() - INTERVAL '72 hours'
+          ORDER BY (SELECT COUNT(*) FROM tweet_likes l WHERE l.tweet_id = v.id)::float8
+                 / GREATEST((SELECT COALESCE(view_count, 0) FROM tweets x WHERE x.id = v.id), 10)::float8 DESC
+          LIMIT 100)
+),
+merged AS (
+    SELECT id, MAX(w) AS w, (ARRAY_AGG(src ORDER BY w DESC))[1] AS src
+    FROM cand GROUP BY id
+),
+-- ⚠ Plafond par auteur SUR LE VIVIER, toutes sources confondues.
+--
+-- Sans lui, un compte qui publie beaucoup entrait des centaines de fois : la
+-- source « social » (comptes suivis, LIMIT 300) suffit à elle seule à saturer
+-- le vivier quand le lecteur suit un compte prolifique. Relevé en prod le
+-- 2026-07-29 sur un lecteur qui suit le plus gros publieur : 32 tweets du même
+-- auteur sur 50 servis, malgré la pénalité de diversité au score ET le plafond
+-- de mise en page. Les deux arrivent trop tard — on ne diversifie pas une liste
+-- où un auteur occupe déjà les deux tiers des candidats.
+--
+-- Le tri interne garde les MEILLEURS candidats de l'auteur (poids de source
+-- décroissant, puis les plus récents) : on borne sa place, on ne dégrade pas ce
+-- qu'il a de mieux.
+picked AS (
+    SELECT id, w, src FROM (
+        SELECT m.id, m.w, m.src,
+               ROW_NUMBER() OVER (
+                   PARTITION BY t.user_id
+                   ORDER BY m.w DESC, t.created_at DESC
+               ) AS rn
+        FROM merged m
+        JOIN tweets t ON t.id = m.id
+    ) ranked
+    WHERE rn <= $11
+)
+SELECT
+    t.id::text, t.user_id::text,
     COALESCE(t.content, '') AS content,
     t.created_at,
-    COALESCE(t.view_count, 0) AS view_count,
-    (SELECT COUNT(*)::bigint FROM tweet_likes WHERE tweet_id = t.id) AS like_count,
-    (SELECT COUNT(*)::bigint FROM tweets rep WHERE rep.parent_tweet_id = t.id AND rep.deleted_at IS NULL) AS comment_count,
-    (SELECT COUNT(*)::bigint FROM tweet_retweets WHERE tweet_id = t.id) AS retweet_count,
-    0::bigint AS share_count,
-    0::bigint AS bookmark_count,
-    0::bigint AS report_count,
-    (t.media_urls IS NOT NULL AND t.media_urls != '[]'::jsonb) AS has_media,
+    COALESCE(t.view_count, 0)::bigint AS view_count,
+    lk.like_count, cm.comment_count, rt.retweet_count,
+    COALESCE(rp.report_count, 0) AS report_count,
+    (t.media_urls IS NOT NULL AND t.media_urls <> '[]'::jsonb) AS has_media,
     COALESCE(jsonb_array_length(t.hashtags), 0)::int AS hashtag_count,
     COALESCE(jsonb_array_length(t.mentions), 0)::int AS mention_count,
     LENGTH(COALESCE(t.content, ''))::int AS content_length,
-    0::bigint AS author_followers,
-    0::bigint AS author_following,
+    au.followers, au.following, au.tweet_count, au.age_days,
     COALESCE(u.verified, false) AS author_is_verified,
-    COALESCE(u.premium, false) AS author_is_premium,
+    COALESCE(u.premium, false)  AS author_is_premium,
+    COALESCE(u.algorithmic_visibility_multiplier, 1.0)::float8 AS visibility_mult,
     COALESCE(t.moderation_status::text, 'pending') AS moderation_status,
-    t.recommendation_group::text
-"#;
-
-const WHERE_BASE: &str = r#"
-    t.deleted_at IS NULL
-    AND t.moderation_status = 'approved'
-    AND t.parent_tweet_id IS NULL
+    t.recommendation_group::text,
+    lk.likes_1h, lk.likes_6h, cm.comments_1h, rt.retweets_1h,
+    COALESCE(bh.impressions, 0) AS impressions,
+    p.src, p.w,
+    t.parent_tweet_id::text, t.original_tweet_id::text, COALESCE(t.is_retweet, false),
+    -- Étiquettes de l'annotateur LLM. LEFT JOIN volontaire : un tweet non
+    -- encore annoté doit rester servable, D9 se met alors en neutre.
+    ll.theme, ll.toxicity_score::float8, ll.toxicity_category,
+    ll.quality_score::float8, ll.tone, ll.confidence::float8,
+    -- `subscription_tier` est un ENUM Postgres : le cast texte est obligatoire,
+    -- tokio-postgres ne sait pas décoder un type enum applicatif.
+    COALESCE(u.subscription_tier::text, 'free') AS author_tier
+FROM picked p
+JOIN tweets t ON t.id = p.id
+JOIN users  u ON u.id = t.user_id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*)::bigint AS like_count,
+           COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')::bigint  AS likes_1h,
+           COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '6 hours')::bigint AS likes_6h
+    FROM tweet_likes WHERE tweet_id = t.id
+) lk ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(*)::bigint AS comment_count,
+           COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')::bigint AS comments_1h
+    FROM tweets r WHERE r.parent_tweet_id = t.id AND r.deleted_at IS NULL
+) cm ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(*)::bigint AS retweet_count,
+           COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')::bigint AS retweets_1h
+    FROM tweet_retweets WHERE tweet_id = t.id
+) rt ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(*)::bigint AS report_count
+    FROM reports WHERE target_type = 'tweet' AND target_id = t.id
+) rp ON true
+LEFT JOIN LATERAL (
+    -- Impressions déjà servies à CE lecteur pour CE tweet.
+    SELECT COUNT(*)::bigint AS impressions
+    FROM user_behavior_data b
+    WHERE b.user_id = $1 AND b.target_type = 'tweet'
+      AND b.action_type = 'tweet_view' AND b.target_id = t.id::text
+) bh ON true
+LEFT JOIN LATERAL (
+    SELECT
+      (SELECT COUNT(*)::bigint FROM user_follows f
+        WHERE f.following_id = t.user_id AND f.status = 'active') AS followers,
+      (SELECT COUNT(*)::bigint FROM user_follows f
+        WHERE f.follower_id  = t.user_id AND f.status = 'active') AS following,
+      (SELECT COUNT(*)::bigint FROM tweets a
+        WHERE a.user_id = t.user_id AND a.deleted_at IS NULL)     AS tweet_count,
+      GREATEST(0, EXTRACT(DAY FROM NOW() - u.created_at))::int    AS age_days
+) au ON true
+-- Un retweet pur porte un contenu vide : c'est le tweet d'origine qui a été
+-- annoté. On rattache donc le label à `original_tweet_id` quand il existe,
+-- sinon au tweet lui-même.
+LEFT JOIN tweet_llm_labels ll ON ll.tweet_id = COALESCE(t.original_tweet_id, t.id)
 "#;
 
 // ─── Mapping rows → RawTweet ──────────────────────────────────────────────────
 
-fn map_rows(rows: Vec<tokio_postgres::Row>, source: TweetSource, weight: f64) -> Vec<RawTweet> {
+fn map_rows(rows: Vec<tokio_postgres::Row>) -> Vec<RawTweet> {
     rows.into_iter().filter_map(|r| {
         let id: String      = r.try_get(0).ok()?;
         let user_id: String = r.try_get(1).ok()?;
@@ -791,32 +1057,322 @@ fn map_rows(rows: Vec<tokio_postgres::Row>, source: TweetSource, weight: f64) ->
             like_count:        r.try_get(5).unwrap_or(0),
             comment_count:     r.try_get(6).unwrap_or(0),
             retweet_count:     r.try_get(7).unwrap_or(0),
-            share_count:       r.try_get(8).unwrap_or(0),
-            bookmark_count:    r.try_get(9).unwrap_or(0),
-            report_count:      r.try_get(10).unwrap_or(0),
-            has_media:         r.try_get(11).unwrap_or(false),
-            hashtag_count:     r.try_get(12).unwrap_or(0),
-            mention_count:     r.try_get(13).unwrap_or(0),
-            content_length:    r.try_get(14).unwrap_or(0),
-            author_followers:  r.try_get(15).unwrap_or(0),
-            author_following:  r.try_get(16).unwrap_or(0),
+            report_count:      r.try_get(8).unwrap_or(0),
+            has_media:         r.try_get(9).unwrap_or(false),
+            hashtag_count:     r.try_get(10).unwrap_or(0),
+            mention_count:     r.try_get(11).unwrap_or(0),
+            content_length:    r.try_get(12).unwrap_or(0),
+            author_followers:  r.try_get(13).unwrap_or(0),
+            author_following:  r.try_get(14).unwrap_or(0),
+            author_tweet_count: r.try_get(15).unwrap_or(0),
+            author_account_age_days: r.try_get(16).unwrap_or(0),
             author_is_verified: r.try_get(17).unwrap_or(false),
             author_is_premium:  r.try_get(18).unwrap_or(false),
-            moderation_status:  r.try_get(19).unwrap_or_else(|_| "approved".into()),
-            recommendation_group: r.try_get(20).ok().flatten(),
-            // Engagement récent (colonnes 21-24 injectées par les LATERAL joins)
-            likes_1h:    r.try_get(21).unwrap_or(0),
-            likes_6h:    r.try_get(22).unwrap_or(0),
-            comments_1h: r.try_get(23).unwrap_or(0),
-            retweets_1h: r.try_get(24).unwrap_or(0),
+            author_tier: AuthorTier::resolve(
+                r.try_get::<_, &str>(38).unwrap_or("free"),
+                r.try_get(18).unwrap_or(false),
+            ),
+            author_visibility_multiplier: r.try_get::<_, f64>(19).unwrap_or(1.0),
+            moderation_status:  r.try_get(20).unwrap_or_else(|_| "approved".into()),
+            recommendation_group: r.try_get(21).ok().flatten(),
+            likes_1h:    r.try_get(22).unwrap_or(0),
+            likes_6h:    r.try_get(23).unwrap_or(0),
+            comments_1h: r.try_get(24).unwrap_or(0),
+            retweets_1h: r.try_get(25).unwrap_or(0),
+            viewer_impressions: r.try_get(26).unwrap_or(0),
+            // Aucune table `tweet_shares` / `tweet_bookmarks` n'existe dans ce
+            // schéma : ces compteurs restent structurellement nuls (les termes
+            // correspondants de D1 sont donc inertes, ce n'est pas une omission).
+            share_count: 0,
+            bookmark_count: 0,
             emoji_count, exclamation_count, question_count, url_count, words,
-            author_account_age_days: 365,
-            author_tweet_count: 0,
-            source, source_weight: weight,
+            source: match r.try_get::<_, i32>(27).unwrap_or(4) {
+                1 => TweetSource::Trending,
+                2 => TweetSource::SocialGraph,
+                3 => TweetSource::Viral,
+                5 => TweetSource::Temporal,
+                6 => TweetSource::Influencer,
+                7 => TweetSource::Personalized,
+                8 => TweetSource::Quality,
+                _ => TweetSource::Discovery,
+            },
+            source_weight: r.try_get::<_, f64>(28).unwrap_or(0.05),
+            parent_tweet_id:   r.try_get::<_, Option<String>>(29).ok().flatten(),
+            original_tweet_id: r.try_get::<_, Option<String>>(30).ok().flatten(),
+            is_retweet:        r.try_get(31).unwrap_or(false),
             // Chargé depuis Redis/DB par le job de qualité ; Clean par défaut
             author_shadowban_level: crate::shadowban::ShadowbanLevel::Clean,
+            // `theme` NULL ⇒ pas de ligne dans tweet_llm_labels ⇒ tweet non
+            // annoté. On laisse `None` plutôt que d'inventer des valeurs par
+            // défaut, pour que D9 puisse rester neutre en connaissance de cause.
+            llm: r.try_get::<_, Option<String>>(32).ok().flatten().map(|theme| LlmLabels {
+                theme,
+                toxicity_score:    r.try_get::<_, f64>(33).unwrap_or(0.0),
+                toxicity_category: r.try_get(34).unwrap_or_else(|_| "aucune".into()),
+                quality_score:     r.try_get::<_, f64>(35).unwrap_or(0.5),
+                tone:              r.try_get(36).unwrap_or_else(|_| "neutre".into()),
+                confidence:        r.try_get::<_, f64>(37).unwrap_or(0.5),
+            }),
         })
     }).collect()
+}
+
+/// Part maximale de réponses dans le fil. Au-delà, le lecteur a l'impression de
+/// lire des bouts de conversation plutôt qu'un fil d'actualité.
+const MAX_REPLY_RATIO: f64 = 0.25;
+
+/// Profondeur maximale de remontée d'un fil de réponses. Borne les chaînes
+/// longues et protège d'un cycle si la base contenait une boucle parent/enfant.
+const MAX_THREAD_DEPTH: usize = 4;
+
+/// Nombre maximum de tweets qu'un même auteur peut placer dans le VIVIER de
+/// candidats, toutes sources confondues.
+///
+/// 12 laisse de quoi remplir les trois premières pages à raison de trois par
+/// page (voir `MAX_PER_AUTHOR_PER_PAGE`) sans qu'un seul compte puisse occuper
+/// la moitié des candidats. C'est le premier des trois verrous de diversité, et
+/// le seul qui agisse avant le scoring : les deux autres (pénalité de score et
+/// étalement de mise en page) ne peuvent que réordonner ce que celui-ci laisse
+/// passer.
+/// ⚠ `i64` et non `i32` : il est comparé à `ROW_NUMBER()`, qui vaut `bigint`
+/// côté Postgres. Avec un `i32`, tokio-postgres refuse la sérialisation du
+/// paramètre (« cannot convert between the Rust type i32 and the Postgres type
+/// int8 ») et TOUTE recommandation part en 500.
+const MAX_CANDIDATES_PER_AUTHOR: i64 = 12;
+
+/// Nombre maximum de tweets d'un même auteur sur une page de fil.
+///
+/// Trois, c'est assez pour comprendre qu'un compte publie beaucoup sur un sujet,
+/// et trop peu pour qu'il occupe la page. Le score seul n'y suffisait pas :
+/// `diversity_multiplier` DÉCOURAGE la répétition, il ne l'interdit pas — un
+/// compte très en forme face à peu de concurrence gardait un score dégradé mais
+/// toujours supérieur au reste, et raflait dix places d'affilée.
+const MAX_PER_AUTHOR_PER_PAGE: u32 = 3;
+
+/// Taille de page servant de fenêtre au plafond ci-dessus.
+///
+/// Alignée sur la valeur demandée par l'app (`limit = 50` côté API, voir
+/// `neuralRankRoutes.js`). Le plafond est appliqué à la CONSTRUCTION de la liste
+/// complète, donc avant la mise en cache : toutes les pages en héritent, y
+/// compris celles servies depuis Redis.
+const PAGE_WINDOW: usize = 50;
+
+/// Met en forme la liste finale d'identifiants servie au client.
+///
+/// Trois règles, appliquées dans l'ordre du classement :
+///
+/// 1. **Un fil n'occupe qu'une entrée.** Soit le tweet racine, soit une de ses
+///    réponses — jamais les deux, et jamais deux réponses au même tweet.
+/// 2. Une réponse n'est servie que si tous ses ancêtres figurent parmi les
+///    candidats retenus. Sinon son contexte est inaffichable (parent supprimé,
+///    privé, auteur bloqué) et le lecteur verrait une repartie sans savoir à
+///    quoi elle répond.
+/// 3. Les réponses sont plafonnées à `MAX_REPLY_RATIO` du fil.
+///
+/// Le parent n'est **pas** ajouté à la liste : le client affiche déjà le tweet
+/// parent au-dessus d'une réponse. Une version antérieure l'insérait aussi côté
+/// serveur, ce qui faisait apparaître le même tweet deux fois à l'écran — une
+/// fois en carte de contexte, une fois en entrée de feed. C'est le rôle de
+/// cette fonction de garantir qu'un fil n'est représenté qu'une seule fois ;
+/// le rendu du contexte reste au client.
+fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<String> {
+    let max_replies = ((scored.len() as f64) * MAX_REPLY_RATIO).ceil() as usize;
+
+    let mut out: Vec<String> = Vec::with_capacity(scored.len());
+    // Tweets déjà visibles à l'écran, que ce soit comme entrée de feed ou comme
+    // carte de contexte rendue par le client au-dessus d'une réponse.
+    let mut shown: HashSet<String> = HashSet::new();
+    let mut replies_kept = 0usize;
+    let mut replies_dropped = 0usize;
+
+    for s in scored {
+        let Some(t) = tweets.get(s.tweet_id.as_str()) else { continue };
+        if shown.contains(&s.tweet_id) {
+            continue;
+        }
+
+        // Remonte le fil : [tweet, parent, …, racine].
+        let mut chain: Vec<&RawTweet> = vec![t];
+        let mut cursor = *t;
+        let mut complete = true;
+        while let Some(parent_id) = cursor.parent_tweet_id.as_deref() {
+            if chain.len() >= MAX_THREAD_DEPTH {
+                complete = false;
+                break;
+            }
+            match tweets.get(parent_id) {
+                Some(p) => {
+                    chain.push(*p);
+                    cursor = *p;
+                }
+                // Ancêtre absent des candidats : filtré en amont ou non
+                // collecté. Le contexte serait incomplet, on écarte.
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        let is_reply = t.parent_tweet_id.is_some();
+
+        if is_reply && !complete {
+            replies_dropped += 1;
+            continue;
+        }
+        // Un ancêtre déjà à l'écran signifie que ce fil est déjà représenté.
+        if chain.iter().skip(1).any(|a| shown.contains(&a.id)) {
+            if is_reply { replies_dropped += 1; }
+            continue;
+        }
+        if is_reply && replies_kept >= max_replies {
+            replies_dropped += 1;
+            continue;
+        }
+
+        out.push(t.id.clone());
+        // Le tweet ET tous ses ancêtres deviennent « à l'écran » : les ancêtres
+        // seront rendus en contexte par le client, les resservir plus bas
+        // afficherait deux fois le même contenu.
+        for a in &chain {
+            shown.insert(a.id.clone());
+        }
+        if is_reply {
+            replies_kept += 1;
+        }
+    }
+
+    if replies_dropped > 0 || replies_kept > 0 {
+        debug!(replies_kept, replies_dropped, max_replies, total = out.len(),
+               "Mise en forme du fil : un fil = une entrée");
+    }
+    out
+}
+
+/// Répartit le fil pour qu'aucun auteur n'occupe plus de
+/// `MAX_PER_AUTHOR_PER_PAGE` places par page de `PAGE_WINDOW`.
+///
+/// Le surplus n'est PAS jeté : il est reporté à la page suivante. C'est la
+/// différence entre « diversifier » et « censurer » — un compte prolifique reste
+/// entièrement lisible, il est simplement étalé au lieu d'être servi en bloc.
+/// Jeter le surplus aurait aussi rendu le nombre de tweets disponibles
+/// dépendant de la composition du fil, donc la pagination incohérente.
+///
+/// L'ordre par score est conservé dans chaque page : on ne remonte jamais un
+/// tweet moins bon devant un meilleur, on descend seulement celui qui ne tient
+/// pas dans le quota de son auteur. Une page peut donc contenir moins de
+/// `PAGE_WINDOW` entrées quand il n'y a pas assez d'auteurs distincts — c'est le
+/// prix assumé du plafond, et il vaut mieux une page courte et variée qu'une
+/// page pleine signée trois fois par la même personne.
+fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<String> {
+    let author_of = |id: &str| -> Option<&str> { tweets.get(id).map(|t| t.user_id.as_str()) };
+
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    // Auteurs présents dans les `PAGE_WINDOW` dernières positions émises, et
+    // leur compte. Tenu à jour au fil de l'eau plutôt que recalculé : le
+    // recalcul à chaque candidat rendait la fonction quadratique en la fenêtre.
+    let mut window: HashMap<String, u32> = HashMap::new();
+    let mut pending: Vec<String> = ids;
+    let mut deferrals = 0usize;
+    let mut forced = 0usize;
+
+    while !pending.is_empty() {
+        // Premier candidat, dans l'ordre du score, dont l'auteur n'a pas encore
+        // saturé son quota sur la fenêtre courante.
+        let pick = pending.iter().position(|id| {
+            match author_of(id) {
+                // Un candidat sans auteur connu ne peut pas être plafonné.
+                // `shape_feed` les a déjà écartés ; s'il en restait un, mieux
+                // vaut le laisser passer que le perdre silencieusement.
+                None => true,
+                Some(a) => *window.get(a).unwrap_or(&0) < MAX_PER_AUTHOR_PER_PAGE,
+            }
+        });
+
+        let index = match pick {
+            Some(i) => {
+                if i > 0 {
+                    deferrals += 1;
+                }
+                i
+            }
+            // Plus AUCUN candidat ne respecte le quota : il ne reste que des
+            // auteurs saturés. Ça arrive dès qu'il y a moins de
+            // PAGE_WINDOW / MAX_PER_AUTHOR_PER_PAGE auteurs distincts — 17 pour
+            // une fenêtre de 50 — donc en permanence sur une petite communauté.
+            //
+            // On sert quand même : laisser un trou n'aurait aucun sens, et
+            // refuser ferait dépendre la taille de la page du nombre d'auteurs
+            // disponibles, ce qui casserait la pagination du client.
+            //
+            // ⚠ Mais surtout PAS dans l'ordre brut. Reprendre `pending[0]` vidait
+            // le premier auteur d'un coup : on obtenait « 3 de chacun » puis
+            // « 7 d'affilée du premier », soit pire qu'un simple tour de rôle.
+            // On prend donc le candidat dont l'auteur est le MOINS présent dans
+            // la fenêtre, ce qui dégrade en round-robin propre au lieu de
+            // retomber en blocs.
+            None => {
+                forced += 1;
+                pending
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(i, id)| {
+                        let seen = author_of(id).map_or(0, |a| *window.get(a).unwrap_or(&0));
+                        // À égalité de présence, l'ordre du score tranche.
+                        (seen, *i)
+                    })
+                    .map_or(0, |(i, _)| i)
+            }
+        };
+
+        let id = pending.remove(index);
+        if let Some(a) = author_of(&id) {
+            *window.entry(a.to_string()).or_insert(0) += 1;
+        }
+        out.push(id);
+
+        // La fenêtre glisse : l'auteur qui sort des `PAGE_WINDOW` dernières
+        // positions retrouve son quota. C'est ce glissement qui rend la garantie
+        // valable pour N'IMPORTE quelle page, quels que soient `offset` et
+        // `limit` — et pas seulement pour un découpage aligné sur 50.
+        if out.len() > PAGE_WINDOW {
+            let leaving = &out[out.len() - PAGE_WINDOW - 1];
+            if let Some(a) = author_of(leaving) {
+                if let Some(count) = window.get_mut(a) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        window.remove(a);
+                    }
+                }
+            }
+        }
+    }
+
+    if deferrals > 0 || forced > 0 {
+        debug!(
+            deferrals, forced, window = PAGE_WINDOW, max_per_author = MAX_PER_AUTHOR_PER_PAGE,
+            "Étalement par auteur appliqué"
+        );
+    }
+
+    out
+}
+
+/// Identité de contenu d'un candidat : ce que le lecteur va réellement lire.
+///
+/// Un retweet n'a pas de texte propre — il réaffiche son original. Deux
+/// retweets du même tweet, ou un tweet et son retweet, montrent donc exactement
+/// la même chose et ne doivent occuper qu'une place dans le feed.
+fn content_identity(tweet: &RawTweet) -> &str {
+    // Uniquement pour un vrai retweet. Les réponses renseignent elles aussi
+    // `original_tweet_id` (elles pointent la racine du fil) : s'en servir ici
+    // ferait passer une réponse pour un doublon du tweet auquel elle répond, et
+    // deux réponses distinctes au même tweet pour un seul contenu.
+    if tweet.is_retweet {
+        tweet.original_tweet_id.as_deref().unwrap_or(&tweet.id)
+    } else {
+        &tweet.id
+    }
 }
 
 fn deduplicate(mut tweets: Vec<RawTweet>) -> Vec<RawTweet> {
@@ -824,20 +1380,118 @@ fn deduplicate(mut tweets: Vec<RawTweet>) -> Vec<RawTweet> {
     let mut result: Vec<RawTweet> = Vec::new();
 
     for tweet in tweets.drain(..) {
-        match seen.get(&tweet.id) {
+        // Clé = tweet d'origine, pas l'id du candidat. L'ancienne version
+        // dédupliquait sur `tweet.id` : un tweet et trois retweets de ce tweet
+        // passaient pour quatre contenus distincts et saturaient le feed avec
+        // la même carte.
+        let key = content_identity(&tweet).to_string();
+        match seen.get(&key) {
             None => {
-                seen.insert(tweet.id.clone(), result.len());
+                seen.insert(key, result.len());
                 result.push(tweet);
             }
             Some(&idx) => {
+                // On garde l'exemplaire déjà retenu, mais on lui laisse le
+                // meilleur poids de source des doublons rencontrés : si le
+                // tweet arrive à la fois par « suivi » et par « trending »,
+                // il mérite le poids du canal le plus fort.
                 if tweet.source_weight > result[idx].source_weight {
                     result[idx].source_weight = tweet.source_weight;
                     result[idx].source = tweet.source;
+                }
+                // Un original a toujours priorité sur son retweet : il porte le
+                // texte, les compteurs et l'auteur réels.
+                if result[idx].original_tweet_id.is_some() && tweet.original_tweet_id.is_none() {
+                    let kept_weight = result[idx].source_weight;
+                    let kept_source = result[idx].source;
+                    result[idx] = tweet;
+                    result[idx].source_weight = kept_weight;
+                    result[idx].source = kept_source;
                 }
             }
         }
     }
     result
+}
+
+/// Mots vides FR/EN — sans ce filtre, `top_words` serait saturé de « dans »,
+/// « pour », « that »… qui apparaissent dans presque tous les tweets et ne
+/// discriminent donc rien.
+const STOPWORDS: &[&str] = &[
+    "avec", "pour", "dans", "cette", "cela", "sont", "mais", "vous", "nous", "elle",
+    "leur", "leurs", "être", "etre", "avoir", "fait", "faire", "plus", "moins", "tout",
+    "tous", "toute", "toutes", "comme", "quand", "aussi", "encore", "alors", "donc",
+    "chez", "sans", "sous", "très", "tres", "bien", "peut", "veut", "vais", "suis",
+    "j'ai", "c'est", "n'est", "qu'il", "qu'elle", "parce", "depuis", "entre",
+    "that", "this", "with", "from", "have", "will", "your", "they", "them", "their",
+    "what", "when", "which", "there", "here", "been", "were", "would", "could",
+    "should", "about", "just", "like", "really", "https", "http",
+];
+
+/// Reconstruit les centres d'intérêt, le style et la positivité d'un lecteur à
+/// partir du texte des tweets qu'il a aimés.
+///
+/// Ces trois champs (`top_words`, `personality_type`, `emotional_positivity`)
+/// existaient dans `UserProfile` et étaient lus par D2 et D8, mais rien ne les
+/// remplissait : la correspondance mots-clés et l'affinité d'intérêt valaient
+/// donc 0 pour tout le monde, quelle que soit l'activité réelle.
+fn profile_from_liked_text(texts: &[String]) -> (Vec<(String, u32)>, PersonalityType, f64) {
+    if texts.is_empty() {
+        return (Vec::new(), PersonalityType::Balanced, 0.5);
+    }
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let (mut emoji, mut excl, mut quest, mut urls, mut long_form) = (0u32, 0u32, 0u32, 0u32, 0u32);
+
+    for text in texts {
+        if text.chars().count() > 180 { long_form += 1; }
+        excl  += text.matches('!').count() as u32;
+        quest += text.matches('?').count() as u32;
+        let lower = text.to_lowercase();
+        urls  += (lower.matches("http://").count() + lower.matches("https://").count()) as u32;
+        emoji += text.chars().filter(|c| {
+            let u = *c as u32;
+            (0x1F300..=0x1FAFF).contains(&u)
+                || (0x2600..=0x27BF).contains(&u)
+                || u == 0x2B50 || u == 0x2764
+        }).count() as u32;
+
+        for raw in lower.split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-') {
+            let word = raw.trim_matches(|c: char| c == '\'' || c == '-');
+            // On garde les mots d'au moins 4 caractères : en dessous, le signal
+            // est dominé par les articles et les abréviations.
+            if word.chars().count() < 4 || word.chars().count() > 30 { continue; }
+            if word.chars().all(|c| c.is_numeric()) { continue; }
+            if STOPWORDS.contains(&word) { continue; }
+            *counts.entry(word.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let mut top_words: Vec<(String, u32)> = counts.into_iter()
+        // Un mot vu une seule fois sur l'ensemble de l'historique n'est pas un
+        // centre d'intérêt, c'est du bruit.
+        .filter(|(_, n)| *n >= 2)
+        .collect();
+    top_words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_words.truncate(30);
+
+    let n = texts.len() as f64;
+    let personality = if emoji as f64 / n > 1.0 || excl as f64 / n > 0.8 {
+        PersonalityType::Enthusiastic
+    } else if quest as f64 / n > 0.5 || urls as f64 / n > 0.4 {
+        PersonalityType::Curious
+    } else if long_form as f64 / n > 0.5 {
+        PersonalityType::Thoughtful
+    } else {
+        PersonalityType::Balanced
+    };
+
+    // Proxy de positivité : densité d'émojis et d'exclamations dans ce que le
+    // lecteur aime. Volontairement borné — c'est une heuristique, pas une
+    // analyse de sentiment.
+    let positivity = (0.5 + (emoji as f64 / n) * 0.2 + (excl as f64 / n) * 0.1).clamp(0.0, 1.0);
+
+    (top_words, personality, positivity)
 }
 
 fn mode_label(mode: &RecommendMode) -> &'static str {
@@ -859,4 +1513,392 @@ fn adaptive_ttl(profile: &UserProfile, mode: &RecommendMode) -> u64 {
     if *mode == RecommendMode::Trending { ttl = ttl.min(60); }
     if *mode == RecommendMode::Discover { ttl = ttl.min(120); }
     ttl.max(30)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ─── Mise en forme du fil ────────────────────────────────────────────────
+
+    fn tweet(id: &str) -> RawTweet {
+        RawTweet { id: id.to_string(), ..Default::default() }
+    }
+
+    fn by(id: &str, author: &str) -> RawTweet {
+        RawTweet { id: id.to_string(), user_id: author.to_string(), ..Default::default() }
+    }
+
+    // ─── Étalement par auteur ────────────────────────────────────────────────
+
+    /// Construit la table `id -> tweet` attendue par `spread_by_author`.
+    fn index<'a>(raw: &'a [RawTweet]) -> HashMap<&'a str, &'a RawTweet> {
+        raw.iter().map(|t| (t.id.as_str(), t)).collect()
+    }
+
+    /// Pire concentration d'un auteur sur toute fenêtre glissante de
+    /// `PAGE_WINDOW` positions, dans les `depth` premières entrées.
+    ///
+    /// Fenêtre GLISSANTE et non découpage aligné : une page peut commencer à
+    /// n'importe quel `offset`, la garantie doit valoir partout.
+    ///
+    /// `depth` borne la mesure à ce qui est réellement servi. Le fond de liste
+    /// se concentre forcément : quand il ne reste que les tweets de deux
+    /// auteurs, aucun ordonnancement n'y peut rien. Personne ne descend à la
+    /// 300ᵉ recommandation, et y garantir la variété coûterait l'ordre par
+    /// score sur les pages que tout le monde lit.
+    fn worst_window_concentration(out: &[String], raw: &[RawTweet], depth: usize) -> u32 {
+        let author_of: HashMap<&str, &str> =
+            raw.iter().map(|t| (t.id.as_str(), t.user_id.as_str())).collect();
+        let head = &out[..depth.min(out.len())];
+        head.windows(PAGE_WINDOW.min(head.len().max(1)))
+            .map(|window| {
+                let mut counts: HashMap<&str, u32> = HashMap::new();
+                for id in window {
+                    *counts.entry(author_of[id.as_str()]).or_insert(0) += 1;
+                }
+                counts.values().copied().max().unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn spread_caps_an_author_when_others_are_available() {
+        // 6 tweets d'un compte prolifique en tête, puis 6 autres auteurs.
+        // Sans étalement, les 6 premiers occupaient le haut de page.
+        let mut raw: Vec<RawTweet> = (0..6).map(|i| by(&format!("s{i}"), "spammy")).collect();
+        raw.extend((0..6).map(|i| by(&format!("o{i}"), &format!("autre{i}"))));
+        let ids: Vec<String> = raw.iter().map(|t| t.id.clone()).collect();
+
+        let out = spread_by_author(ids.clone(), &index(&raw));
+
+        assert_eq!(out.len(), ids.len(), "aucun tweet ne doit être perdu");
+        // Les 3 premiers de « spammy » passent, les suivants sont repoussés
+        // derrière les autres auteurs.
+        assert_eq!(&out[..3], &texts(&["s0", "s1", "s2"])[..]);
+        assert_eq!(&out[3..9], &texts(&["o0", "o1", "o2", "o3", "o4", "o5"])[..]);
+        assert_eq!(&out[9..], &texts(&["s3", "s4", "s5"])[..]);
+    }
+
+    #[test]
+    fn spread_keeps_score_order_when_nothing_exceeds_quota() {
+        let raw = vec![by("a1", "a"), by("b1", "b"), by("c1", "c"), by("a2", "a")];
+        let ids = texts(&["a1", "b1", "c1", "a2"]);
+
+        let out = spread_by_author(ids.clone(), &index(&raw));
+
+        assert_eq!(out, ids, "sans dépassement de quota, l'ordre par score est conservé");
+    }
+
+    #[test]
+    fn spread_serves_everything_when_a_single_author_remains() {
+        // Un seul auteur : le plafond est intenable sans laisser des trous.
+        // La dégradation attendue est « on sert quand même », pas « on ampute ».
+        let raw: Vec<RawTweet> = (0..10).map(|i| by(&format!("t{i}"), "seul")).collect();
+        let ids: Vec<String> = raw.iter().map(|t| t.id.clone()).collect();
+
+        let out = spread_by_author(ids.clone(), &index(&raw));
+
+        assert_eq!(out, ids, "aucune perte, ordre conservé, faute d'alternative");
+    }
+
+    /// Profondeur réellement servie qu'on protège : trois pages.
+    const SERVED_DEPTH: usize = PAGE_WINDOW * 3;
+
+    #[test]
+    fn spread_holds_the_cap_on_served_pages_when_enough_authors() {
+        // ⚠ Le plafond n'est tenable que s'il existe au moins
+        // ceil(PAGE_WINDOW / MAX_PER_AUTHOR_PER_PAGE) auteurs distincts : à 3
+        // tweets chacun, il en faut 17 pour garnir une fenêtre de 50. En dessous,
+        // aucun ordonnancement n'y arrive — c'est de l'arithmétique, pas un
+        // défaut d'implémentation (voir le test de dégradation ci-dessous).
+        //
+        // 300 tweets sur 20 auteurs, GROUPÉS par auteur en entrée : le pire cas
+        // de concentration qu'on puisse soumettre à l'étalement.
+        let raw: Vec<RawTweet> = (0..300)
+            .map(|i| by(&format!("t{i}"), &format!("auteur{}", i / 15)))
+            .collect();
+        let ids: Vec<String> = raw.iter().map(|t| t.id.clone()).collect();
+
+        let out = spread_by_author(ids.clone(), &index(&raw));
+
+        let mut sorted_in = ids.clone();
+        let mut sorted_out = out.clone();
+        sorted_in.sort();
+        sorted_out.sort();
+        assert_eq!(sorted_in, sorted_out, "l'étalement réordonne, il ne filtre pas");
+        assert_eq!(
+            worst_window_concentration(&out, &raw, SERVED_DEPTH),
+            MAX_PER_AUTHOR_PER_PAGE,
+            "exactement {MAX_PER_AUTHOR_PER_PAGE} par fenêtre de {PAGE_WINDOW} sur les pages servies",
+        );
+    }
+
+    #[test]
+    fn spread_degrades_proportionally_when_authors_are_too_few() {
+        // 4 auteurs pour une fenêtre de 50 : 4 × 3 = 12 places, la fenêtre ne
+        // peut pas être garnie sans dépasser le quota. Le repli doit alors
+        // dégrader en tour de rôle — donc tendre vers PAGE_WINDOW / auteurs —
+        // et surtout pas resservir les auteurs par blocs.
+        let raw: Vec<RawTweet> = (0..40)
+            .map(|i| by(&format!("t{i}"), &format!("auteur{}", i / 10)))
+            .collect();
+        let ids: Vec<String> = raw.iter().map(|t| t.id.clone()).collect();
+
+        let out = spread_by_author(ids.clone(), &index(&raw));
+
+        assert_eq!(out.len(), ids.len(), "aucune perte, même en dégradation");
+        let worst = worst_window_concentration(&out, &raw, SERVED_DEPTH);
+        // 40 tweets, 4 auteurs : le minimum théorique sur la liste entière est
+        // 10 par auteur. On doit l'atteindre, pas le dépasser.
+        assert_eq!(worst, 10, "dégradation en tour de rôle, pas en blocs");
+    }
+
+    fn reply(id: &str, parent: &str) -> RawTweet {
+        RawTweet {
+            id: id.to_string(),
+            parent_tweet_id: Some(parent.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn retweet(id: &str, original: &str) -> RawTweet {
+        RawTweet {
+            id: id.to_string(),
+            original_tweet_id: Some(original.to_string()),
+            is_retweet: true,
+            ..Default::default()
+        }
+    }
+
+    fn scored_of(ids: &[&str]) -> Vec<ScoredTweet> {
+        ids.iter().enumerate().map(|(i, id)| ScoredTweet {
+            tweet_id: id.to_string(),
+            score: 1.0 - (i as f64) * 0.01,
+            breakdown: Default::default(),
+            ctr_features: None,
+        }).collect()
+    }
+
+    fn shape(scored: &[ScoredTweet], raw: &[RawTweet]) -> Vec<String> {
+        let map: HashMap<&str, &RawTweet> = raw.iter().map(|t| (t.id.as_str(), t)).collect();
+        shape_feed(scored, &map)
+    }
+
+    #[test]
+    fn une_reponse_est_precedee_de_son_parent() {
+        let raw = vec![tweet("racine"), reply("rep", "parent"), tweet("parent")];
+        let out = shape(&scored_of(&["rep", "racine"]), &raw);
+
+        let i_parent = out.iter().position(|x| x == "parent").expect("parent remonte");
+        let i_rep = out.iter().position(|x| x == "rep").expect("reponse presente");
+        assert!(i_parent < i_rep, "le parent doit passer avant la reponse : {out:?}");
+    }
+
+    #[test]
+    fn une_reponse_dont_le_parent_est_absent_est_ecartee() {
+        // `parent` n'est pas dans les candidats : il a été filtré en amont
+        // (supprime, prive, auteur bloque…). La reponse ne doit pas passer.
+        let raw = vec![tweet("racine"), reply("rep", "parent")];
+        let out = shape(&scored_of(&["rep", "racine"]), &raw);
+
+        assert!(!out.contains(&"rep".to_string()),
+                "reponse orpheline servie : {out:?}");
+        assert!(!out.contains(&"parent".to_string()),
+                "un parent filtre ne doit jamais reapparaitre : {out:?}");
+        assert_eq!(out, vec!["racine"]);
+    }
+
+    #[test]
+    fn une_reponse_a_une_reponse_amene_tout_le_fil_dans_l_ordre() {
+        // Cas observe en prod : le parent etait lui-meme une reponse et
+        // arrivait sans son propre parent.
+        // Le fil compte 2 reponses : il faut assez de candidats pour que le
+        // plafond de 25 % les autorise, sinon c'est lui qui tranche.
+        let mut raw = vec![
+            tweet("racine"),
+            reply("mid", "racine"),
+            reply("feuille", "mid"),
+        ];
+        let mut ids = vec!["feuille".to_string()];
+        for i in 0..7 {
+            let id = format!("f{i}");
+            raw.push(tweet(&id));
+            ids.push(id);
+        }
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let out = shape(&scored_of(&refs), &raw);
+
+        let pos = |id: &str| out.iter().position(|x| x == id)
+            .unwrap_or_else(|| panic!("{id} absent de {out:?}"));
+        assert!(pos("racine") < pos("mid"), "racine avant mid : {out:?}");
+        assert!(pos("mid") < pos("feuille"), "mid avant feuille : {out:?}");
+    }
+
+    #[test]
+    fn une_reponse_a_un_retweet_n_est_pas_confondue_avec_l_original() {
+        // Les reponses portent aussi `original_tweet_id` : la deduplication ne
+        // doit surtout pas les collapser sur la racine du fil.
+        let mut r1 = reply("rep1", "racine");
+        r1.original_tweet_id = Some("racine".into());
+        let mut r2 = reply("rep2", "racine");
+        r2.original_tweet_id = Some("racine".into());
+
+        let deduped = deduplicate(vec![tweet("racine"), r1, r2]);
+        let ids: Vec<&str> = deduped.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "racine + 2 reponses distinctes attendues : {ids:?}");
+    }
+
+    #[test]
+    fn le_parent_n_est_pas_duplique_s_il_est_deja_plus_haut() {
+        let raw = vec![tweet("parent"), reply("rep", "parent")];
+        let out = shape(&scored_of(&["parent", "rep"]), &raw);
+
+        assert_eq!(out.iter().filter(|x| *x == "parent").count(), 1,
+                   "le parent ne doit apparaitre qu'une fois : {out:?}");
+        assert_eq!(out, vec!["parent", "rep"]);
+    }
+
+    #[test]
+    fn les_reponses_sont_plafonnees() {
+        // 8 candidats classés dont 6 réponses → plafond de 25 % = 2 réponses.
+        let mut raw = vec![tweet("t1"), tweet("t2")];
+        let mut ids = vec!["t1".to_string(), "t2".to_string()];
+        for i in 0..6 {
+            let rid = format!("r{i}");
+            let pid = format!("p{i}");
+            raw.push(reply(&rid, &pid));
+            raw.push(tweet(&pid));
+            ids.push(rid);
+        }
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let out = shape(&scored_of(&refs), &raw);
+
+        let n_replies = out.iter().filter(|id| id.starts_with('r')).count();
+        assert!(n_replies <= 2, "trop de reponses retenues : {n_replies} dans {out:?}");
+    }
+
+    #[test]
+    fn aucune_reponse_orpheline_dans_la_sortie() {
+        // Invariant global : tout tweet servi qui a un parent doit avoir ce
+        // parent quelque part avant lui.
+        let raw = vec![
+            tweet("a"),
+            reply("b", "a"),
+            reply("c", "b"),
+            reply("orphelin", "inconnu"),
+            tweet("d"),
+        ];
+        let out = shape(&scored_of(&["c", "orphelin", "d", "a", "b"]), &raw);
+
+        let pos: HashMap<&str, usize> = out.iter().enumerate()
+            .map(|(i, id)| (id.as_str(), i)).collect();
+        let by_id: HashMap<&str, &RawTweet> = raw.iter()
+            .map(|t| (t.id.as_str(), t)).collect();
+
+        for (id, i) in &pos {
+            if let Some(parent) = by_id.get(id).and_then(|t| t.parent_tweet_id.as_deref()) {
+                let pp = pos.get(parent)
+                    .unwrap_or_else(|| panic!("parent {parent} absent pour {id} : {out:?}"));
+                assert!(pp < i, "parent {parent} apres son enfant {id} : {out:?}");
+            }
+        }
+        assert!(!out.contains(&"orphelin".to_string()));
+    }
+
+    #[test]
+    fn un_retweet_du_meme_tweet_ne_passe_qu_une_fois() {
+        // L'original et deux retweets de ce même original.
+        let deduped = deduplicate(vec![
+            retweet("rt1", "origine"),
+            tweet("origine"),
+            retweet("rt2", "origine"),
+        ]);
+
+        assert_eq!(deduped.len(), 1, "un seul contenu attendu : {:?}",
+                   deduped.iter().map(|t| &t.id).collect::<Vec<_>>());
+        // L'original doit être conservé plutôt qu'un de ses retweets.
+        assert_eq!(deduped[0].id, "origine");
+    }
+
+    #[test]
+    fn deux_tweets_distincts_sont_conserves() {
+        let deduped = deduplicate(vec![tweet("a"), tweet("b"), retweet("rt", "c"), tweet("c")]);
+        let ids: Vec<&str> = deduped.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "a, b et c attendus : {ids:?}");
+        assert!(ids.contains(&"a") && ids.contains(&"b") && ids.contains(&"c"));
+    }
+
+    #[test]
+    fn top_words_ignore_les_mots_vides_et_les_hapax() {
+        let liked = texts(&[
+            "le casino avec la roue et les jetons dans le casino",
+            "encore une soiree casino, la roue tourne pour tout le monde",
+            "jetons perdus au casino ce soir",
+        ]);
+        let (words, _, _) = profile_from_liked_text(&liked);
+        let map: std::collections::HashMap<_, _> = words.iter().cloned().collect();
+
+        // « casino » revient 4 fois → centre d'intérêt retenu.
+        assert_eq!(map.get("casino"), Some(&4));
+        assert_eq!(map.get("jetons"), Some(&2));
+        // Mots vides écartés même s'ils sont fréquents.
+        assert!(!map.contains_key("dans"));
+        assert!(!map.contains_key("pour"));
+        // Vu une seule fois → bruit, pas un intérêt.
+        assert!(!map.contains_key("soiree"));
+    }
+
+    #[test]
+    fn profil_vide_ne_panique_pas_et_reste_neutre() {
+        let (words, personality, positivity) = profile_from_liked_text(&[]);
+        assert!(words.is_empty());
+        assert!(matches!(personality, PersonalityType::Balanced));
+        assert_eq!(positivity, 0.5);
+    }
+
+    #[test]
+    fn personnalite_deduite_du_style_des_tweets_aimes() {
+        let enthousiaste = texts(&["trop bien !! 🎉🔥", "enorme !! 😍", "wow !! 🚀🎰"]);
+        assert!(matches!(
+            profile_from_liked_text(&enthousiaste).1,
+            PersonalityType::Enthusiastic
+        ));
+
+        let curieux = texts(&[
+            "comment ca marche ? source https://exemple.fr",
+            "pourquoi ce choix ? des donnees ?",
+            "quelqu'un sait ? https://exemple.fr/doc",
+        ]);
+        assert!(matches!(
+            profile_from_liked_text(&curieux).1,
+            PersonalityType::Curious
+        ));
+    }
+
+    #[test]
+    fn positivite_augmente_avec_les_emojis_mais_reste_bornee() {
+        let neutre = profile_from_liked_text(&texts(&["analyse posee du sujet"])).2;
+        let joyeux = profile_from_liked_text(&texts(&["super 🎉🔥😍🚀 !!!"])).2;
+        assert!(joyeux > neutre);
+        assert!((0.0..=1.0).contains(&joyeux));
+    }
+
+    #[test]
+    fn fatigue_impression_laisse_une_seconde_chance_puis_decroit() {
+        use crate::algorithm::scoring::impression_fatigue;
+        // Jusqu'à 2 expositions : aucune pénalité.
+        assert_eq!(impression_fatigue(0), 1.0);
+        assert_eq!(impression_fatigue(2), 1.0);
+        // Ensuite décroissance stricte.
+        assert!(impression_fatigue(3) < 1.0);
+        assert!(impression_fatigue(4) < impression_fatigue(3));
+        // Jamais un bannissement définitif.
+        assert!(impression_fatigue(500) >= 0.05);
+    }
 }
