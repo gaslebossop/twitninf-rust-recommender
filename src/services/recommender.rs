@@ -9,6 +9,10 @@ use tracing::{info, warn, debug, trace};
 use crate::algorithm::scoring::{compute_feed_metrics, score_tweet_ml_with_weights};
 use crate::algorithm::trending::trending_score;
 use crate::bandit::bandit_select;
+use crate::constants::{
+    COLD_START_FOLLOW_BOOST_MAX, COLD_START_INTERACTION_FLOOR, FOLLOW_FEED_BOOST,
+    FOLLOW_MUTUAL_BOOST,
+};
 use crate::experiments;
 use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
@@ -427,19 +431,15 @@ impl RecommenderService {
                     s.score = (s.score * multiplier).min(1.0);
                 }
                 RecommendMode::Feed => {
-                    let mut boost = 1.0;
-                    if profile.following_ids.contains(&tweet.user_id) {
-                        boost *= 1.30;
-                        trace!(tweet_id = %tweet.id, "Feed: user follows author, boosting by 30%");
-                    }
-                    if profile.mutual_follow_ids.contains(&tweet.user_id) {
-                        boost *= 1.15;
-                        trace!(tweet_id = %tweet.id, "Feed: mutual follow, boosting by 15%");
-                    }
-                    s.score = (s.score * boost).min(1.0);
+                    s.score = apply_follow_boost(s.score, tweet, profile, "Feed");
                 }
                 RecommendMode::ForYou => {
-                    trace!(tweet_id = %tweet.id, "ForYou mode: no mode-specific adjustment");
+                    // C'est le mode que demandent réellement les applications.
+                    // Il n'appliquait aucun ajustement : le boost abonnés
+                    // n'existait que dans `Feed`, que personne n'appelle. Un
+                    // abonnement ne pesait donc que sa part de D3, invisible
+                    // derrière l'engagement.
+                    s.score = apply_follow_boost(s.score, tweet, profile, "ForYou");
                 }
             }
 
@@ -1176,6 +1176,47 @@ static PARENTS_SQL: std::sync::LazyLock<String> =
 
 // ─── Mapping rows → RawTweet ──────────────────────────────────────────────────
 
+/// Renfort accordé aux abonnements tant que le compte n'a presque pas d'histoire.
+///
+/// À l'inscription, les comptes suivis sont le seul signal existant : pas de
+/// like, pas d'auteur favori, pas d'heure d'activité. Le renfort décroît
+/// linéairement jusqu'à disparaître une fois `COLD_START_INTERACTION_FLOOR`
+/// interactions atteintes — sinon un choix fait en dix secondes à l'inscription
+/// continuerait de dominer le fil des mois plus tard.
+fn cold_start_follow_multiplier(profile: &UserProfile) -> f64 {
+    let interactions = (profile.liked_tweet_ids.len()
+        + profile.retweeted_tweet_ids.len()
+        + profile.replied_to_tweet_ids.len()
+        + profile.bookmarked_tweet_ids.len()) as f64;
+
+    if interactions >= COLD_START_INTERACTION_FLOOR {
+        return 1.0;
+    }
+    let novelty = 1.0 - (interactions / COLD_START_INTERACTION_FLOOR);
+    1.0 + novelty * (COLD_START_FOLLOW_BOOST_MAX - 1.0)
+}
+
+/// Multiplicateur « je suis ce compte » appliqué au score final.
+///
+/// Partagé par les modes Feed et ForYou : deux forces différentes pour le même
+/// signal rendraient le fil incompréhensible selon l'onglet ouvert.
+fn apply_follow_boost(score: f64, tweet: &RawTweet, profile: &UserProfile, mode: &str) -> f64 {
+    let mut boost = 1.0;
+
+    if profile.following_ids.contains(&tweet.user_id) {
+        boost *= FOLLOW_FEED_BOOST;
+        let cold = cold_start_follow_multiplier(profile);
+        boost *= cold;
+        trace!(tweet_id = %tweet.id, mode, cold_start = cold, "Follow boost applied");
+    }
+    if profile.mutual_follow_ids.contains(&tweet.user_id) {
+        boost *= FOLLOW_MUTUAL_BOOST;
+        trace!(tweet_id = %tweet.id, mode, "Mutual follow boost applied");
+    }
+
+    (score * boost).min(1.0)
+}
+
 fn map_rows(rows: Vec<tokio_postgres::Row>) -> Vec<RawTweet> {
     rows.into_iter().filter_map(|r| {
         let id: String      = r.try_get(0).ok()?;
@@ -1799,6 +1840,70 @@ mod tests {
 
     fn texts(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ─── Poids des abonnements ───────────────────────────────────────────────
+
+    fn profile_following(author: &str, interactions: usize) -> UserProfile {
+        UserProfile {
+            following_ids: vec![author.to_string()],
+            liked_tweet_ids: (0..interactions).map(|i| format!("t{i}")).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn tweet_by(author: &str) -> RawTweet {
+        RawTweet { user_id: author.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn un_compte_neuf_beneficie_du_renfort_maximal() {
+        let profile = profile_following("a", 0);
+        assert!((cold_start_follow_multiplier(&profile) - COLD_START_FOLLOW_BOOST_MAX).abs() < 1e-9);
+    }
+
+    #[test]
+    fn le_renfort_de_demarrage_disparait_une_fois_le_compte_actif() {
+        // Passe le plancher : les interactions reelles remplacent le choix
+        // d'inscription, le renfort ne doit plus rien ajouter.
+        let profile = profile_following("a", COLD_START_INTERACTION_FLOOR as usize + 5);
+        assert!((cold_start_follow_multiplier(&profile) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn le_renfort_decroit_avec_l_activite() {
+        let neuf = cold_start_follow_multiplier(&profile_following("a", 0));
+        let tiede = cold_start_follow_multiplier(&profile_following("a", 10));
+        let actif = cold_start_follow_multiplier(&profile_following("a", 25));
+        assert!(neuf > tiede && tiede > actif);
+    }
+
+    #[test]
+    fn suivre_un_auteur_remonte_reellement_son_tweet() {
+        let suivi = profile_following("auteur", 0);
+        let inconnu = UserProfile::default();
+        let t = tweet_by("auteur");
+
+        let avec = apply_follow_boost(0.40, &t, &suivi, "ForYou");
+        let sans = apply_follow_boost(0.40, &t, &inconnu, "ForYou");
+
+        assert!(sans == 0.40, "un auteur non suivi ne doit rien gagner");
+        // Le point de depart du probleme : l'ecart doit etre franc, pas cosmetique.
+        assert!(avec >= sans * 1.4, "avec={avec}, sans={sans}");
+    }
+
+    #[test]
+    fn le_boost_ne_fait_jamais_deborder_le_score() {
+        let suivi = profile_following("auteur", 0);
+        assert!(apply_follow_boost(0.99, &tweet_by("auteur"), &suivi, "ForYou") <= 1.0);
+    }
+
+    #[test]
+    fn les_poids_de_dimensions_somment_a_un() {
+        // Une somme differente de 1 fait deriver tous les scores et casse les
+        // seuils calibres ailleurs (garbage, shadowban, bandit).
+        let total: f64 = crate::admin::models::AlgoWeights::default().as_array().iter().sum();
+        assert!((total - 1.0).abs() < 1e-9, "somme des poids = {total}");
     }
 
     // ─── Mise en forme du fil ────────────────────────────────────────────────

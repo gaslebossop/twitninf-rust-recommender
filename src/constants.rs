@@ -3,13 +3,13 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Dimension weights (sum = 1.0) — Phase 1 CTR Optimization
-pub const W_D1_ENGAGEMENT_VELOCITY: f64 = 0.32; // +0.07: meilleur prédicteur CTR
-pub const W_D2_CONTENT_INTELLIGENCE: f64 = 0.18; // -0.02
-pub const W_D3_SOCIAL_GRAPH: f64 = 0.15;
-pub const W_D4_TEMPORAL: f64 = 0.10;
+pub const W_D1_ENGAGEMENT_VELOCITY: f64 = 0.29; // -0.03 au profit de D3
+pub const W_D2_CONTENT_INTELLIGENCE: f64 = 0.16; // -0.02 au profit de D3
+pub const W_D3_SOCIAL_GRAPH: f64 = 0.22; // +0.07 : un abonnement doit se voir
+pub const W_D4_TEMPORAL: f64 = 0.09;
 pub const W_D5_BEHAVIORAL: f64 = 0.08; // -0.02
 pub const W_D6_DIVERSITY: f64 = 0.06; // -0.02
-pub const W_D7_VIRAL: f64 = 0.07;
+pub const W_D7_VIRAL: f64 = 0.06;
 pub const W_D8_PERSONALIZATION: f64 = 0.04; // -0.01
 
 // ─── D1 : Engagement Velocity ───────────────────────────────────────────────
@@ -46,6 +46,25 @@ pub const D2_URL_WEIGHT: f64 = 0.03; // varies by personality
 pub const D2_KEYWORD_WEIGHT: f64 = 0.03; // per keyword match, max 0.15
 
 // ─── D3 : Social Graph ──────────────────────────────────────────────────────
+
+/// Multiplicateur appliqué au score final d'un tweet écrit par un compte suivi,
+/// dans les modes Feed et ForYou.
+///
+/// Il existe parce que D3 seul ne suffit pas : `0,55 × 0,22` pèse environ 0,12
+/// sur un score borné à 1, quand D1 (engagement) en pèse trois fois plus. Sans
+/// ce multiplicateur, un tweet viral d'un inconnu passe systématiquement devant
+/// un abonnement, et l'abonnement ne sert quasiment à rien.
+pub const FOLLOW_FEED_BOOST: f64 = 1.45;
+pub const FOLLOW_MUTUAL_BOOST: f64 = 1.15;
+
+/// Renfort supplémentaire tant que le compte n'a presque aucun historique.
+///
+/// À l'inscription les abonnements choisis sont le SEUL signal disponible :
+/// aucun like, aucune vue, aucun auteur favori. Ce renfort s'efface au fur et à
+/// mesure que les interactions réelles arrivent, pour ne pas figer durablement
+/// le fil sur trois comptes choisis en dix secondes.
+pub const COLD_START_FOLLOW_BOOST_MAX: f64 = 1.25;
+pub const COLD_START_INTERACTION_FLOOR: f64 = 20.0;
 
 pub const D3_DIRECT_FOLLOW_BOOST: f64 = 0.55;
 pub const D3_MUTUAL_FOLLOW_BOOST: f64 = 0.25;

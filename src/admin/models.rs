@@ -88,14 +88,18 @@ impl Default for AlgoWeights {
         // D9 est financée par un prélèvement sur D1/D2 plutôt que par une
         // inflation du total : la somme reste à 1.0, sinon tous les scores
         // dérivent vers le haut et les seuils calibrés ailleurs sautent.
+        // D3 passe de 0,15 à 0,22, prélevés sur D1, D2, D4 et D7 : la somme
+        // reste à 1,0. Un abonnement pesait environ +0,05 sur un score borné à
+        // 1 — invisible face à D1. Le multiplicateur FOLLOW_FEED_BOOST fait le
+        // reste du travail au moment du classement.
         Self {
-            d1_engagement_velocity:  0.27,
-            d2_content_intelligence: 0.14,
-            d3_social_graph:         0.15,
-            d4_temporal:             0.10,
+            d1_engagement_velocity:  0.24,
+            d2_content_intelligence: 0.12,
+            d3_social_graph:         0.22,
+            d4_temporal:             0.09,
             d5_behavioral:           0.08,
             d6_diversity:            0.06,
-            d7_viral:                0.07,
+            d7_viral:                0.06,
             d8_personalization:      0.03,
             d9_llm_understanding:    0.10,
         }
