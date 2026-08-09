@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{}", cfg.port);
+    let addr = format!("{}:{}", cfg.bind_host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{}", addr);
 

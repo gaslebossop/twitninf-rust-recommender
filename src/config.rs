@@ -5,6 +5,13 @@ use tracing::warn;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
+    /// Adresse d'écoute. Reste `127.0.0.1` par défaut : ce service n'a aucune
+    /// authentification sur ses routes de scoring, il ne doit jamais se
+    /// retrouver exposé par accident. On ne l'élargit que pour l'IP du tunnel
+    /// WireGuard, afin que l'instance API du second VPS puisse l'interroger —
+    /// sans quoi elle retombe silencieusement sur le classement JS et perd les
+    /// événements CTR qui alimentent le modèle.
+    pub bind_host: String,
     pub db_host: String,
     pub db_port: u16,
     pub db_name: String,
@@ -56,6 +63,7 @@ impl Config {
             port: env::var("RUST_PORT")
                 .unwrap_or_else(|_| "3002".to_string())
                 .parse()?,
+            bind_host: env::var("RUST_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             db_host: env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string()),
             db_port: env::var("DB_PORT")
                 .unwrap_or_else(|_| "5432".to_string())
