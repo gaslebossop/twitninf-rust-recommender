@@ -934,6 +934,11 @@ WITH visible AS (
       AND (
         COALESCE(t.content, '') <> ''
         OR (t.media_urls IS NOT NULL AND t.media_urls <> '[]'::jsonb)
+        -- Un message vocal se suffit à lui-même : le composeur comme l'API
+        -- acceptent un tweet sans texte ni média dès lors qu'il en porte un.
+        -- Sans cette ligne, ce tweet-là n'entrait jamais dans le pool de
+        -- candidats — publié, visible sur le profil, absent du fil.
+        OR t.audio_url IS NOT NULL
         OR EXISTS (
              SELECT 1 FROM tweets o
              WHERE o.id = t.original_tweet_id
