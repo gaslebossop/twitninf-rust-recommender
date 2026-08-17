@@ -243,6 +243,14 @@ impl RecommenderService {
                 }
             }
         }
+        // Frein de vélocité (1h, ×0.5) — voir `crate::velocity`. Même patron de
+        // lecture par lot que le registre d'avertissements, mais un mécanisme
+        // entièrement séparé : pas de niveau, pas de surface fermée, juste un
+        // multiplicateur appliqué plus bas, après le scoring.
+        let velocity_throttles = self.cache.load_velocity_throttles(&author_ids).await;
+        if !velocity_throttles.is_empty() {
+            debug!(count = velocity_throttles.len(), "Velocity throttles loaded from Redis");
+        }
         debug!(deduped_count, removed = total_candidates - deduped_count, "Deduplication complete");
 
         // ── Plancher de qualité ─────────────────────────────────────────────────
@@ -294,7 +302,7 @@ impl RecommenderService {
         let active_weights = self.auto_tuner.active_weights(admin_weights.as_ref());
 
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
-        let scored = self.score_all(&deduped, &profile, &mode, &active_weights);
+        let scored = self.score_all(&deduped, &profile, &mode, &active_weights, &velocity_throttles);
         debug!(scored_count = scored.len(), "Scoring complete");
 
         // Show top 5 scores
@@ -408,7 +416,14 @@ impl RecommenderService {
         })
     }
 
-    fn score_all(&self, tweets: &[RawTweet], profile: &UserProfile, mode: &RecommendMode, weights: &crate::admin::AlgoWeights) -> Vec<ScoredTweet> {
+    fn score_all(
+        &self,
+        tweets: &[RawTweet],
+        profile: &UserProfile,
+        mode: &RecommendMode,
+        weights: &crate::admin::AlgoWeights,
+        velocity_throttles: &HashMap<String, f64>,
+    ) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
         let (ctr_samples, _) = self.ctr_predictor.stats();
@@ -537,6 +552,16 @@ impl RecommenderService {
                     trace!(tweet_id = %tweet.id, author = %tweet.user_id, strikes, damping,
                            "Author damped by explicit disinterest");
                 }
+            }
+
+            // ── Frein de vélocité ──────────────────────────────────────────────
+            // Appliqué à tous les modes, comme la sourdine ci-dessus. Un simple
+            // multiplicateur, jamais un filtre dur : contrairement au shadowban,
+            // ce frein ne ferme aucune surface — il retarde, il n'exclut pas.
+            if let Some(&mult) = velocity_throttles.get(&tweet.user_id) {
+                s.score *= mult;
+                trace!(tweet_id = %tweet.id, author = %tweet.user_id, mult,
+                       "Velocity throttle applied");
             }
 
             if idx < 3 {

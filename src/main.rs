@@ -3,6 +3,7 @@ mod ads;
 mod algorithm;
 mod bandit;
 mod shadowban;
+mod velocity;
 mod config;
 mod constants;
 mod error;
@@ -48,6 +49,7 @@ use handlers::{
     invalidate::invalidate_handler,
     recommendations::recommend_handler,
     tracking::track_handler,
+    velocity::{velocity_throttle_handler, velocity_post_burst_handler},
 };
 use ml::AutoTuner;
 use services::{cache_manager::CacheManager, recommender::RecommenderService};
@@ -123,6 +125,10 @@ async fn main() -> Result<()> {
         .route("/invalidate",      post(invalidate_handler))
         // État de compte lisible par le créateur concerné (service-à-service).
         .route("/account-status",  get(account_status_handler))
+        // Frein temporaire (1h, ×0.5) sur une action du compte — distinct du
+        // registre d'avertissements, voir `crate::velocity`.
+        .route("/velocity-throttle",  post(velocity_throttle_handler))
+        .route("/velocity/post-burst", post(velocity_post_burst_handler))
         // ── Admin node ────────────────────────────────────────────────────────
         .route("/admin/panel",                get(admin_ui_handler))
         .route("/admin/filters",              get(admin_filters_handler))

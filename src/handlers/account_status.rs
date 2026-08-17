@@ -60,5 +60,23 @@ pub async fn account_status_handler(
     }
 
     let status = state.cache.shadowban_account_status(&q.user_id).await;
-    (StatusCode::OK, Json(json!({ "success": true, "data": status })))
+
+    // Le frein de vélocité (`crate::velocity`) vit dans une clé Redis à part,
+    // hors du registre d'avertissements — sans ce merge, un compte tout juste
+    // freiné se lirait « Clean » ici alors que son score est bien divisé par
+    // deux en ce moment même. `velocity_throttled` s'ajoute donc au même JSON,
+    // pas dans un champ séparé de la réponse : la page « état du compte »
+    // n'a qu'un seul objet à lire.
+    let velocity_throttled = state
+        .cache
+        .load_velocity_throttles(std::slice::from_ref(&q.user_id))
+        .await
+        .contains_key(&q.user_id);
+
+    let mut data = serde_json::to_value(&status).unwrap_or_else(|_| json!({}));
+    if let Value::Object(ref mut map) = data {
+        map.insert("velocity_throttled".to_string(), json!(velocity_throttled));
+    }
+
+    (StatusCode::OK, Json(json!({ "success": true, "data": data })))
 }

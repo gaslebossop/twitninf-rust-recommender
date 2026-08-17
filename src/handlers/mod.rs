@@ -7,3 +7,4 @@ pub mod health;
 pub mod invalidate;
 pub mod recommendations;
 pub mod tracking;
+pub mod velocity;

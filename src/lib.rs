@@ -22,6 +22,7 @@ pub mod experiments;
 pub mod handlers;
 pub mod ml;        // Phase 2: ML CTR Predictor + User Weights + AutoTuner
 pub mod shadowban; // Suppression des comptes contenu poubelle
+pub mod velocity;  // Frein temporaire automatique (1h), distinct du shadowban
 pub mod models;
 pub mod services;
 pub mod utils;
