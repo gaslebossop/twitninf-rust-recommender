@@ -32,20 +32,26 @@ pub fn select(
     limit: usize,
 ) -> BanditSelection {
     if scored.is_empty() {
-        return BanditSelection { tweet_ids: vec![], exploit_count: 0, explore_count: 0 };
+        return BanditSelection {
+            tweet_ids: vec![],
+            exploit_count: 0,
+            explore_count: 0,
+        };
     }
 
     let n_explore = (limit as f64 * EPSILON).round() as usize;
     let n_exploit = limit.saturating_sub(n_explore);
 
     // Pool exploit : top tweets par score (déjà triés)
-    let exploit_pool: Vec<&ScoredTweet> = scored.iter()
+    let exploit_pool: Vec<&ScoredTweet> = scored
+        .iter()
         .filter(|s| s.score >= MIN_EXPLOIT_SCORE)
         .take(n_exploit * 3) // oversample pour pouvoir filtrer
         .collect();
 
     // Pool explore : tweets diversifiés (sources inattendues, auteurs nouveaux)
-    let explore_pool: Vec<&ScoredTweet> = scored.iter()
+    let explore_pool: Vec<&ScoredTweet> = scored
+        .iter()
         .filter(|s| is_exploration_candidate(s, raw_tweets, profile))
         .collect();
 
@@ -62,7 +68,8 @@ pub fn select(
     }
 
     // 2. Remplir explore : sélection aléatoire parmi candidats exploration
-    let mut explore_candidates: Vec<_> = explore_pool.iter()
+    let mut explore_candidates: Vec<_> = explore_pool
+        .iter()
         .filter(|s| !result.contains(&s.tweet_id))
         .collect();
 
@@ -82,7 +89,9 @@ pub fn select(
     // Compléter si manque de candidats explore
     if result.len() < limit {
         for s in scored.iter() {
-            if result.len() >= limit { break; }
+            if result.len() >= limit {
+                break;
+            }
             if !result.contains(&s.tweet_id) {
                 result.push(s.tweet_id.clone());
                 exploit_count += 1;
@@ -94,8 +103,11 @@ pub fn select(
     let interleaved = interleave_explore(&result, exploit_count, explore_count);
 
     debug!(
-        total = interleaved.len(), exploit_count, explore_count,
-        epsilon = EPSILON, "Bandit selection complete"
+        total = interleaved.len(),
+        exploit_count,
+        explore_count,
+        epsilon = EPSILON,
+        "Bandit selection complete"
     );
 
     BanditSelection {
@@ -126,9 +138,15 @@ fn is_exploration_candidate(
 
 /// Interleave : place les tweets explore à intervalles réguliers dans le feed
 fn interleave_explore(ids: &[String], n_exploit: usize, n_explore: usize) -> Vec<String> {
-    if n_explore == 0 { return ids.to_vec(); }
+    if n_explore == 0 {
+        return ids.to_vec();
+    }
 
-    let interval = if n_explore > 0 { (n_exploit / n_explore).max(1) } else { usize::MAX };
+    let interval = if n_explore > 0 {
+        (n_exploit / n_explore).max(1)
+    } else {
+        usize::MAX
+    };
     let exploit_ids: Vec<_> = ids.iter().take(n_exploit).collect();
     let explore_ids: Vec<_> = ids.iter().skip(n_exploit).collect();
 

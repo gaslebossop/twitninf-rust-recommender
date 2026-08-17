@@ -180,7 +180,9 @@ fn choose_active_variant(experiment: &ExperimentSnapshot) -> Option<&VariantPerf
             .iter()
             .filter(|variant| variant.impressions == lowest_impressions)
             .collect();
-        return least_exposed.get(rng.gen_range(0..least_exposed.len())).copied();
+        return least_exposed
+            .get(rng.gen_range(0..least_exposed.len()))
+            .copied();
     }
 
     if rng.gen_range(0..100) < experiment.exploration_percent.clamp(0, 100) {
@@ -677,10 +679,7 @@ mod tests {
 
     #[test]
     fn hard_stop_keeps_a_best_version_even_when_lift_is_small() {
-        let variants = vec![
-            performance("a", 0, 16, 2.0),
-            performance("b", 1, 16, 2.1),
-        ];
+        let variants = vec![performance("a", 0, 16, 2.0), performance("b", 1, 16, 2.1)];
         assert_eq!(
             winner_candidate(&variants, 8).map(|variant| variant.id.as_str()),
             Some("b")

@@ -49,8 +49,10 @@ pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
             let (samples, global_ctr) = recommender.ctr_stats();
             if n > 0 {
                 let pending = cache.pending_impressions().await;
-                debug!(negatives = n, samples, global_ctr, pending,
-                       "Balayage CTR : impressions sans engagement");
+                debug!(
+                    negatives = n,
+                    samples, global_ctr, pending, "Balayage CTR : impressions sans engagement"
+                );
             }
 
             if samples >= last_saved_at + SAVE_EVERY_SAMPLES {

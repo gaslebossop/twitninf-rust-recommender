@@ -187,15 +187,19 @@ mod tests {
 
     #[test]
     fn qualite_haute_bat_qualite_basse() {
-        let bon = d9_llm_understanding(&tweet_with(Some(labels(0.9, 0.0, "neutre", "humour", 1.0))));
-        let mauvais = d9_llm_understanding(&tweet_with(Some(labels(0.1, 0.0, "neutre", "humour", 1.0))));
+        let bon =
+            d9_llm_understanding(&tweet_with(Some(labels(0.9, 0.0, "neutre", "humour", 1.0))));
+        let mauvais =
+            d9_llm_understanding(&tweet_with(Some(labels(0.1, 0.0, "neutre", "humour", 1.0))));
         assert!(bon > mauvais, "bon={bon} mauvais={mauvais}");
     }
 
     #[test]
     fn confiance_faible_ramene_vers_neutre() {
-        let sur = d9_llm_understanding(&tweet_with(Some(labels(1.0, 0.0, "neutre", "humour", 1.0))));
-        let hesitant = d9_llm_understanding(&tweet_with(Some(labels(1.0, 0.0, "neutre", "humour", 0.4))));
+        let sur =
+            d9_llm_understanding(&tweet_with(Some(labels(1.0, 0.0, "neutre", "humour", 1.0))));
+        let hesitant =
+            d9_llm_understanding(&tweet_with(Some(labels(1.0, 0.0, "neutre", "humour", 0.4))));
         assert!(
             (hesitant - NEUTRAL).abs() < (sur - NEUTRAL).abs(),
             "hesitant={hesitant} sur={sur}"
@@ -204,9 +208,18 @@ mod tests {
 
     #[test]
     fn toxicite_penalise_sans_annuler() {
-        let p = toxicity_penalty(&tweet_with(Some(labels(0.5, 1.0, "agressif", "clash_insulte", 1.0))));
+        let p = toxicity_penalty(&tweet_with(Some(labels(
+            0.5,
+            1.0,
+            "agressif",
+            "clash_insulte",
+            1.0,
+        ))));
         assert!(p >= MIN_TOXICITY_MULTIPLIER, "penalite={p}");
-        assert!(p < 0.5, "un tweet tres toxique doit etre fortement retrograde, penalite={p}");
+        assert!(
+            p < 0.5,
+            "un tweet tres toxique doit etre fortement retrograde, penalite={p}"
+        );
     }
 
     #[test]
@@ -258,11 +271,18 @@ mod tests {
     fn le_boost_monte_progressivement() {
         // Pas de falaise autour du seuil : deux qualités voisines restent
         // traitées de façon voisine.
-        let juste_au_dessus = quality_boost(&tweet_with(Some(labels(0.71, 0.0, "neutre", "humour", 1.0))));
-        let bien_au_dessus = quality_boost(&tweet_with(Some(labels(0.95, 0.0, "neutre", "humour", 1.0))));
+        let juste_au_dessus = quality_boost(&tweet_with(Some(labels(
+            0.71, 0.0, "neutre", "humour", 1.0,
+        ))));
+        let bien_au_dessus = quality_boost(&tweet_with(Some(labels(
+            0.95, 0.0, "neutre", "humour", 1.0,
+        ))));
         assert!(juste_au_dessus > 1.0);
         assert!(bien_au_dessus > juste_au_dessus);
-        assert!(juste_au_dessus < 1.0 + MAX_QUALITY_BOOST * 0.2, "montée trop brutale: {juste_au_dessus}");
+        assert!(
+            juste_au_dessus < 1.0 + MAX_QUALITY_BOOST * 0.2,
+            "montée trop brutale: {juste_au_dessus}"
+        );
     }
 
     #[test]
@@ -277,7 +297,8 @@ mod tests {
         for q in [0.0, 0.5, 1.0] {
             for tone in ["agressif", "positif", "neutre"] {
                 for theme in ["spam_vide", "humour"] {
-                    let s = d9_llm_understanding(&tweet_with(Some(labels(q, 0.0, tone, theme, 1.0))));
+                    let s =
+                        d9_llm_understanding(&tweet_with(Some(labels(q, 0.0, tone, theme, 1.0))));
                     assert!((0.0..=1.0).contains(&s), "score hors intervalle: {s}");
                 }
             }

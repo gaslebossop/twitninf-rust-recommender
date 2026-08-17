@@ -64,7 +64,10 @@ pub fn score_tweet(
     // fonctions calculaient auparavant la même chose en double, et toute
     // correction apportée à l'une manquait à l'autre.
     score_tweet_with_weights(
-        tweet, profile, author_feed_count, feed_tweets_so_far,
+        tweet,
+        profile,
+        author_feed_count,
+        feed_tweets_so_far,
         &AlgoWeights::default(),
     )
 }
@@ -84,7 +87,11 @@ pub fn score_tweet_with_weights(
     let d5 = d5_behavioral_prediction(tweet, profile);
     let d6 = d6_content_diversity(tweet, profile, feed_tweets_so_far);
     let d7_raw = d7_viral_prediction(tweet);
-    let d7 = if tweet.source == TweetSource::Trending { (d7_raw * 1.2).clamp(0.0, 1.0) } else { d7_raw };
+    let d7 = if tweet.source == TweetSource::Trending {
+        (d7_raw * 1.2).clamp(0.0, 1.0)
+    } else {
+        d7_raw
+    };
     let d8 = d8_personalization_depth(tweet, profile);
     // D9 juge le texte lui-même via les étiquettes du LLM annotateur. Neutre
     // (0.5) tant qu'un tweet n'est pas annoté, donc sans effet sur le classement
@@ -96,8 +103,7 @@ pub fn score_tweet_with_weights(
 
     // Pondération avec les poids actifs (admin/auto-tuner) au lieu des constantes
     let w = weights;
-    let global_score =
-          d1 * w.d1_engagement_velocity
+    let global_score = d1 * w.d1_engagement_velocity
         + d2 * w.d2_content_intelligence
         + d3 * w.d3_social_graph
         + d4 * w.d4_temporal
@@ -109,27 +115,28 @@ pub fn score_tweet_with_weights(
     let base_score = global_score * 0.60 + user_weighted_score * 0.40;
 
     let diversity_mult = diversity_multiplier(author_feed_count);
-    let mod_penalty    = moderation_penalty(tweet);
+    let mod_penalty = moderation_penalty(tweet);
     let source_bonus = match tweet.source {
-        TweetSource::SocialGraph  => 0.08,
+        TweetSource::SocialGraph => 0.08,
         TweetSource::Personalized => 0.05,
-        TweetSource::Viral        => 0.04,
-        TweetSource::Influencer   => 0.03,
-        TweetSource::Trending     => 0.04,
-        TweetSource::Temporal     => 0.02,
-        TweetSource::Discovery    => 0.01,
-        TweetSource::Quality      => 0.01,
+        TweetSource::Viral => 0.04,
+        TweetSource::Influencer => 0.03,
+        TweetSource::Trending => 0.04,
+        TweetSource::Temporal => 0.02,
+        TweetSource::Discovery => 0.01,
+        TweetSource::Quality => 0.01,
     };
 
-    let score_before_shadowban = ((base_score + source_bonus) * diversity_mult + mod_penalty)
-        .clamp(0.0, 1.0);
+    let score_before_shadowban =
+        ((base_score + source_bonus) * diversity_mult + mod_penalty).clamp(0.0, 1.0);
 
     let enforcer = ShadowbanEnforcer::new();
     let shadowban_mult = enforcer.multiplier(tweet.author_shadowban_level);
-    let score_after_shadowban = enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
+    let score_after_shadowban =
+        enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
 
     let garbage_signals = GarbageContentDetector::new().detect(tweet);
-    let garbage_score   = garbage_signals.score();
+    let garbage_score = garbage_signals.score();
     let garbage_penalty = 1.0 - 0.60 * garbage_score;
 
     // ── Mod F : fatigue d'exposition ─────────────────────────────────────────
@@ -182,27 +189,27 @@ pub fn score_tweet_with_weights(
         tweet_id: tweet.id.clone(),
         score: final_score,
         breakdown: ScoreBreakdown {
-            engagement_velocity:    d1,
-            content_intelligence:   d2,
-            social_graph_dynamics:  d3,
-            temporal_dynamics:      d4,
-            behavioral_prediction:  d5,
-            content_diversity:      d6,
-            viral_prediction:       d7,
-            personalization_depth:  d8,
+            engagement_velocity: d1,
+            content_intelligence: d2,
+            social_graph_dynamics: d3,
+            temporal_dynamics: d4,
+            behavioral_prediction: d5,
+            content_diversity: d6,
+            viral_prediction: d7,
+            personalization_depth: d8,
             engagement_velocity_raw: ev_raw,
             engagement_acceleration: ev_accel,
-            viral_velocity:         viral_vel,
-            direct_follow_boost:    d_follow,
-            mutual_follow_boost:    d_mutual,
-            second_degree_boost:    d_second,
-            diversity_multiplier:   diversity_mult,
-            moderation_penalty:     mod_penalty,
-            source_weight:          tweet.source_weight,
-            shadowban_multiplier:   shadowban_mult,
+            viral_velocity: viral_vel,
+            direct_follow_boost: d_follow,
+            mutual_follow_boost: d_mutual,
+            second_degree_boost: d_second,
+            diversity_multiplier: diversity_mult,
+            moderation_penalty: mod_penalty,
+            source_weight: tweet.source_weight,
+            shadowban_multiplier: shadowban_mult,
             garbage_penalty,
             subscription_boost,
-            has_media:              tweet.has_media,
+            has_media: tweet.has_media,
             final_score,
         },
         ctr_features: None,
@@ -235,7 +242,10 @@ pub fn score_tweet_ml(
     if let Some(ctr_model) = ctr {
         let ml_ctr = ctr_model.predict_ctr(&features);
         let blended = scored.score * 0.60 + ml_ctr * 0.40;
-        debug!(base = scored.score, ml_ctr, blended, "Phase 2: ML CTR blend (60% rules + 40% ML)");
+        debug!(
+            base = scored.score,
+            ml_ctr, blended, "Phase 2: ML CTR blend (60% rules + 40% ML)"
+        );
         scored.score = blended;
     }
 
@@ -259,7 +269,13 @@ pub fn score_tweet_ml_with_weights(
     realtime_boost: f64,
     weights: &AlgoWeights,
 ) -> ScoredTweet {
-    let mut scored = score_tweet_with_weights(tweet, profile, author_feed_count, feed_tweets_so_far, weights);
+    let mut scored = score_tweet_with_weights(
+        tweet,
+        profile,
+        author_feed_count,
+        feed_tweets_so_far,
+        weights,
+    );
 
     let features = ctr_feature_vector(tweet, &scored);
     scored.ctr_features = Some(features.to_vec());
@@ -313,16 +329,22 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
     trace!(age_h, "D1 Age in hours");
 
     // Score brut pondéré par valeur d'action
-    let eng_total =
-          t.like_count     as f64 * 1.0
+    let eng_total = t.like_count     as f64 * 1.0
         + t.comment_count  as f64 * 3.5   // commentaires = signal fort
         + t.retweet_count  as f64 * 5.0   // retweet = amplification
         + t.share_count    as f64 * 4.0
         + t.bookmark_count as f64 * 2.5
         + t.view_count     as f64 * 0.05; // vues : volume élevé → faible poids
-    trace!(likes = t.like_count, comments = t.comment_count, retweets = t.retweet_count,
-           shares = t.share_count, bookmarks = t.bookmark_count, views = t.view_count,
-           eng_total, "D1 Raw engagement total");
+    trace!(
+        likes = t.like_count,
+        comments = t.comment_count,
+        retweets = t.retweet_count,
+        shares = t.share_count,
+        bookmarks = t.bookmark_count,
+        views = t.view_count,
+        eng_total,
+        "D1 Raw engagement total"
+    );
 
     // Phase 1: boost multiplicatif pour les tweets très récents (CTR signal fort)
     let recency_boost = if age_h < 0.5 {
@@ -332,7 +354,11 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
     } else {
         1.0
     };
-    trace!(recency_boost, age_h, "D1 Recency boost multiplier (Phase 1)");
+    trace!(
+        recency_boost,
+        age_h,
+        "D1 Recency boost multiplier (Phase 1)"
+    );
 
     // Vélocité = engagement / âge pondéré logarithmiquement + recency boost
     let velocity_raw = (eng_total / (1.0 + (age_h / 6.0).ln().max(0.0) * 2.0)) * recency_boost;
@@ -340,15 +366,18 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
 
     // Engagement récent (1h) : signal d'accélération
     let recent_eng =
-          t.likes_1h    as f64 * 1.0
-        + t.comments_1h as f64 * 3.5
-        + t.retweets_1h as f64 * 5.0;
-    trace!(recent_eng, likes_1h = t.likes_1h, comments_1h = t.comments_1h, retweets_1h = t.retweets_1h, "D1 Recent engagement (1h)");
+        t.likes_1h as f64 * 1.0 + t.comments_1h as f64 * 3.5 + t.retweets_1h as f64 * 5.0;
+    trace!(
+        recent_eng,
+        likes_1h = t.likes_1h,
+        comments_1h = t.comments_1h,
+        retweets_1h = t.retweets_1h,
+        "D1 Recent engagement (1h)"
+    );
 
     // Accélération : compare 1h à 6h pour détecter montée en puissance
     let eng_6h =
-          t.likes_6h  as f64 * 1.0
-        + (t.comment_count.min(t.comments_1h * 6 + 1)) as f64 * 3.5;
+        t.likes_6h as f64 * 1.0 + (t.comment_count.min(t.comments_1h * 6 + 1)) as f64 * 3.5;
 
     let acceleration = if eng_6h > 0.0 {
         // ratio 1h annualisé vs 6h : si > 1.0, trending en hausse
@@ -366,9 +395,14 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
 
     // Score D1 composite
     let ev_raw = sigmoid(velocity_raw / 200.0);
-    let d1 = (ev_raw * 0.50 + acceleration * 0.30 + viral_vel * 0.20)
-        .clamp(0.0, 1.0);
-    debug!(d1, ev_raw, acceleration, viral_vel, "D1 Final (50% raw_velocity + 30% acceleration + 20% viral_vel)");
+    let d1 = (ev_raw * 0.50 + acceleration * 0.30 + viral_vel * 0.20).clamp(0.0, 1.0);
+    debug!(
+        d1,
+        ev_raw,
+        acceleration,
+        viral_vel,
+        "D1 Final (50% raw_velocity + 30% acceleration + 20% viral_vel)"
+    );
 
     (d1, ev_raw, acceleration, viral_vel)
 }
@@ -385,22 +419,45 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
     // ── Longueur idéale ──────────────────────────────────────────────────────
     let len = t.content_length as f64;
     let len_score = match profile.preferred_content_length {
-        ContentLength::Short  => if len < 80.0 { 1.0 } else { 1.0 - ((len - 80.0) / 200.0).clamp(0.0, 0.8) },
+        ContentLength::Short => {
+            if len < 80.0 {
+                1.0
+            } else {
+                1.0 - ((len - 80.0) / 200.0).clamp(0.0, 0.8)
+            }
+        }
         ContentLength::Medium => gaussian(len, 150.0, 80.0),
-        ContentLength::Long   => if len > 200.0 { 1.0 } else { len / 200.0 },
+        ContentLength::Long => {
+            if len > 200.0 {
+                1.0
+            } else {
+                len / 200.0
+            }
+        }
     };
     score += len_score * 0.25;
     trace!(len_score, "D2 Length score (25% weight)");
 
     // ── Richesse du contenu ──────────────────────────────────────────────────
     let mut richness_score = 0.0;
-    if t.has_media { richness_score += 0.20; trace!("D2 Media +0.20"); }
+    if t.has_media {
+        richness_score += 0.20;
+        trace!("D2 Media +0.20");
+    }
     let hashtag_score = (t.hashtag_count as f64 * 0.04).min(0.12);
     richness_score += hashtag_score;
-    trace!(hashtag_count = t.hashtag_count, hashtag_score, "D2 Hashtags");
+    trace!(
+        hashtag_count = t.hashtag_count,
+        hashtag_score,
+        "D2 Hashtags"
+    );
     let mention_score = (t.mention_count as f64 * 0.03).min(0.09);
     richness_score += mention_score;
-    trace!(mention_count = t.mention_count, mention_score, "D2 Mentions");
+    trace!(
+        mention_count = t.mention_count,
+        mention_score,
+        "D2 Mentions"
+    );
     score += richness_score;
 
     // ── Style correspondant au profil ────────────────────────────────────────
@@ -410,7 +467,13 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
             let emoji_bonus = (t.emoji_count as f64 * 0.03).min(0.10);
             let excl_bonus = (t.exclamation_count as f64 * 0.03).min(0.06);
             let ps = emoji_bonus + excl_bonus;
-            trace!(emoji_count = t.emoji_count, emoji_bonus, exclamation_count = t.exclamation_count, excl_bonus, "D2 Enthusiastic");
+            trace!(
+                emoji_count = t.emoji_count,
+                emoji_bonus,
+                exclamation_count = t.exclamation_count,
+                excl_bonus,
+                "D2 Enthusiastic"
+            );
             ps
         }
         PersonalityType::Curious => {
@@ -418,7 +481,13 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
             let question_bonus = (t.question_count as f64 * 0.04).min(0.10);
             let url_bonus = (t.url_count as f64 * 0.03).min(0.06);
             let ps = question_bonus + url_bonus;
-            trace!(question_count = t.question_count, question_bonus, url_count = t.url_count, url_bonus, "D2 Curious");
+            trace!(
+                question_count = t.question_count,
+                question_bonus,
+                url_count = t.url_count,
+                url_bonus,
+                "D2 Curious"
+            );
             ps
         }
         PersonalityType::Thoughtful => {
@@ -426,7 +495,12 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
             let long_bonus = if len > 150.0 { 0.10 } else { 0.0 };
             let url_bonus = (t.url_count as f64 * 0.04).min(0.08);
             let ps = long_bonus + url_bonus;
-            trace!(long_bonus, url_count = t.url_count, url_bonus, "D2 Thoughtful");
+            trace!(
+                long_bonus,
+                url_count = t.url_count,
+                url_bonus,
+                "D2 Thoughtful"
+            );
             ps
         }
         PersonalityType::Balanced => {
@@ -442,7 +516,9 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
 
     // ── Correspondance mots-clés préférés ────────────────────────────────────
     let content_lower = t.content.to_lowercase();
-    let keyword_matches: usize = profile.top_words.iter()
+    let keyword_matches: usize = profile
+        .top_words
+        .iter()
         .filter(|(word, _)| content_lower.contains(word.as_str()))
         .count();
     let keyword_score = (keyword_matches as f64 * 0.03).min(0.15);
@@ -450,7 +526,10 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
     score += keyword_score;
 
     let final_d2 = score.clamp(0.0, 1.0);
-    debug!(final_d2, len_score, richness_score, personality_score, keyword_score, "D2 Final");
+    debug!(
+        final_d2,
+        len_score, richness_score, personality_score, keyword_score, "D2 Final"
+    );
     final_d2
 }
 
@@ -463,22 +542,48 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     trace!(author_id = %t.user_id, "D3 Social graph analysis");
 
     // Degré 1 : l'utilisateur suit directement l'auteur
-    let direct = if profile.following_ids.contains(&t.user_id) { 0.55 } else { 0.0 };
+    let direct = if profile.following_ids.contains(&t.user_id) {
+        0.55
+    } else {
+        0.0
+    };
     score += direct;
-    trace!(direct, is_following = profile.following_ids.contains(&t.user_id), "D3 Degree 1: Direct follow");
+    trace!(
+        direct,
+        is_following = profile.following_ids.contains(&t.user_id),
+        "D3 Degree 1: Direct follow"
+    );
 
     // Degré 1.5 : follow mutuel (plus fort signal d'engagement)
-    let mutual = if profile.mutual_follow_ids.contains(&t.user_id) { 0.25 } else { 0.0 };
+    let mutual = if profile.mutual_follow_ids.contains(&t.user_id) {
+        0.25
+    } else {
+        0.0
+    };
     score += mutual;
-    trace!(mutual, is_mutual = profile.mutual_follow_ids.contains(&t.user_id), "D3 Degree 1.5: Mutual follow");
+    trace!(
+        mutual,
+        is_mutual = profile.mutual_follow_ids.contains(&t.user_id),
+        "D3 Degree 1.5: Mutual follow"
+    );
 
     // Degré 2 : ami d'ami (signal de découverte sociale)
-    let second = if profile.second_degree_ids.contains(&t.user_id) { 0.12 } else { 0.0 };
+    let second = if profile.second_degree_ids.contains(&t.user_id) {
+        0.12
+    } else {
+        0.0
+    };
     score += second;
-    trace!(second, is_second_degree = profile.second_degree_ids.contains(&t.user_id), "D3 Degree 2: Second degree");
+    trace!(
+        second,
+        is_second_degree = profile.second_degree_ids.contains(&t.user_id),
+        "D3 Degree 2: Second degree"
+    );
 
     // Bonus si l'utilisateur a déjà interagi positivement avec l'auteur
-    let prior_affinity = profile.top_authors.iter()
+    let prior_affinity = profile
+        .top_authors
+        .iter()
         .find(|(uid, _)| uid == &t.user_id)
         .map(|(_, s)| *s)
         .unwrap_or(0.0);
@@ -490,10 +595,18 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     let author_influence = sigmoid((t.author_followers as f64).ln().max(0.0) / 10.0);
     let influence_bonus = author_influence * 0.08;
     score += influence_bonus;
-    trace!(author_followers = t.author_followers, author_influence, influence_bonus, "D3 Author network influence");
+    trace!(
+        author_followers = t.author_followers,
+        author_influence,
+        influence_bonus,
+        "D3 Author network influence"
+    );
 
     let final_d3 = score.clamp(0.0, 1.0);
-    debug!(final_d3, direct, mutual, second, "D3 Final (direct + mutual + second degree)");
+    debug!(
+        final_d3,
+        direct, mutual, second, "D3 Final (direct + mutual + second degree)"
+    );
     (final_d3, direct, mutual, second)
 }
 
@@ -511,14 +624,24 @@ fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile) -> f64 {
     trace!(recency, "D4 Recency (4h half-life, Phase 1 optimization)");
 
     // Alignement heure d'activité utilisateur
-    let pub_hour = t.created_at.format("%H").to_string().parse::<u32>().unwrap_or(12) as usize;
+    let pub_hour = t
+        .created_at
+        .format("%H")
+        .to_string()
+        .parse::<u32>()
+        .unwrap_or(12) as usize;
     let user_hour_activity = profile.hourly_activity[pub_hour];
     // user_hour_activity est déjà normalisé [0,1]
     let hour_match = user_hour_activity;
     trace!(pub_hour, hour_match, "D4 Hourly activity match");
 
     // Alignement jour de la semaine
-    let pub_day = t.created_at.format("%w").to_string().parse::<usize>().unwrap_or(1);
+    let pub_day = t
+        .created_at
+        .format("%w")
+        .to_string()
+        .parse::<usize>()
+        .unwrap_or(1);
     let day_match = profile.daily_activity[pub_day];
     trace!(pub_day, day_match, "D4 Daily activity match");
 
@@ -535,7 +658,14 @@ fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile) -> f64 {
 
     let d4 = (recency * 0.45 + hour_match * 0.25 + day_match * 0.15 + momentum.min(1.0) * 0.15)
         .clamp(0.0, 1.0);
-    debug!(d4, recency, hour_match, day_match, momentum, "D4 Final (45% recency + 25% hour + 15% day + 15% momentum)");
+    debug!(
+        d4,
+        recency,
+        hour_match,
+        day_match,
+        momentum,
+        "D4 Final (45% recency + 25% hour + 15% day + 15% momentum)"
+    );
     d4
 }
 
@@ -550,51 +680,91 @@ fn d5_behavioral_prediction(t: &RawTweet, profile: &UserProfile) -> f64 {
     // Probabilité d'engagement basée sur la vélocité (utilisateurs actifs voient plus)
     let activity_bonus = match profile.user_type {
         UserType::PowerUser => 0.20,
-        UserType::Regular   => 0.12,
-        UserType::Casual    => 0.05,
+        UserType::Regular => 0.12,
+        UserType::Casual => 0.05,
     };
     score += activity_bonus;
     trace!(activity_bonus, "D5 User activity type bonus");
 
     // L'utilisateur engage-t-il souvent avec des médias ? → boost si tweet avec média
-    let media_bonus = if profile.prefers_media && t.has_media { 0.18 } else { 0.0 };
+    let media_bonus = if profile.prefers_media && t.has_media {
+        0.18
+    } else {
+        0.0
+    };
     score += media_bonus;
-    trace!(media_bonus, prefers_media = profile.prefers_media, has_media = t.has_media, "D5 Media preference");
+    trace!(
+        media_bonus,
+        prefers_media = profile.prefers_media,
+        has_media = t.has_media,
+        "D5 Media preference"
+    );
 
     // Longueur préférée = signal fort d'achèvement de lecture
     let length_match = match (&profile.preferred_content_length, t.content_length) {
-        (ContentLength::Short,  l) if l < 100 => 0.15,
+        (ContentLength::Short, l) if l < 100 => 0.15,
         (ContentLength::Medium, l) if (80..=200).contains(&l) => 0.15,
-        (ContentLength::Long,   l) if l > 180 => 0.15,
+        (ContentLength::Long, l) if l > 180 => 0.15,
         _ => 0.05,
     };
     score += length_match;
-    trace!(length_match, content_length = t.content_length, "D5 Length preference match");
+    trace!(
+        length_match,
+        content_length = t.content_length,
+        "D5 Length preference match"
+    );
 
     // Prédiction de partage : si utilisateur retweet beaucoup
     let profile_retweet_rate = if profile.liked_tweet_ids.len() > 0 {
         profile.retweeted_tweet_ids.len() as f64 / profile.liked_tweet_ids.len() as f64
-    } else { 0.1 };
+    } else {
+        0.1
+    };
     // Si tweet très retweetable ET utilisateur retweet souvent
-    let retweet_pred = sigmoid(
-        (t.retweet_count as f64 / t.view_count.max(1) as f64) * 100.0
-    ) * profile_retweet_rate;
+    let retweet_pred = sigmoid((t.retweet_count as f64 / t.view_count.max(1) as f64) * 100.0)
+        * profile_retweet_rate;
     let retweet_bonus = (retweet_pred * 0.20).min(0.20);
     score += retweet_bonus;
-    trace!(retweet_pred, profile_retweet_rate, retweet_bonus, "D5 Retweet prediction");
+    trace!(
+        retweet_pred,
+        profile_retweet_rate,
+        retweet_bonus,
+        "D5 Retweet prediction"
+    );
 
     // Tendance d'engagement en hausse → utilisateurs actifs plus réceptifs
-    let trend_bonus = if profile.engagement_trend > 1.2 { 0.10 } else { 0.0 };
+    let trend_bonus = if profile.engagement_trend > 1.2 {
+        0.10
+    } else {
+        0.0
+    };
     score += trend_bonus;
-    trace!(engagement_trend = profile.engagement_trend, trend_bonus, "D5 Engagement trend");
+    trace!(
+        engagement_trend = profile.engagement_trend,
+        trend_bonus,
+        "D5 Engagement trend"
+    );
 
     // Risque churn inverse : utilisateur fidèle → plus de chances d'engager
     let loyalty_bonus = (1.0 - profile.churn_risk) * 0.12;
     score += loyalty_bonus;
-    trace!(churn_risk = profile.churn_risk, loyalty_bonus, "D5 Churn risk (loyalty)");
+    trace!(
+        churn_risk = profile.churn_risk,
+        loyalty_bonus,
+        "D5 Churn risk (loyalty)"
+    );
 
     let d5 = score.clamp(0.0, 1.0);
-    debug!(d5, activity_bonus, media_bonus, length_match, retweet_bonus, trend_bonus, loyalty_bonus, "D5 Final");
+    debug!(
+        d5,
+        activity_bonus,
+        media_bonus,
+        length_match,
+        retweet_bonus,
+        trend_bonus,
+        loyalty_bonus,
+        "D5 Final"
+    );
     d5
 }
 
@@ -603,11 +773,7 @@ fn d5_behavioral_prediction(t: &RawTweet, profile: &UserProfile) -> f64 {
 // Maximal Marginal Relevance (MMR) adapté :
 // récompense les tweets qui apportent de la nouveauté au feed.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d6_content_diversity(
-    t: &RawTweet,
-    profile: &UserProfile,
-    feed: &[ScoredTweet],
-) -> f64 {
+fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet]) -> f64 {
     let feed_size = feed.len();
     trace!(feed_size, tweet_id = %t.id, "D6 Content diversity analysis");
 
@@ -624,9 +790,7 @@ fn d6_content_diversity(
 
     // Bonus format : médias vs texte — ratio réel de tweets-média déjà dans le feed.
     // (auparavant un placeholder figé à 1.0 qui désactivait totalement ce bonus)
-    let media_in_feed = feed.iter()
-        .filter(|s| s.breakdown.has_media)
-        .count();
+    let media_in_feed = feed.iter().filter(|s| s.breakdown.has_media).count();
     let media_ratio_in_feed = media_in_feed as f64 / feed_size.max(1) as f64;
     // Récompense la nouveauté de format : un tweet média dans un feed pauvre en média
     // (ou inversement, un tweet texte dans un feed saturé de médias).
@@ -638,17 +802,34 @@ fn d6_content_diversity(
         0.0
     };
     score += media_bonus;
-    trace!(media_bonus, media_ratio_in_feed, media_in_feed, "D6 Media format diversity (real ratio)");
+    trace!(
+        media_bonus,
+        media_ratio_in_feed,
+        media_in_feed,
+        "D6 Media format diversity (real ratio)"
+    );
 
     // Bonus hashtags non vus (nouveaux sujets)
     let hashtag_novelty = if t.hashtag_count > 0 { 0.10 } else { 0.0 };
     score += hashtag_novelty;
-    trace!(hashtag_novelty, hashtag_count = t.hashtag_count, "D6 Hashtag novelty");
+    trace!(
+        hashtag_novelty,
+        hashtag_count = t.hashtag_count,
+        "D6 Hashtag novelty"
+    );
 
     // Contenu pas encore vu
-    let novelty_bonus = if !profile.seen_tweet_ids.contains(&t.id) { 0.05 } else { 0.0 };
+    let novelty_bonus = if !profile.seen_tweet_ids.contains(&t.id) {
+        0.05
+    } else {
+        0.0
+    };
     score += novelty_bonus;
-    trace!(novelty_bonus, already_seen = profile.seen_tweet_ids.contains(&t.id), "D6 Content novelty");
+    trace!(
+        novelty_bonus,
+        already_seen = profile.seen_tweet_ids.contains(&t.id),
+        "D6 Content novelty"
+    );
 
     let d6 = score.clamp(0.0, 1.0);
     debug!(d6, "D6 Final");
@@ -670,16 +851,27 @@ fn d7_viral_prediction(t: &RawTweet) -> f64 {
     }
 
     // Taux de partage (retweet/share par rapport au total d'engagement)
-    let share_ratio = (t.retweet_count + t.share_count) as f64
-        / total_eng.max(1) as f64;
-    trace!(share_ratio, retweets = t.retweet_count, shares = t.share_count, "D7 Share ratio");
+    let share_ratio = (t.retweet_count + t.share_count) as f64 / total_eng.max(1) as f64;
+    trace!(
+        share_ratio,
+        retweets = t.retweet_count,
+        shares = t.share_count,
+        "D7 Share ratio"
+    );
 
     // Cascade effect : plus de retweets que de likes → potentiel viral fort
     let cascade = if t.like_count > 0 {
         (t.retweet_count as f64 / t.like_count as f64).min(3.0) / 3.0
-    } else if t.retweet_count > 0 { 1.0 }
-    else { 0.0 };
-    trace!(cascade, likes = t.like_count, "D7 Cascade effect (retweets/likes)");
+    } else if t.retweet_count > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    trace!(
+        cascade,
+        likes = t.like_count,
+        "D7 Cascade effect (retweets/likes)"
+    );
 
     // Vitesse de diffusion : eng/heure (viral = > 100 eng/h)
     let eng_per_hour = total_eng as f64 / age_h;
@@ -690,15 +882,25 @@ fn d7_viral_prediction(t: &RawTweet) -> f64 {
     let shareability = if t.has_media { 0.3 } else { 0.1 }
         + if t.hashtag_count > 0 { 0.1 } else { 0.0 }
         + if t.url_count > 0 { 0.1 } else { 0.0 };
-    trace!(shareability, has_media = t.has_media, hashtags = t.hashtag_count, urls = t.url_count, "D7 Shareability");
+    trace!(
+        shareability,
+        has_media = t.has_media,
+        hashtags = t.hashtag_count,
+        urls = t.url_count,
+        "D7 Shareability"
+    );
 
     // Prédiction virale composite
-    let d7 = (share_ratio     * 0.30
-    + cascade        * 0.25
-    + spread_velocity* 0.25
-    + shareability   * 0.20)
-    .clamp(0.0, 1.0);
-    debug!(d7, share_ratio, cascade, spread_velocity, shareability, "D7 Final (30% share + 25% cascade + 25% velocity + 20% shareability)");
+    let d7 = (share_ratio * 0.30 + cascade * 0.25 + spread_velocity * 0.25 + shareability * 0.20)
+        .clamp(0.0, 1.0);
+    debug!(
+        d7,
+        share_ratio,
+        cascade,
+        spread_velocity,
+        shareability,
+        "D7 Final (30% share + 25% cascade + 25% velocity + 20% shareability)"
+    );
     d7
 }
 
@@ -711,44 +913,85 @@ fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile) -> f64 {
     trace!(author_id = %t.user_id, "D8 Personalization depth start");
 
     // Affinité auteur (score précalculé depuis l'historique d'interactions)
-    let author_affinity = profile.top_authors.iter()
+    let author_affinity = profile
+        .top_authors
+        .iter()
         .find(|(uid, _)| uid == &t.user_id)
         .map(|(_, s)| *s)
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
     let affinity_score = author_affinity * 0.40;
     score += affinity_score;
-    trace!(author_affinity, affinity_score, "D8 Author affinity (40% weight)");
+    trace!(
+        author_affinity,
+        affinity_score,
+        "D8 Author affinity (40% weight)"
+    );
 
     // Correspondance mots avec centres d'intérêt
     let content_lower = t.content.to_lowercase();
     let mut word_matches = 0;
-    let interest_score: f64 = profile.top_words.iter()
+    let interest_score: f64 = profile
+        .top_words
+        .iter()
         .take(20)
         .map(|(word, count)| {
             if content_lower.contains(word.as_str()) {
                 word_matches += 1;
                 (*count as f64).ln() / 5.0 // pondéré par fréquence
-            } else { 0.0 }
+            } else {
+                0.0
+            }
         })
         .sum::<f64>()
         .min(0.35);
     score += interest_score;
-    trace!(interest_score, word_matches, top_words_count = profile.top_words.len(), "D8 Interest word matches");
+    trace!(
+        interest_score,
+        word_matches,
+        top_words_count = profile.top_words.len(),
+        "D8 Interest word matches"
+    );
 
     // Profil émotionnel : si utilisateur positif, boost contenus enthousiastes
-    let emotional_bonus = if profile.emotional_positivity > 0.6 && t.emoji_count > 0 { 0.10 } else { 0.0 };
+    let emotional_bonus = if profile.emotional_positivity > 0.6 && t.emoji_count > 0 {
+        0.10
+    } else {
+        0.0
+    };
     score += emotional_bonus;
-    trace!(emotional_bonus, emotional_positivity = profile.emotional_positivity, emoji_count = t.emoji_count, "D8 Emotional positivity");
+    trace!(
+        emotional_bonus,
+        emotional_positivity = profile.emotional_positivity,
+        emoji_count = t.emoji_count,
+        "D8 Emotional positivity"
+    );
 
     // Activité heure = match quasi parfait
-    let pub_hour = t.created_at.format("%H").to_string().parse::<u32>().unwrap_or(12);
-    let hour_bonus = if pub_hour == profile.most_active_hour { 0.15 } else { 0.0 };
+    let pub_hour = t
+        .created_at
+        .format("%H")
+        .to_string()
+        .parse::<u32>()
+        .unwrap_or(12);
+    let hour_bonus = if pub_hour == profile.most_active_hour {
+        0.15
+    } else {
+        0.0
+    };
     score += hour_bonus;
-    trace!(hour_bonus, pub_hour, most_active_hour = profile.most_active_hour, "D8 Peak activity hour match");
+    trace!(
+        hour_bonus,
+        pub_hour,
+        most_active_hour = profile.most_active_hour,
+        "D8 Peak activity hour match"
+    );
 
     let d8 = score.clamp(0.0, 1.0);
-    debug!(d8, author_affinity, interest_score, emotional_bonus, hour_bonus, "D8 Final");
+    debug!(
+        d8,
+        author_affinity, interest_score, emotional_bonus, hour_bonus, "D8 Final"
+    );
     d8
 }
 
@@ -796,13 +1039,17 @@ pub fn diversity_multiplier(author_count_in_feed: u32) -> f64 {
     // compte qui finissait quand même par occuper la page faute de concurrence.
     let mult = match author_count_in_feed {
         0 | 1 => 1.00,
-        2     => 0.82,
-        3     => 0.62,
-        4     => 0.36,
-        5     => 0.20,
-        _     => 0.10,
+        2 => 0.82,
+        3 => 0.62,
+        4 => 0.36,
+        5 => 0.20,
+        _ => 0.10,
     };
-    trace!(author_count_in_feed, mult, "Diversity multiplier applied (anti-filter bubble)");
+    trace!(
+        author_count_in_feed,
+        mult,
+        "Diversity multiplier applied (anti-filter bubble)"
+    );
     mult
 }
 
@@ -813,7 +1060,12 @@ fn moderation_penalty(t: &RawTweet) -> f64 {
     }
     let report_ratio = t.report_count as f64 / t.view_count.max(100) as f64;
     let penalty = -(report_ratio * 3.0).min(0.50);
-    trace!(report_count = t.report_count, report_ratio, penalty, "Moderation penalty calculated");
+    trace!(
+        report_count = t.report_count,
+        report_ratio,
+        penalty,
+        "Moderation penalty calculated"
+    );
     penalty // max -50% du score
 }
 
@@ -833,46 +1085,61 @@ pub struct FeedQualityMetrics {
 pub fn compute_feed_metrics(tweets: &[(&RawTweet, &ScoredTweet)]) -> FeedQualityMetrics {
     if tweets.is_empty() {
         return FeedQualityMetrics {
-            diversity_score: 0.0, freshness_score: 0.0,
-            relevance_score: 0.0, viral_potential: 0.0, novelty_score: 0.0,
+            diversity_score: 0.0,
+            freshness_score: 0.0,
+            relevance_score: 0.0,
+            viral_potential: 0.0,
+            novelty_score: 0.0,
         };
     }
 
     let n = tweets.len() as f64;
 
     // Diversité : ratio d'auteurs uniques
-    let unique_authors: std::collections::HashSet<&str> = tweets.iter()
-        .map(|(t, _)| t.user_id.as_str()).collect();
+    let unique_authors: std::collections::HashSet<&str> =
+        tweets.iter().map(|(t, _)| t.user_id.as_str()).collect();
     let diversity_score = (unique_authors.len() as f64 / n).min(1.0);
 
     // Fraîcheur : moyenne des scores de fraîcheur
-    let freshness_score = tweets.iter()
+    let freshness_score = tweets
+        .iter()
         .map(|(t, _)| (-0.115 * age_hours(t)).exp())
-        .sum::<f64>() / n;
+        .sum::<f64>()
+        / n;
 
     // Pertinence : moyenne des scores D5 (behavioral prediction)
-    let relevance_score = tweets.iter()
+    let relevance_score = tweets
+        .iter()
         .map(|(_, s)| s.breakdown.behavioral_prediction)
-        .sum::<f64>() / n;
+        .sum::<f64>()
+        / n;
 
     // Potentiel viral : moyenne D7
-    let viral_potential = tweets.iter()
+    let viral_potential = tweets
+        .iter()
         .map(|(_, s)| s.breakdown.viral_prediction)
-        .sum::<f64>() / n;
+        .sum::<f64>()
+        / n;
 
     // Nouveauté : % de tweets avec scores de découverte (source != social)
-    let novelty_score = tweets.iter()
-        .map(|(t, _)| if t.source == TweetSource::Discovery || t.source == TweetSource::Trending {
-            1.0
-        } else { 0.0 })
-        .sum::<f64>() / n;
+    let novelty_score = tweets
+        .iter()
+        .map(|(t, _)| {
+            if t.source == TweetSource::Discovery || t.source == TweetSource::Trending {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .sum::<f64>()
+        / n;
 
     FeedQualityMetrics {
         diversity_score,
         freshness_score: freshness_score.clamp(0.0, 1.0),
         relevance_score: relevance_score.clamp(0.0, 1.0),
         viral_potential: viral_potential.clamp(0.0, 1.0),
-        novelty_score:   novelty_score.clamp(0.0, 1.0),
+        novelty_score: novelty_score.clamp(0.0, 1.0),
     }
 }
 

@@ -3,7 +3,7 @@ pub mod store;
 pub mod ui;
 
 pub use models::{
-    AdminActionResponse, AlgoStatsResponse, AlgoWeights, AlgoWeightsResponse,
-    BanRequest, BannedUser, FiltersResponse, IssueStrikeRequest, RevokeStrikeRequest,
-    SetShadowbanRequest, SetWeightsRequest, ShadowbannedUser, UnbanRequest,
+    AdminActionResponse, AlgoStatsResponse, AlgoWeights, AlgoWeightsResponse, BanRequest,
+    BannedUser, FiltersResponse, IssueStrikeRequest, RevokeStrikeRequest, SetShadowbanRequest,
+    SetWeightsRequest, ShadowbannedUser, UnbanRequest,
 };

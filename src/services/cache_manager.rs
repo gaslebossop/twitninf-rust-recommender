@@ -1,5 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -11,9 +12,6 @@ const TTL_SEEN_TWEETS: u64 = 86400;
 /// définitif — les goûts changent, et rien dans l'app ne permet de « dé-refuser ».
 const TTL_DAMPED_AUTHORS: u64 = 30 * 86400;
 const TTL_USER_PROFILE: u64 = 300;
-const TWEET_SCORES_KEY: &str = "twitninf:tweet_scores";
-const MAX_TWEET_SCORE: f64 = 500.0; // plafond absolu pour éviter l'inflation Redis
-
 /// Impressions en attente d'attribution, triées par timestamp d'exposition.
 const CTR_PENDING_KEY: &str = "twitninf:ctr:pending";
 /// Au-delà de ce délai, une impression sans engagement devient un exemple négatif.
@@ -30,7 +28,9 @@ impl CacheManager {
     pub async fn new(redis_url: &str) -> Result<Self> {
         let client = Client::open(redis_url)?;
         let conn = client.get_multiplexed_tokio_connection().await?;
-        Ok(CacheManager { conn: Arc::new(Mutex::new(conn)) })
+        Ok(CacheManager {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     // ─── Recommandations ─────────────────────────────────────────────────────
@@ -54,11 +54,22 @@ impl CacheManager {
             return Some(entries);
         }
         serde_json::from_str::<Vec<String>>(&json).ok().map(|ids| {
-            ids.into_iter().map(|id| FeedEntry { id, parent_id: None }).collect()
+            ids.into_iter()
+                .map(|id| FeedEntry {
+                    id,
+                    parent_id: None,
+                })
+                .collect()
         })
     }
 
-    pub async fn set_recommendations_ttl(&self, user_id: &str, mode: &str, entries: &[FeedEntry], ttl: u64) {
+    pub async fn set_recommendations_ttl(
+        &self,
+        user_id: &str,
+        mode: &str,
+        entries: &[FeedEntry],
+        ttl: u64,
+    ) {
         let key = format!("twitninf:reco:{}:{}", user_id, mode);
         if let Ok(json) = serde_json::to_string(entries) {
             let mut c = self.conn.lock().await;
@@ -90,21 +101,6 @@ impl CacheManager {
     }
 
     // ─── Scores de tweets ─────────────────────────────────────────────────────
-
-    pub async fn update_tweet_score(&self, tweet_id: &str, weight: f64) -> Result<f64> {
-        // Valider que tweet_id est un UUID avant de l'utiliser comme membre Redis
-        if uuid::Uuid::parse_str(tweet_id).is_err() {
-            bail!("tweet_id must be a valid UUID");
-        }
-        let mut c = self.conn.lock().await;
-        let new_score: f64 = c.zincr(TWEET_SCORES_KEY, tweet_id, weight).await?;
-        // Plafonner le score pour éviter l'inflation illimitée via fausses interactions
-        if new_score > MAX_TWEET_SCORE {
-            let _: Result<(), _> = c.zadd(TWEET_SCORES_KEY, tweet_id, MAX_TWEET_SCORE).await;
-            return Ok(MAX_TWEET_SCORE);
-        }
-        Ok(new_score)
-    }
 
     // ─── Tweets vus ───────────────────────────────────────────────────────────
 
@@ -139,16 +135,23 @@ impl CacheManager {
     }
 
     /// Auteurs refusés par ce lecteur → nombre de refus.
-    pub async fn get_damped_authors(&self, user_id: &str) -> std::collections::HashMap<String, f64> {
+    pub async fn get_damped_authors(
+        &self,
+        user_id: &str,
+    ) -> std::collections::HashMap<String, f64> {
         let key = format!("twitninf:damped:{}", user_id);
         let mut c = self.conn.lock().await;
-        let entries: Vec<(String, f64)> = c.zrange_withscores(&key, 0, -1).await.unwrap_or_default();
+        let entries: Vec<(String, f64)> =
+            c.zrange_withscores(&key, 0, -1).await.unwrap_or_default();
         entries.into_iter().collect()
     }
 
     pub async fn health_check(&self) -> bool {
         let mut c = self.conn.lock().await;
-        redis::cmd("PING").query_async::<String>(&mut *c).await.is_ok()
+        redis::cmd("PING")
+            .query_async::<String>(&mut *c)
+            .await
+            .is_ok()
     }
 
     // ─── Impressions CTR ──────────────────────────────────────────────────────
@@ -169,7 +172,9 @@ impl CacheManager {
         if uuid::Uuid::parse_str(user_id).is_err() || uuid::Uuid::parse_str(tweet_id).is_err() {
             return;
         }
-        let Ok(json) = serde_json::to_string(features) else { return };
+        let Ok(json) = serde_json::to_string(features) else {
+            return;
+        };
         let now = now_secs();
         let key = Self::imp_key(user_id, tweet_id);
         let member = format!("{}:{}", user_id, tweet_id);
@@ -215,7 +220,9 @@ impl CacheManager {
         for member in members {
             // member = "<user_uuid>:<tweet_uuid>" — les UUID contiennent des
             // tirets mais pas de deux-points, la coupe est donc sans ambiguïté.
-            let Some((user_id, tweet_id)) = member.split_once(':') else { continue };
+            let Some((user_id, tweet_id)) = member.split_once(':') else {
+                continue;
+            };
             let key = Self::imp_key(user_id, tweet_id);
 
             let mut c = self.conn.lock().await;

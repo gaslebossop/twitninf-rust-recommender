@@ -5,9 +5,11 @@ use anyhow::Result;
 use deadpool_postgres::Pool as PgPool;
 use rand::Rng;
 use tokio::join;
-use tracing::{info, warn, debug, trace};
+use tracing::{debug, info, trace, warn};
 
-use crate::algorithm::scoring::{compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights};
+use crate::algorithm::scoring::{
+    compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights,
+};
 use crate::algorithm::trending::trending_score;
 use crate::bandit::bandit_select;
 use crate::constants::{
@@ -45,14 +47,24 @@ pub struct RecommenderService {
 impl RecommenderService {
     pub fn new(pg: PgPool, cache: CacheManager) -> Self {
         Self {
-            pg, cache,
+            pg,
+            cache,
             ctr_predictor: CtrPredictor::new(),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
 
-    pub fn new_with_tuner(pg: PgPool, cache: CacheManager, auto_tuner: std::sync::Arc<AutoTuner>) -> Self {
-        Self { pg, cache, ctr_predictor: CtrPredictor::new(), auto_tuner }
+    pub fn new_with_tuner(
+        pg: PgPool,
+        cache: CacheManager,
+        auto_tuner: std::sync::Arc<AutoTuner>,
+    ) -> Self {
+        Self {
+            pg,
+            cache,
+            ctr_predictor: CtrPredictor::new(),
+            auto_tuner,
+        }
     }
 
     /// Variante de production : recharge le modèle CTR persisté au lieu de
@@ -64,25 +76,41 @@ impl RecommenderService {
         auto_tuner: std::sync::Arc<AutoTuner>,
     ) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
-        Self { pg, cache, ctr_predictor, auto_tuner }
+        Self {
+            pg,
+            cache,
+            ctr_predictor,
+            auto_tuner,
+        }
     }
 
     pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
-        Self { pg, cache, ctr_predictor, auto_tuner: std::sync::Arc::new(AutoTuner::new()) }
+        Self {
+            pg,
+            cache,
+            ctr_predictor,
+            auto_tuner: std::sync::Arc::new(AutoTuner::new()),
+        }
     }
 
     /// Enregistre un engagement/rejet et met à jour le modèle ML en temps réel.
     /// `features` provient de l'impression mémorisée à l'affichage.
     pub fn record_ctr_event(&self, features: &[f64], clicked: bool) {
         let Some(vec) = to_feature_array(features) else {
-            warn!(len = features.len(), "CTR: vecteur de features de taille invalide, ignoré");
+            warn!(
+                len = features.len(),
+                "CTR: vecteur de features de taille invalide, ignoré"
+            );
             return;
         };
         self.ctr_predictor.record_interaction(vec, clicked);
         let (samples, global_ctr) = self.ctr_predictor.stats();
         if samples % 100 == 0 {
-            info!(samples, global_ctr, "CTR model checkpoint — 100 new samples");
+            info!(
+                samples,
+                global_ctr, "CTR model checkpoint — 100 new samples"
+            );
         }
     }
 
@@ -108,9 +136,15 @@ impl RecommenderService {
 
         let mut stored = 0usize;
         for tweet_id in page_ids {
-            let Some(s) = by_id.get(tweet_id.as_str()) else { continue };
-            let Some(features) = s.ctr_features.as_ref() else { continue };
-            self.cache.record_impression(user_id, tweet_id, features).await;
+            let Some(s) = by_id.get(tweet_id.as_str()) else {
+                continue;
+            };
+            let Some(features) = s.ctr_features.as_ref() else {
+                continue;
+            };
+            self.cache
+                .record_impression(user_id, tweet_id, features)
+                .await;
             stored += 1;
         }
         if stored > 0 {
@@ -143,7 +177,12 @@ impl RecommenderService {
                 let cached_total = cached.len();
                 let page: Vec<FeedEntry> = cached.into_iter().skip(offset).take(limit).collect();
                 let count = page.len();
-                debug!(cache_hit = true, cached_total, page_size = count, "Cache hit!");
+                debug!(
+                    cache_hit = true,
+                    cached_total,
+                    page_size = count,
+                    "Cache hit!"
+                );
                 // ⚠ Une page peut couper un fil en deux : le parent finit la
                 // page N, sa réponse ouvre la page N+1. `thread_links` ne
                 // rattache alors rien pour cette réponse, et les clients
@@ -152,8 +191,12 @@ impl RecommenderService {
                 let threads = thread_links(&page);
                 let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
                 let mut response = self.build_empty_response(
-                    &req.user_id, page_ids, count, mode_str,
-                    start.elapsed().as_millis() as u64, true,
+                    &req.user_id,
+                    page_ids,
+                    count,
+                    mode_str,
+                    start.elapsed().as_millis() as u64,
+                    true,
                 );
                 response.threads = threads;
                 if req.enable_experiments.unwrap_or(false) {
@@ -161,7 +204,9 @@ impl RecommenderService {
                         &self.pg,
                         &req.user_id,
                         &response.tweet_ids,
-                    ).await.unwrap_or_else(|error| {
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
                         warn!(error = ?error, "A/B assignment failed on cached recommendations");
                         Vec::new()
                     });
@@ -175,8 +220,12 @@ impl RecommenderService {
         if self.cache.admin_is_hard_banned(&req.user_id).await {
             warn!(user_id = %req.user_id, "Hard-banned user requested recommendations — returning empty");
             return Ok(self.build_empty_response(
-                &req.user_id, vec![], 0, mode_str,
-                start.elapsed().as_millis() as u64, false,
+                &req.user_id,
+                vec![],
+                0,
+                mode_str,
+                start.elapsed().as_millis() as u64,
+                false,
             ));
         }
 
@@ -190,13 +239,18 @@ impl RecommenderService {
         debug!(banned_count = banned_set.len(), "Hard-banned set loaded");
 
         debug!("Collecting candidates from {} sources...", 8);
-        let (mut sources, source_stats) = self.collect_candidates(&req.user_id, &profile, &mode, &banned_set).await?;
+        let (mut sources, source_stats) = self
+            .collect_candidates(&req.user_id, &profile, &mode, &banned_set)
+            .await?;
 
         // Remonter les parents AVANT la déduplication et le plancher de qualité :
         // un parent est un tweet comme un autre et doit subir exactement les
         // mêmes contrôles. L'entrer plus tard reviendrait à le faire passer par
         // une porte que les candidats normaux n'ont pas.
-        if let Err(error) = self.hydrate_thread_parents(&req.user_id, &mut sources, &banned_set).await {
+        if let Err(error) = self
+            .hydrate_thread_parents(&req.user_id, &mut sources, &banned_set)
+            .await
+        {
             // Échec non bloquant : sans les parents, `shape_feed` retombe sur
             // son comportement d'avant — il écarte les réponses. Le fil est plus
             // pauvre, il n'est pas cassé.
@@ -204,18 +258,28 @@ impl RecommenderService {
         }
 
         let total_candidates = sources.len();
-        debug!(total_candidates,
-               trending = source_stats.trending, social_graph = source_stats.social_graph,
-               viral = source_stats.viral, discovery = source_stats.discovery,
-               temporal = source_stats.temporal, influencer = source_stats.influencer,
-               personalized = source_stats.personalized, quality = source_stats.quality,
-               "Candidates collected from 8 sources");
+        debug!(
+            total_candidates,
+            trending = source_stats.trending,
+            social_graph = source_stats.social_graph,
+            viral = source_stats.viral,
+            discovery = source_stats.discovery,
+            temporal = source_stats.temporal,
+            influencer = source_stats.influencer,
+            personalized = source_stats.personalized,
+            quality = source_stats.quality,
+            "Candidates collected from 8 sources"
+        );
 
         if sources.is_empty() {
             warn!("No candidates found for user");
             return Ok(self.build_empty_response(
-                &req.user_id, vec![], 0, mode_str,
-                start.elapsed().as_millis() as u64, false,
+                &req.user_id,
+                vec![],
+                0,
+                mode_str,
+                start.elapsed().as_millis() as u64,
+                false,
             ));
         }
 
@@ -227,16 +291,26 @@ impl RecommenderService {
         // On collecte les author_ids uniques puis on fait un batch lookup Redis.
         let author_ids: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
-            deduped.iter().filter_map(|t| {
-                if seen.insert(t.user_id.clone()) { Some(t.user_id.clone()) } else { None }
-            }).collect()
+            deduped
+                .iter()
+                .filter_map(|t| {
+                    if seen.insert(t.user_id.clone()) {
+                        Some(t.user_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         };
         // Décision manuelle ET niveau dérivé des avertissements, en deux MGET
         // pour tout le pool (voir `shadowban/store.rs`). L'ancienne lecture
         // faisait un aller-retour Redis par auteur, en série.
         let shadowban_levels = self.cache.shadowban_load_levels(&author_ids).await;
         if !shadowban_levels.is_empty() {
-            debug!(count = shadowban_levels.len(), "Shadowban levels loaded from Redis");
+            debug!(
+                count = shadowban_levels.len(),
+                "Shadowban levels loaded from Redis"
+            );
             for tweet in deduped.iter_mut() {
                 if let Some(&level) = shadowban_levels.get(&tweet.user_id) {
                     tweet.author_shadowban_level = level;
@@ -249,9 +323,23 @@ impl RecommenderService {
         // multiplicateur appliqué plus bas, après le scoring.
         let velocity_throttles = self.cache.load_velocity_throttles(&author_ids).await;
         if !velocity_throttles.is_empty() {
-            debug!(count = velocity_throttles.len(), "Velocity throttles loaded from Redis");
+            debug!(
+                count = velocity_throttles.len(),
+                "Velocity throttles loaded from Redis"
+            );
         }
-        debug!(deduped_count, removed = total_candidates - deduped_count, "Deduplication complete");
+        // Boost temps réel (30 min) — voir `services::feedback_loop`. Batché sur
+        // le même `author_ids` que le shadowban et le frein de vélocité : aucun
+        // aller-retour Redis supplémentaire par tweet.
+        let realtime_author_boosts = self
+            .cache
+            .load_realtime_author_boosts(&req.user_id, &author_ids)
+            .await;
+        debug!(
+            deduped_count,
+            removed = total_candidates - deduped_count,
+            "Deduplication complete"
+        );
 
         // ── Plancher de qualité ─────────────────────────────────────────────────
         // Écarté AVANT le scoring, et pas rétrogradé : un tweet sans apport
@@ -284,32 +372,54 @@ impl RecommenderService {
         // `EXCLUDE_SEEN_MIN_REMAINING`.
         if req.exclude_seen.unwrap_or(false) && !profile.seen_tweet_ids.is_empty() {
             let seen: HashSet<&str> = profile.seen_tweet_ids.iter().map(|s| s.as_str()).collect();
-            let remaining = deduped.iter().filter(|t| !seen.contains(t.id.as_str())).count();
+            let remaining = deduped
+                .iter()
+                .filter(|t| !seen.contains(t.id.as_str()))
+                .count();
             if remaining >= EXCLUDE_SEEN_MIN_REMAINING {
                 let before = deduped.len();
                 deduped.retain(|t| !seen.contains(t.id.as_str()));
-                debug!(dropped = before - deduped.len(), remaining = deduped.len(),
-                       "Already-seen tweets excluded");
+                debug!(
+                    dropped = before - deduped.len(),
+                    remaining = deduped.len(),
+                    "Already-seen tweets excluded"
+                );
             } else {
-                debug!(remaining, floor = EXCLUDE_SEEN_MIN_REMAINING,
-                       "Already-seen filter skipped: would leave too few candidates");
+                debug!(
+                    remaining,
+                    floor = EXCLUDE_SEEN_MIN_REMAINING,
+                    "Already-seen filter skipped: would leave too few candidates"
+                );
             }
         }
 
         // ── Charger les poids actifs (admin override > auto-tuner > defaults) ────
         let admin_weights = self.cache.admin_load_weights().await;
-        self.auto_tuner.maybe_update(&self.ctr_predictor, admin_weights.as_ref());
+        self.auto_tuner
+            .maybe_update(&self.ctr_predictor, admin_weights.as_ref());
         let active_weights = self.auto_tuner.active_weights(admin_weights.as_ref());
 
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
-        let scored = self.score_all(&deduped, &profile, &mode, &active_weights, &velocity_throttles);
+        let scored = self.score_all(
+            &deduped,
+            &profile,
+            &mode,
+            &active_weights,
+            &velocity_throttles,
+            &realtime_author_boosts,
+        );
         debug!(scored_count = scored.len(), "Scoring complete");
 
         // Show top 5 scores
-        let top_5: Vec<_> = scored.iter().take(5).map(|s| (&s.tweet_id, s.score)).collect();
+        let top_5: Vec<_> = scored
+            .iter()
+            .take(5)
+            .map(|s| (&s.tweet_id, s.score))
+            .collect();
         trace!("Top 5 scores: {:?}", top_5);
 
-        let tweet_map: HashMap<&str, &RawTweet> = deduped.iter().map(|t| (t.id.as_str(), t)).collect();
+        let tweet_map: HashMap<&str, &RawTweet> =
+            deduped.iter().map(|t| (t.id.as_str(), t)).collect();
 
         // Mise en forme du fil : plafonne les réponses et fait précéder chacune
         // du tweet auquel elle répond.
@@ -318,15 +428,21 @@ impl RecommenderService {
         // pages servies depuis Redis en héritent aussi.
         let all_ids = spread_by_author(all_ids, &tweet_map);
 
-        let pairs: Vec<(&RawTweet, &ScoredTweet)> = scored.iter()
+        let pairs: Vec<(&RawTweet, &ScoredTweet)> = scored
+            .iter()
             .filter_map(|s| tweet_map.get(s.tweet_id.as_str()).map(|t| (*t, s)))
             .collect();
 
         debug!("Computing feed quality metrics...");
         let metrics = compute_feed_metrics(&pairs);
-        debug!(diversity_score = metrics.diversity_score, freshness_score = metrics.freshness_score,
-               relevance_score = metrics.relevance_score, viral_potential = metrics.viral_potential,
-               novelty_score = metrics.novelty_score, "Feed metrics calculated");
+        debug!(
+            diversity_score = metrics.diversity_score,
+            freshness_score = metrics.freshness_score,
+            relevance_score = metrics.relevance_score,
+            viral_potential = metrics.viral_potential,
+            novelty_score = metrics.novelty_score,
+            "Feed metrics calculated"
+        );
 
         // Le lien de fil est figé ICI, tant qu'on a encore les tweets complets :
         // après la mise en cache il ne reste que des identifiants.
@@ -334,29 +450,36 @@ impl RecommenderService {
 
         let adaptive_ttl = adaptive_ttl(&profile, &mode);
         debug!(ttl_seconds = adaptive_ttl, "Setting cache TTL");
-        self.cache.set_recommendations_ttl(&req.user_id, mode_str, &all_entries, adaptive_ttl).await;
+        self.cache
+            .set_recommendations_ttl(&req.user_id, mode_str, &all_entries, adaptive_ttl)
+            .await;
 
         let total_available = self.count_available(&req.user_id).await.unwrap_or(1000);
         let page: Vec<FeedEntry> = all_entries.into_iter().skip(offset).take(limit).collect();
         let threads = thread_links(&page);
         let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
         let count = page_ids.len();
-        debug!(pagination_offset = offset, pagination_limit = limit, page_size = count, total_available, "Pagination applied");
+        debug!(
+            pagination_offset = offset,
+            pagination_limit = limit,
+            page_size = count,
+            total_available,
+            "Pagination applied"
+        );
 
         // ── Mémoriser les impressions servies pour l'entraînement CTR ────────────
         // Uniquement les tweets réellement renvoyés : ceux qui sortent de la
         // pagination n'ont jamais été exposés au lecteur, les compter en
         // négatif fabriquerait des rejets qui n'ont pas eu lieu.
-        self.record_impressions(&req.user_id, &page_ids, &scored).await;
+        self.record_impressions(&req.user_id, &page_ids, &scored)
+            .await;
         let experiment_assignments = if req.enable_experiments.unwrap_or(false) {
-            experiments::assign_variants(
-                &self.pg,
-                &req.user_id,
-                &page_ids,
-            ).await.unwrap_or_else(|error| {
-                warn!(error = ?error, "A/B assignment failed on recommendations");
-                Vec::new()
-            })
+            experiments::assign_variants(&self.pg, &req.user_id, &page_ids)
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(error = ?error, "A/B assignment failed on recommendations");
+                    Vec::new()
+                })
         } else {
             Vec::new()
         };
@@ -392,9 +515,13 @@ impl RecommenderService {
                     confidence: profile.profile_confidence,
                     personality: format!("{:?}", profile.personality_type),
                     engagement_velocity: profile.engagement_velocity,
-                    engagement_trend: if profile.engagement_trend > 1.2 { "increasing".into() }
-                        else if profile.engagement_trend < 0.8 { "decreasing".into() }
-                        else { "stable".into() },
+                    engagement_trend: if profile.engagement_trend > 1.2 {
+                        "increasing".into()
+                    } else if profile.engagement_trend < 0.8 {
+                        "decreasing".into()
+                    } else {
+                        "stable".into()
+                    },
                     network_influence: profile.network_influence,
                     most_active_hour: profile.most_active_hour,
                     churn_risk: profile.churn_risk,
@@ -423,6 +550,7 @@ impl RecommenderService {
         mode: &RecommendMode,
         weights: &crate::admin::AlgoWeights,
         velocity_throttles: &HashMap<String, f64>,
+        realtime_author_boosts: &HashMap<String, f64>,
     ) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
@@ -473,11 +601,25 @@ impl RecommenderService {
             }
 
             let ac = *author_count.get(&tweet.user_id).unwrap_or(&0);
+            // Boost temps réel (30 min, voir `services::feedback_loop`) : réagit
+            // à un like/skip de CETTE session, pas seulement au profil rechargé
+            // toutes les 300s ou au prochain TTL de cache de feed.
+            let realtime_boost = realtime_author_boosts
+                .get(&tweet.user_id)
+                .copied()
+                .unwrap_or(0.0);
             // Phase 2+3: score_tweet_ml_with_weights intègre poids actifs + CTR predictor + realtime boost
             let mut s = score_tweet_ml_with_weights(
-                tweet, profile, ac, &scored_feed,
-                if use_ml { Some(&self.ctr_predictor) } else { None },
-                0.0, // realtime_boost: 0.0 ici (appliqué via feedback_loop dans le handler)
+                tweet,
+                profile,
+                ac,
+                &scored_feed,
+                if use_ml {
+                    Some(&self.ctr_predictor)
+                } else {
+                    None
+                },
+                realtime_boost,
                 weights,
             );
             let base_score = s.score;
@@ -577,12 +719,21 @@ impl RecommenderService {
                    "Filtre d'admission par surface appliqué");
         }
 
-        debug!("Sorting {} scored tweets by final score...", scored_feed.len());
+        debug!(
+            "Sorting {} scored tweets by final score...",
+            scored_feed.len()
+        );
         scored_feed.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let top_scores: Vec<_> = scored_feed.iter().take(3).map(|s| (&s.tweet_id, s.score)).collect();
+        let top_scores: Vec<_> = scored_feed
+            .iter()
+            .take(3)
+            .map(|s| (&s.tweet_id, s.score))
+            .collect();
         debug!("Top 3 final scores: {:?}", top_scores);
 
         // Trending seul : réordonnancement aléatoire pondéré par score (Gumbel-max),
@@ -597,8 +748,15 @@ impl RecommenderService {
         // rapport avec « ce qui prend de l'ampleur en ce moment »).
         if *mode == RecommendMode::Trending {
             scored_feed = trending_draw(scored_feed);
-            let shuffled_top: Vec<_> = scored_feed.iter().take(3).map(|s| (&s.tweet_id, s.score)).collect();
-            debug!("Trending: two-temperature draw applied, new top 3: {:?}", shuffled_top);
+            let shuffled_top: Vec<_> = scored_feed
+                .iter()
+                .take(3)
+                .map(|s| (&s.tweet_id, s.score))
+                .collect();
+            debug!(
+                "Trending: two-temperature draw applied, new top 3: {:?}",
+                shuffled_top
+            );
         }
 
         // Phase 3: Contextual Bandit — réorganise le feed (80% exploit / 20% explore)
@@ -616,7 +774,9 @@ impl RecommenderService {
                 .into_iter()
                 .map(|s| (s.tweet_id.clone(), s))
                 .collect();
-            return selection.tweet_ids.into_iter()
+            return selection
+                .tweet_ids
+                .into_iter()
                 .filter_map(|id| id_to_scored.remove(&id))
                 .collect();
         }
@@ -664,9 +824,18 @@ impl RecommenderService {
         // détruit avant la fin du `join!`.
         let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&uid];
 
-        let (social_res, engagement_res, temporal_res, content_pref_res,
-             behavior_res, author_affinity_res, seen_ids_res,
-             retweeted_res, liked_text_res, second_degree_res) = join!(
+        let (
+            social_res,
+            engagement_res,
+            temporal_res,
+            content_pref_res,
+            behavior_res,
+            author_affinity_res,
+            seen_ids_res,
+            retweeted_res,
+            liked_text_res,
+            second_degree_res,
+        ) = join!(
             client.query(SQL_SOCIAL, &params),
             client.query(SQL_ENGAGEMENT, &params),
             client.query(SQL_TEMPORAL, &params),
@@ -688,25 +857,36 @@ impl RecommenderService {
                 let is_mutual: bool = row.try_get(1).unwrap_or(false);
                 if !fid.is_empty() {
                     profile.following_ids.push(fid.clone());
-                    if is_mutual { profile.mutual_follow_ids.push(fid); }
+                    if is_mutual {
+                        profile.mutual_follow_ids.push(fid);
+                    }
                 }
             }
-            trace!(following = profile.following_ids.len(), mutual = profile.mutual_follow_ids.len(), "Social graph loaded");
+            trace!(
+                following = profile.following_ids.len(),
+                mutual = profile.mutual_follow_ids.len(),
+                "Social graph loaded"
+            );
         }
 
         if let Ok(rows) = behavior_res {
             if let Some(row) = rows.first() {
-                let like_count: i64  = row.try_get(1).unwrap_or(0);
+                let like_count: i64 = row.try_get(1).unwrap_or(0);
                 let follower_count: i64 = row.try_get(3).unwrap_or(0);
                 let following_count: i64 = row.try_get(4).unwrap_or(0);
 
-                profile.follower_count  = follower_count;
+                profile.follower_count = follower_count;
                 profile.following_count = following_count;
-                profile.network_influence = ((follower_count as f64).ln().max(0.0) * 10.0).min(100.0);
+                profile.network_influence =
+                    ((follower_count as f64).ln().max(0.0) * 10.0).min(100.0);
 
-                profile.user_type = if like_count > 200 { UserType::PowerUser }
-                    else if like_count > 30 { UserType::Regular }
-                    else { UserType::Casual };
+                profile.user_type = if like_count > 200 {
+                    UserType::PowerUser
+                } else if like_count > 30 {
+                    UserType::Regular
+                } else {
+                    UserType::Casual
+                };
 
                 profile.profile_confidence = (0.3 + (like_count as f64 / 400.0).min(0.7)).min(1.0);
                 profile.churn_risk = 0.2;
@@ -716,86 +896,140 @@ impl RecommenderService {
 
         if let Ok(rows) = engagement_res {
             if let Some(row) = rows.first() {
-                let daily: i64  = row.try_get(0).unwrap_or(0);
+                let daily: i64 = row.try_get(0).unwrap_or(0);
                 let weekly: i64 = row.try_get(1).unwrap_or(0);
                 let weekly_per_day = weekly as f64 / 7.0;
                 profile.engagement_velocity = daily as f64;
-                profile.engagement_trend = if weekly_per_day > 0.0 { daily as f64 / weekly_per_day } else { 1.0 };
-                trace!(daily_engagement = daily, engagement_trend = profile.engagement_trend, "Engagement metrics loaded");
+                profile.engagement_trend = if weekly_per_day > 0.0 {
+                    daily as f64 / weekly_per_day
+                } else {
+                    1.0
+                };
+                trace!(
+                    daily_engagement = daily,
+                    engagement_trend = profile.engagement_trend,
+                    "Engagement metrics loaded"
+                );
             }
         }
 
         if let Ok(rows) = temporal_res {
             let mut hourly = [0.0_f64; 24];
-            let mut daily  = [0.0_f64; 7];
+            let mut daily = [0.0_f64; 7];
             for row in &rows {
                 let h: i32 = row.try_get(0).unwrap_or(0);
                 let d: i32 = row.try_get(1).unwrap_or(0);
                 let cnt: i64 = row.try_get(2).unwrap_or(0);
-                if (0..24).contains(&h) { hourly[h as usize] += cnt as f64; }
-                if (0..7).contains(&d)  { daily[d as usize]  += cnt as f64; }
+                if (0..24).contains(&h) {
+                    hourly[h as usize] += cnt as f64;
+                }
+                if (0..7).contains(&d) {
+                    daily[d as usize] += cnt as f64;
+                }
             }
-            let h_max = hourly.iter().cloned().fold(f64::NEG_INFINITY, f64::max).max(1.0);
-            let d_max = daily.iter().cloned().fold(f64::NEG_INFINITY, f64::max).max(1.0);
-            for i in 0..24 { profile.hourly_activity[i] = hourly[i] / h_max; }
-            for i in 0..7  { profile.daily_activity[i]  = daily[i]  / d_max; }
-            profile.most_active_hour = hourly.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(12) as u32;
-            trace!(most_active_hour = profile.most_active_hour, "Temporal activity patterns loaded");
+            let h_max = hourly
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max)
+                .max(1.0);
+            let d_max = daily
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max)
+                .max(1.0);
+            for i in 0..24 {
+                profile.hourly_activity[i] = hourly[i] / h_max;
+            }
+            for i in 0..7 {
+                profile.daily_activity[i] = daily[i] / d_max;
+            }
+            profile.most_active_hour = hourly
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(12) as u32;
+            trace!(
+                most_active_hour = profile.most_active_hour,
+                "Temporal activity patterns loaded"
+            );
         }
 
         if let Ok(rows) = content_pref_res {
             if let Some(row) = rows.first() {
-                let avg_len: f64     = row.try_get(0).unwrap_or(100.0);
+                let avg_len: f64 = row.try_get(0).unwrap_or(100.0);
                 let media_ratio: f64 = row.try_get(1).unwrap_or(0.3);
-                let avg_ht: f64      = row.try_get(2).unwrap_or(1.0);
+                let avg_ht: f64 = row.try_get(2).unwrap_or(1.0);
                 profile.avg_content_length = avg_len;
                 profile.prefers_media = media_ratio > 0.35;
                 profile.avg_hashtag_count = avg_ht;
-                profile.preferred_content_length = if avg_len < 80.0 { ContentLength::Short }
-                    else if avg_len > 200.0 { ContentLength::Long }
-                    else { ContentLength::Medium };
+                profile.preferred_content_length = if avg_len < 80.0 {
+                    ContentLength::Short
+                } else if avg_len > 200.0 {
+                    ContentLength::Long
+                } else {
+                    ContentLength::Medium
+                };
                 trace!(avg_content_length = avg_len, media_ratio, content_preference = ?profile.preferred_content_length, "Content preferences loaded");
             }
         }
 
         if let Ok(rows) = author_affinity_res {
-            let max_aff = rows.first()
+            let max_aff = rows
+                .first()
                 .and_then(|r| r.try_get::<_, f64>(1).ok())
-                .unwrap_or(1.0).max(1.0);
-            profile.top_authors = rows.iter()
+                .unwrap_or(1.0)
+                .max(1.0);
+            profile.top_authors = rows
+                .iter()
                 .filter_map(|r| {
                     let uid: String = r.try_get(0).ok()?;
-                    let aff: f64   = r.try_get(1).ok()?;
+                    let aff: f64 = r.try_get(1).ok()?;
                     Some((uid, aff / max_aff))
                 })
                 .collect();
-            trace!(top_authors_count = profile.top_authors.len(), "Top authors affinity loaded");
+            trace!(
+                top_authors_count = profile.top_authors.len(),
+                "Top authors affinity loaded"
+            );
         }
 
         if let Ok(rows) = seen_ids_res {
-            profile.liked_tweet_ids = rows.iter()
+            profile.liked_tweet_ids = rows
+                .iter()
                 .filter_map(|r| r.try_get::<_, String>(0).ok())
                 .collect();
-            trace!(liked_tweets_count = profile.liked_tweet_ids.len(), "Liked tweet history loaded");
+            trace!(
+                liked_tweets_count = profile.liked_tweet_ids.len(),
+                "Liked tweet history loaded"
+            );
         }
         profile.seen_tweet_ids = self.cache.get_seen_tweet_ids(user_id).await;
         profile.damped_authors = self.cache.get_damped_authors(user_id).await;
         if !profile.damped_authors.is_empty() {
-            debug!(user_id, authors = profile.damped_authors.len(), "Damped authors loaded");
+            debug!(
+                user_id,
+                authors = profile.damped_authors.len(),
+                "Damped authors loaded"
+            );
         }
 
         if let Ok(rows) = retweeted_res {
             // Sans ces ids, `profile_retweet_rate` valait 0/N = 0 dans D5 et le
             // bonus « prédiction de partage » ne se déclenchait jamais.
-            profile.retweeted_tweet_ids = rows.iter()
+            profile.retweeted_tweet_ids = rows
+                .iter()
                 .filter_map(|r| r.try_get::<_, String>(0).ok())
                 .collect();
-            trace!(retweeted = profile.retweeted_tweet_ids.len(), "Retweet history loaded");
+            trace!(
+                retweeted = profile.retweeted_tweet_ids.len(),
+                "Retweet history loaded"
+            );
         }
 
         if let Ok(rows) = liked_text_res {
-            let texts: Vec<String> = rows.iter()
+            let texts: Vec<String> = rows
+                .iter()
                 .filter_map(|r| r.try_get::<_, String>(0).ok())
                 .collect();
             let (words, personality, positivity) = profile_from_liked_text(&texts);
@@ -807,13 +1041,20 @@ impl RecommenderService {
         }
 
         if let Ok(rows) = second_degree_res {
-            profile.second_degree_ids = rows.iter()
+            profile.second_degree_ids = rows
+                .iter()
                 .filter_map(|r| r.try_get::<_, String>(0).ok())
                 .collect();
-            trace!(second_degree_count = profile.second_degree_ids.len(), "Second degree network loaded");
+            trace!(
+                second_degree_count = profile.second_degree_ids.len(),
+                "Second degree network loaded"
+            );
         }
 
-        debug!(profile_confidence = profile.profile_confidence, "User profile built and cached");
+        debug!(
+            profile_confidence = profile.profile_confidence,
+            "User profile built and cached"
+        );
         self.cache.set_profile(&cache_key, &profile).await;
         Ok(profile)
     }
@@ -851,12 +1092,13 @@ impl RecommenderService {
         // Les fenêtres trending / social / viral restent courtes : c'est ce qui
         // garde le haut du fil frais. Seule la découverte remonte loin, et son
         // poids (0.05) fait qu'elle apporte de la variété sans noyer l'actualité.
-        let (window_trending, window_social, window_discover, window_viral): (i32, i32, i32, i32) = match mode {
-            RecommendMode::Trending  => (6,  24, 24 * 7,  3),
-            RecommendMode::Feed      => (12, 72, 24 * 14, 6),
-            RecommendMode::Discover  => (24, 48, 24 * 30, 12),
-            RecommendMode::ForYou    => (72, 72, 24 * 30, 24),
-        };
+        let (window_trending, window_social, window_discover, window_viral): (i32, i32, i32, i32) =
+            match mode {
+                RecommendMode::Trending => (6, 24, 24 * 7, 3),
+                RecommendMode::Feed => (12, 72, 24 * 14, 6),
+                RecommendMode::Discover => (24, 48, 24 * 30, 12),
+                RecommendMode::ForYou => (72, 72, 24 * 30, 24),
+            };
         // Horizon global : aucune source ne remonte plus loin, le CTE `visible`
         // n'a donc pas à balayer toute la table.
         let horizon = window_trending
@@ -873,14 +1115,22 @@ impl RecommenderService {
         // concaténées dans le SQL : une liste vide donne `= ANY('{}')` qui vaut
         // simplement `false`, sans sentinelle bidon ni branche spéciale.
         let to_uuids = |ids: &[String]| -> Vec<uuid::Uuid> {
-            ids.iter().filter_map(|id| uuid::Uuid::parse_str(id).ok()).collect()
+            ids.iter()
+                .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+                .collect()
         };
         let uid = uuid::Uuid::parse_str(user_id)?;
         let following_uuids = to_uuids(&profile.following_ids);
         let top_author_uuids = to_uuids(
-            &profile.top_authors.iter().take(10).map(|(id, _)| id.clone()).collect::<Vec<_>>()
+            &profile
+                .top_authors
+                .iter()
+                .take(10)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
         );
-        let banned_uuids: Vec<uuid::Uuid> = banned_set.iter()
+        let banned_uuids: Vec<uuid::Uuid> = banned_set
+            .iter()
             .filter_map(|id| uuid::Uuid::parse_str(id).ok())
             .collect();
 
@@ -896,9 +1146,12 @@ impl RecommenderService {
         //
         // Les autres modes n'ont qu'une tentative : leurs fenêtres sont déjà
         // larges, et c'est Trending qui porte la page de découverte.
-        let mut attempts: Vec<(i32, i32, i32, i32)> = vec![
-            (window_trending, window_social, window_discover, window_viral),
-        ];
+        let mut attempts: Vec<(i32, i32, i32, i32)> = vec![(
+            window_trending,
+            window_social,
+            window_discover,
+            window_viral,
+        )];
         if *mode == RecommendMode::Trending {
             attempts.push((
                 window_trending * TRENDING_WIDEN_FACTOR,
@@ -911,49 +1164,62 @@ impl RecommenderService {
         let mut all = Vec::new();
         for (attempt, (wt, ws, wd, wv)) in attempts.into_iter().enumerate() {
             let attempt_horizon = wt.max(ws).max(wd).max(wv).max(horizon);
-            let rows = client.query(CANDIDATES_SQL.as_str(), &[
-                &uid,                 // $1
-                &following_uuids,     // $2
-                &top_author_uuids,    // $3
-                &banned_uuids,        // $4
-                &wt,                  // $5
-                &ws,                  // $6
-                &wd,                  // $7
-                &wv,                  // $8
-                &attempt_horizon,     // $9
-                &active_hour,         // $10
-                &MAX_CANDIDATES_PER_AUTHOR, // $11
-            ]).await?;
+            let rows = client
+                .query(
+                    CANDIDATES_SQL.as_str(),
+                    &[
+                        &uid,                       // $1
+                        &following_uuids,           // $2
+                        &top_author_uuids,          // $3
+                        &banned_uuids,              // $4
+                        &wt,                        // $5
+                        &ws,                        // $6
+                        &wd,                        // $7
+                        &wv,                        // $8
+                        &attempt_horizon,           // $9
+                        &active_hour,               // $10
+                        &MAX_CANDIDATES_PER_AUTHOR, // $11
+                    ],
+                )
+                .await?;
 
             all = map_rows(rows);
             if all.len() >= TRENDING_MIN_POOL {
                 break;
             }
-            debug!(attempt, candidates = all.len(), floor = TRENDING_MIN_POOL,
-                   "Candidate pool below floor");
+            debug!(
+                attempt,
+                candidates = all.len(),
+                floor = TRENDING_MIN_POOL,
+                "Candidate pool below floor"
+            );
         }
 
         let mut stats = SourceStats::default();
         for tweet in &all {
             match tweet.source {
-                TweetSource::Trending     => stats.trending += 1,
-                TweetSource::SocialGraph  => stats.social_graph += 1,
-                TweetSource::Viral        => stats.viral += 1,
-                TweetSource::Discovery    => stats.discovery += 1,
-                TweetSource::Temporal     => stats.temporal += 1,
-                TweetSource::Influencer   => stats.influencer += 1,
+                TweetSource::Trending => stats.trending += 1,
+                TweetSource::SocialGraph => stats.social_graph += 1,
+                TweetSource::Viral => stats.viral += 1,
+                TweetSource::Discovery => stats.discovery += 1,
+                TweetSource::Temporal => stats.temporal += 1,
+                TweetSource::Influencer => stats.influencer += 1,
                 TweetSource::Personalized => stats.personalized += 1,
-                TweetSource::Quality      => stats.quality += 1,
+                TweetSource::Quality => stats.quality += 1,
             }
         }
         stats.deduplicated_total = all.len();
 
         debug!(
             candidates = all.len(),
-            trending = stats.trending, social_graph = stats.social_graph,
-            viral = stats.viral, discovery = stats.discovery,
-            temporal = stats.temporal, influencer = stats.influencer,
-            personalized = stats.personalized, quality = stats.quality,
+            trending = stats.trending,
+            social_graph = stats.social_graph,
+            viral = stats.viral,
+            discovery = stats.discovery,
+            temporal = stats.temporal,
+            influencer = stats.influencer,
+            personalized = stats.personalized,
+            quality = stats.quality,
             "Candidates collected (single parameterized query, deduped in SQL)"
         );
 
@@ -980,7 +1246,8 @@ impl RecommenderService {
         banned_set: &std::collections::HashSet<String>,
     ) -> Result<usize> {
         let uid = uuid::Uuid::parse_str(user_id)?;
-        let banned_uuids: Vec<uuid::Uuid> = banned_set.iter()
+        let banned_uuids: Vec<uuid::Uuid> = banned_set
+            .iter()
             .filter_map(|id| uuid::Uuid::parse_str(id).ok())
             .collect();
 
@@ -988,11 +1255,12 @@ impl RecommenderService {
         let mut added = 0usize;
 
         for _ in 0..MAX_THREAD_DEPTH {
-            let missing: Vec<uuid::Uuid> = tweets.iter()
+            let missing: Vec<uuid::Uuid> = tweets
+                .iter()
                 .filter_map(|t| t.parent_tweet_id.as_deref())
                 .filter(|id| !known.contains(*id))
                 .filter_map(|id| uuid::Uuid::parse_str(id).ok())
-                .collect::<HashSet<_>>()   // un même parent peut manquer à plusieurs réponses
+                .collect::<HashSet<_>>() // un même parent peut manquer à plusieurs réponses
                 .into_iter()
                 .collect();
             if missing.is_empty() {
@@ -1000,7 +1268,9 @@ impl RecommenderService {
             }
 
             let client = self.pg.get().await?;
-            let rows = client.query(PARENTS_SQL.as_str(), &[&uid, &missing, &banned_uuids]).await?;
+            let rows = client
+                .query(PARENTS_SQL.as_str(), &[&uid, &missing, &banned_uuids])
+                .await?;
             let parents = map_rows(rows);
             if parents.is_empty() {
                 // Les parents restants sont invisibles pour ce lecteur.
@@ -1024,7 +1294,10 @@ impl RecommenderService {
         }
 
         if added > 0 {
-            debug!(parents_added = added, "Parents de fil remontés pour rendre les réponses lisibles");
+            debug!(
+                parents_added = added,
+                "Parents de fil remontés pour rendre les réponses lisibles"
+            );
         }
         Ok(added)
     }
@@ -1035,41 +1308,66 @@ impl RecommenderService {
         // Aligné sur les filtres de `visible` : compter des tweets privés ou de
         // comptes suspendus faussait `has_more`, qui promettait des pages
         // supplémentaires que la pagination ne pouvait pas servir.
-        let row = client.query_one(
-            "SELECT COUNT(*) FROM tweets t JOIN users u ON u.id = t.user_id \
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM tweets t JOIN users u ON u.id = t.user_id \
              WHERE t.deleted_at IS NULL AND t.moderation_status = 'approved' \
                AND t.is_private = false AND COALESCE(t.is_data_test, false) = false \
                AND u.is_active = true AND COALESCE(u.is_suspended, false) = false \
                AND t.user_id <> $1",
-            &[&uid]
-        ).await?;
+                &[&uid],
+            )
+            .await?;
         Ok(row.get(0))
     }
 
     fn build_empty_response(
-        &self, user_id: &str, tweet_ids: Vec<String>, count: usize,
-        mode: &str, latency_ms: u64, cache_hit: bool,
+        &self,
+        user_id: &str,
+        tweet_ids: Vec<String>,
+        count: usize,
+        mode: &str,
+        latency_ms: u64,
+        cache_hit: bool,
     ) -> RecommendResponse {
         RecommendResponse {
-            success: true, user_id: user_id.to_string(), tweet_ids, threads: Vec::new(), count,
+            success: true,
+            user_id: user_id.to_string(),
+            tweet_ids,
+            threads: Vec::new(),
+            count,
             algorithm: "NeuralRank Fusion",
             algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
-            mode: mode.to_string(), latency_ms, cache_hit,
+            mode: mode.to_string(),
+            latency_ms,
+            cache_hit,
             experiments: Vec::new(),
             metadata: RecommendMetadata {
                 candidates_collected: 0,
                 sources: SourceStats::default(),
                 user_profile: UserProfileSummary {
-                    user_type: "cached".into(), confidence: 1.0,
-                    personality: "cached".into(), engagement_velocity: 0.0,
-                    engagement_trend: "cached".into(), network_influence: 0.0,
-                    most_active_hour: 12, churn_risk: 0.0,
+                    user_type: "cached".into(),
+                    confidence: 1.0,
+                    personality: "cached".into(),
+                    engagement_velocity: 0.0,
+                    engagement_trend: "cached".into(),
+                    network_influence: 0.0,
+                    most_active_hour: 12,
+                    churn_risk: 0.0,
                 },
                 quality_metrics: QualityMetrics {
-                    diversity_score: 0.0, freshness_score: 0.0,
-                    relevance_score: 0.0, viral_potential: 0.0, novelty_score: 0.0,
+                    diversity_score: 0.0,
+                    freshness_score: 0.0,
+                    relevance_score: 0.0,
+                    viral_potential: 0.0,
+                    novelty_score: 0.0,
                 },
-                pagination: Pagination { limit: 50, offset: 0, has_more: false, total_available: 0 },
+                pagination: Pagination {
+                    limit: 50,
+                    offset: 0,
+                    has_more: false,
+                    total_available: 0,
+                },
             },
         }
     }
@@ -1477,99 +1775,115 @@ fn trending_draw(scored: Vec<ScoredTweet>) -> Vec<ScoredTweet> {
 }
 
 fn map_rows(rows: Vec<tokio_postgres::Row>) -> Vec<RawTweet> {
-    rows.into_iter().filter_map(|r| {
-        let id: String      = r.try_get(0).ok()?;
-        let user_id: String = r.try_get(1).ok()?;
-        let content: String = r.try_get(2).unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|r| {
+            let id: String = r.try_get(0).ok()?;
+            let user_id: String = r.try_get(1).ok()?;
+            let content: String = r.try_get(2).unwrap_or_default();
 
-        let content_lower = content.to_lowercase();
-        // Détection émoji couvrant les blocs Unicode réels (emoticons, symboles,
-        // dingbats, supplément). L'ancien seuil `> 0x1F000` manquait ❤ ✅ ⭐ … et
-        // comptait à tort des idéogrammes CJK situés plus haut.
-        let emoji_count = content.chars().filter(|c| {
-            let u = *c as u32;
-            (0x1F300..=0x1FAFF).contains(&u)  // emoticons + symbols & pictographs + supplemental
+            let content_lower = content.to_lowercase();
+            // Détection émoji couvrant les blocs Unicode réels (emoticons, symboles,
+            // dingbats, supplément). L'ancien seuil `> 0x1F000` manquait ❤ ✅ ⭐ … et
+            // comptait à tort des idéogrammes CJK situés plus haut.
+            let emoji_count = content
+                .chars()
+                .filter(|c| {
+                    let u = *c as u32;
+                    (0x1F300..=0x1FAFF).contains(&u)  // emoticons + symbols & pictographs + supplemental
                 || (0x2600..=0x27BF).contains(&u) // misc symbols + dingbats
                 || (0x1F000..=0x1F0FF).contains(&u) // mahjong, dominoes, cards
                 || (0xFE00..=0xFE0F).contains(&u)   // variation selectors (emoji style)
-                || u == 0x2B50 || u == 0x2764       // ⭐ ❤
-        }).count() as i32;
-        let exclamation_count = content.matches('!').count() as i32;
-        let question_count    = content.matches('?').count() as i32;
-        // Compter les vraies URLs (schémas) plutôt que toute occurrence de "http".
-        let url_count = (content_lower.matches("http://").count()
-            + content_lower.matches("https://").count()) as i32;
-        let words: Vec<String> = content_lower.split_whitespace()
-            .filter(|w| w.len() > 3)
-            .map(String::from)
-            .take(50)
-            .collect();
+                || u == 0x2B50 || u == 0x2764 // ⭐ ❤
+                })
+                .count() as i32;
+            let exclamation_count = content.matches('!').count() as i32;
+            let question_count = content.matches('?').count() as i32;
+            // Compter les vraies URLs (schémas) plutôt que toute occurrence de "http".
+            let url_count = (content_lower.matches("http://").count()
+                + content_lower.matches("https://").count()) as i32;
+            let words: Vec<String> = content_lower
+                .split_whitespace()
+                .filter(|w| w.len() > 3)
+                .map(String::from)
+                .take(50)
+                .collect();
 
-        Some(RawTweet {
-            id, user_id, content,
-            created_at:        r.try_get(3).ok()?,
-            view_count:        r.try_get(4).unwrap_or(0),
-            like_count:        r.try_get(5).unwrap_or(0),
-            comment_count:     r.try_get(6).unwrap_or(0),
-            retweet_count:     r.try_get(7).unwrap_or(0),
-            report_count:      r.try_get(8).unwrap_or(0),
-            has_media:         r.try_get(9).unwrap_or(false),
-            hashtag_count:     r.try_get(10).unwrap_or(0),
-            mention_count:     r.try_get(11).unwrap_or(0),
-            content_length:    r.try_get(12).unwrap_or(0),
-            author_followers:  r.try_get(13).unwrap_or(0),
-            author_following:  r.try_get(14).unwrap_or(0),
-            author_tweet_count: r.try_get(15).unwrap_or(0),
-            author_account_age_days: r.try_get(16).unwrap_or(0),
-            author_is_verified: r.try_get(17).unwrap_or(false),
-            author_is_premium:  r.try_get(18).unwrap_or(false),
-            author_tier: AuthorTier::resolve(
-                r.try_get::<_, &str>(38).unwrap_or("free"),
-                r.try_get(18).unwrap_or(false),
-            ),
-            author_visibility_multiplier: r.try_get::<_, f64>(19).unwrap_or(1.0),
-            moderation_status:  r.try_get(20).unwrap_or_else(|_| "approved".into()),
-            recommendation_group: r.try_get(21).ok().flatten(),
-            likes_1h:    r.try_get(22).unwrap_or(0),
-            likes_6h:    r.try_get(23).unwrap_or(0),
-            comments_1h: r.try_get(24).unwrap_or(0),
-            retweets_1h: r.try_get(25).unwrap_or(0),
-            viewer_impressions: r.try_get(26).unwrap_or(0),
-            // Aucune table `tweet_shares` / `tweet_bookmarks` n'existe dans ce
-            // schéma : ces compteurs restent structurellement nuls (les termes
-            // correspondants de D1 sont donc inertes, ce n'est pas une omission).
-            share_count: 0,
-            bookmark_count: 0,
-            emoji_count, exclamation_count, question_count, url_count, words,
-            source: match r.try_get::<_, i32>(27).unwrap_or(4) {
-                1 => TweetSource::Trending,
-                2 => TweetSource::SocialGraph,
-                3 => TweetSource::Viral,
-                5 => TweetSource::Temporal,
-                6 => TweetSource::Influencer,
-                7 => TweetSource::Personalized,
-                8 => TweetSource::Quality,
-                _ => TweetSource::Discovery,
-            },
-            source_weight: r.try_get::<_, f64>(28).unwrap_or(0.05),
-            parent_tweet_id:   r.try_get::<_, Option<String>>(29).ok().flatten(),
-            original_tweet_id: r.try_get::<_, Option<String>>(30).ok().flatten(),
-            is_retweet:        r.try_get(31).unwrap_or(false),
-            // Chargé depuis Redis/DB par le job de qualité ; Clean par défaut
-            author_shadowban_level: crate::shadowban::ShadowbanLevel::Clean,
-            // `theme` NULL ⇒ pas de ligne dans tweet_llm_labels ⇒ tweet non
-            // annoté. On laisse `None` plutôt que d'inventer des valeurs par
-            // défaut, pour que D9 puisse rester neutre en connaissance de cause.
-            llm: r.try_get::<_, Option<String>>(32).ok().flatten().map(|theme| LlmLabels {
-                theme,
-                toxicity_score:    r.try_get::<_, f64>(33).unwrap_or(0.0),
-                toxicity_category: r.try_get(34).unwrap_or_else(|_| "aucune".into()),
-                quality_score:     r.try_get::<_, f64>(35).unwrap_or(0.5),
-                tone:              r.try_get(36).unwrap_or_else(|_| "neutre".into()),
-                confidence:        r.try_get::<_, f64>(37).unwrap_or(0.5),
-            }),
+            Some(RawTweet {
+                id,
+                user_id,
+                content,
+                created_at: r.try_get(3).ok()?,
+                view_count: r.try_get(4).unwrap_or(0),
+                like_count: r.try_get(5).unwrap_or(0),
+                comment_count: r.try_get(6).unwrap_or(0),
+                retweet_count: r.try_get(7).unwrap_or(0),
+                report_count: r.try_get(8).unwrap_or(0),
+                has_media: r.try_get(9).unwrap_or(false),
+                hashtag_count: r.try_get(10).unwrap_or(0),
+                mention_count: r.try_get(11).unwrap_or(0),
+                content_length: r.try_get(12).unwrap_or(0),
+                author_followers: r.try_get(13).unwrap_or(0),
+                author_following: r.try_get(14).unwrap_or(0),
+                author_tweet_count: r.try_get(15).unwrap_or(0),
+                author_account_age_days: r.try_get(16).unwrap_or(0),
+                author_is_verified: r.try_get(17).unwrap_or(false),
+                author_is_premium: r.try_get(18).unwrap_or(false),
+                author_tier: AuthorTier::resolve(
+                    r.try_get::<_, &str>(38).unwrap_or("free"),
+                    r.try_get(18).unwrap_or(false),
+                ),
+                author_visibility_multiplier: r.try_get::<_, f64>(19).unwrap_or(1.0),
+                moderation_status: r.try_get(20).unwrap_or_else(|_| "approved".into()),
+                recommendation_group: r.try_get(21).ok().flatten(),
+                likes_1h: r.try_get(22).unwrap_or(0),
+                likes_6h: r.try_get(23).unwrap_or(0),
+                comments_1h: r.try_get(24).unwrap_or(0),
+                retweets_1h: r.try_get(25).unwrap_or(0),
+                viewer_impressions: r.try_get(26).unwrap_or(0),
+                // Aucune table `tweet_shares` / `tweet_bookmarks` n'existe dans ce
+                // schéma : ces compteurs restent structurellement nuls (les termes
+                // correspondants de D1 sont donc inertes, ce n'est pas une omission).
+                share_count: 0,
+                bookmark_count: 0,
+                emoji_count,
+                exclamation_count,
+                question_count,
+                url_count,
+                words,
+                source: match r.try_get::<_, i32>(27).unwrap_or(4) {
+                    1 => TweetSource::Trending,
+                    2 => TweetSource::SocialGraph,
+                    3 => TweetSource::Viral,
+                    5 => TweetSource::Temporal,
+                    6 => TweetSource::Influencer,
+                    7 => TweetSource::Personalized,
+                    8 => TweetSource::Quality,
+                    _ => TweetSource::Discovery,
+                },
+                source_weight: r.try_get::<_, f64>(28).unwrap_or(0.05),
+                parent_tweet_id: r.try_get::<_, Option<String>>(29).ok().flatten(),
+                original_tweet_id: r.try_get::<_, Option<String>>(30).ok().flatten(),
+                is_retweet: r.try_get(31).unwrap_or(false),
+                // Chargé depuis Redis/DB par le job de qualité ; Clean par défaut
+                author_shadowban_level: crate::shadowban::ShadowbanLevel::Clean,
+                // `theme` NULL ⇒ pas de ligne dans tweet_llm_labels ⇒ tweet non
+                // annoté. On laisse `None` plutôt que d'inventer des valeurs par
+                // défaut, pour que D9 puisse rester neutre en connaissance de cause.
+                llm: r
+                    .try_get::<_, Option<String>>(32)
+                    .ok()
+                    .flatten()
+                    .map(|theme| LlmLabels {
+                        theme,
+                        toxicity_score: r.try_get::<_, f64>(33).unwrap_or(0.0),
+                        toxicity_category: r.try_get(34).unwrap_or_else(|_| "aucune".into()),
+                        quality_score: r.try_get::<_, f64>(35).unwrap_or(0.5),
+                        tone: r.try_get(36).unwrap_or_else(|_| "neutre".into()),
+                        confidence: r.try_get::<_, f64>(37).unwrap_or(0.5),
+                    }),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// Part maximale de réponses dans le fil. Au-delà, le lecteur a l'impression de
@@ -1650,7 +1964,9 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
     let mut replies_dropped = 0usize;
 
     for s in scored {
-        let Some(t) = tweets.get(s.tweet_id.as_str()) else { continue };
+        let Some(t) = tweets.get(s.tweet_id.as_str()) else {
+            continue;
+        };
         if shown.contains(&s.tweet_id) {
             continue;
         }
@@ -1693,7 +2009,8 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
         // d'en ouvrir un second. On l'ajoute telle quelle, sans réémettre la
         // chaîne — c'est le cas d'un tweet et de sa réponse tous deux bien
         // classés, où le fil se lit naturellement de haut en bas.
-        let extends_last = chain.get(1)
+        let extends_last = chain
+            .get(1)
             .zip(out.last())
             .is_some_and(|(parent, previous)| parent.id == *previous);
         if extends_last {
@@ -1708,7 +2025,9 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
         // — et le client ne tracerait aucun trait de conversation entre les
         // deux. Le fil est déjà représenté, on passe.
         if chain.iter().skip(1).any(|a| shown.contains(&a.id)) {
-            if is_reply { replies_dropped += 1; }
+            if is_reply {
+                replies_dropped += 1;
+            }
             continue;
         }
 
@@ -1725,8 +2044,13 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
     }
 
     if replies_dropped > 0 || replies_kept > 0 {
-        debug!(replies_kept, replies_dropped, max_replies, total = out.len(),
-               "Mise en forme du fil : un fil = une entrée");
+        debug!(
+            replies_kept,
+            replies_dropped,
+            max_replies,
+            total = out.len(),
+            "Mise en forme du fil : un fil = une entrée"
+        );
     }
     out
 }
@@ -1774,7 +2098,8 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
         block.iter().filter_map(|id| author_of(id)).for_each(|a| {
             *need.entry(a).or_insert(0) += 1;
         });
-        need.iter().all(|(a, n)| window.get(*a).unwrap_or(&0) + n <= MAX_PER_AUTHOR_PER_PAGE)
+        need.iter()
+            .all(|(a, n)| window.get(*a).unwrap_or(&0) + n <= MAX_PER_AUTHOR_PER_PAGE)
     };
 
     while !pending.is_empty() {
@@ -1813,7 +2138,8 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
                         // Présence de l'auteur le PLUS installé du fil : c'est
                         // lui qui décide si le servir maintenant déséquilibre
                         // la fenêtre.
-                        let seen = block.iter()
+                        let seen = block
+                            .iter()
                             .filter_map(|id| author_of(id))
                             .map(|a| *window.get(a).unwrap_or(&0))
                             .max()
@@ -1856,7 +2182,10 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
 
     if deferrals > 0 || forced > 0 {
         debug!(
-            deferrals, forced, window = PAGE_WINDOW, max_per_author = MAX_PER_AUTHOR_PER_PAGE,
+            deferrals,
+            forced,
+            window = PAGE_WINDOW,
+            max_per_author = MAX_PER_AUTHOR_PER_PAGE,
             "Étalement par auteur appliqué"
         );
     }
@@ -1871,14 +2200,20 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
 /// l'écran montre — « le tweet juste au-dessus est celui auquel je réponds » —
 /// et pas la généalogie du tweet, que la base connaît déjà.
 fn as_feed_entries(ids: &[String], tweets: &HashMap<&str, &RawTweet>) -> Vec<FeedEntry> {
-    ids.iter().enumerate().map(|(i, id)| {
-        let parent_id = tweets
-            .get(id.as_str())
-            .and_then(|t| t.parent_tweet_id.as_deref())
-            .filter(|parent| i > 0 && ids[i - 1] == *parent)
-            .map(String::from);
-        FeedEntry { id: id.clone(), parent_id }
-    }).collect()
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let parent_id = tweets
+                .get(id.as_str())
+                .and_then(|t| t.parent_tweet_id.as_deref())
+                .filter(|parent| i > 0 && ids[i - 1] == *parent)
+                .map(String::from);
+            FeedEntry {
+                id: id.clone(),
+                parent_id,
+            }
+        })
+        .collect()
 }
 
 /// Traduit les entrées d'une PAGE en liens de conversation exposables.
@@ -1894,7 +2229,9 @@ fn thread_links(page: &[FeedEntry]) -> Vec<ThreadLink> {
     let mut links = Vec::new();
 
     for entry in page {
-        let Some(parent) = entry.parent_id.as_deref() else { continue };
+        let Some(parent) = entry.parent_id.as_deref() else {
+            continue;
+        };
         let root = root_of.get(parent).copied().unwrap_or(parent);
         let depth = depth_of.get(parent).copied().unwrap_or(0) + 1;
         root_of.insert(entry.id.as_str(), root);
@@ -1996,13 +2333,12 @@ fn deduplicate(mut tweets: Vec<RawTweet>) -> Vec<RawTweet> {
 /// « pour », « that »… qui apparaissent dans presque tous les tweets et ne
 /// discriminent donc rien.
 const STOPWORDS: &[&str] = &[
-    "avec", "pour", "dans", "cette", "cela", "sont", "mais", "vous", "nous", "elle",
-    "leur", "leurs", "être", "etre", "avoir", "fait", "faire", "plus", "moins", "tout",
-    "tous", "toute", "toutes", "comme", "quand", "aussi", "encore", "alors", "donc",
-    "chez", "sans", "sous", "très", "tres", "bien", "peut", "veut", "vais", "suis",
-    "j'ai", "c'est", "n'est", "qu'il", "qu'elle", "parce", "depuis", "entre",
-    "that", "this", "with", "from", "have", "will", "your", "they", "them", "their",
-    "what", "when", "which", "there", "here", "been", "were", "would", "could",
+    "avec", "pour", "dans", "cette", "cela", "sont", "mais", "vous", "nous", "elle", "leur",
+    "leurs", "être", "etre", "avoir", "fait", "faire", "plus", "moins", "tout", "tous", "toute",
+    "toutes", "comme", "quand", "aussi", "encore", "alors", "donc", "chez", "sans", "sous", "très",
+    "tres", "bien", "peut", "veut", "vais", "suis", "j'ai", "c'est", "n'est", "qu'il", "qu'elle",
+    "parce", "depuis", "entre", "that", "this", "with", "from", "have", "will", "your", "they",
+    "them", "their", "what", "when", "which", "there", "here", "been", "were", "would", "could",
     "should", "about", "just", "like", "really", "https", "http",
 ];
 
@@ -2022,30 +2358,43 @@ fn profile_from_liked_text(texts: &[String]) -> (Vec<(String, u32)>, Personality
     let (mut emoji, mut excl, mut quest, mut urls, mut long_form) = (0u32, 0u32, 0u32, 0u32, 0u32);
 
     for text in texts {
-        if text.chars().count() > 180 { long_form += 1; }
-        excl  += text.matches('!').count() as u32;
+        if text.chars().count() > 180 {
+            long_form += 1;
+        }
+        excl += text.matches('!').count() as u32;
         quest += text.matches('?').count() as u32;
         let lower = text.to_lowercase();
-        urls  += (lower.matches("http://").count() + lower.matches("https://").count()) as u32;
-        emoji += text.chars().filter(|c| {
-            let u = *c as u32;
-            (0x1F300..=0x1FAFF).contains(&u)
-                || (0x2600..=0x27BF).contains(&u)
-                || u == 0x2B50 || u == 0x2764
-        }).count() as u32;
+        urls += (lower.matches("http://").count() + lower.matches("https://").count()) as u32;
+        emoji += text
+            .chars()
+            .filter(|c| {
+                let u = *c as u32;
+                (0x1F300..=0x1FAFF).contains(&u)
+                    || (0x2600..=0x27BF).contains(&u)
+                    || u == 0x2B50
+                    || u == 0x2764
+            })
+            .count() as u32;
 
         for raw in lower.split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-') {
             let word = raw.trim_matches(|c: char| c == '\'' || c == '-');
             // On garde les mots d'au moins 4 caractères : en dessous, le signal
             // est dominé par les articles et les abréviations.
-            if word.chars().count() < 4 || word.chars().count() > 30 { continue; }
-            if word.chars().all(|c| c.is_numeric()) { continue; }
-            if STOPWORDS.contains(&word) { continue; }
+            if word.chars().count() < 4 || word.chars().count() > 30 {
+                continue;
+            }
+            if word.chars().all(|c| c.is_numeric()) {
+                continue;
+            }
+            if STOPWORDS.contains(&word) {
+                continue;
+            }
             *counts.entry(word.to_string()).or_insert(0) += 1;
         }
     }
 
-    let mut top_words: Vec<(String, u32)> = counts.into_iter()
+    let mut top_words: Vec<(String, u32)> = counts
+        .into_iter()
         // Un mot vu une seule fois sur l'ensemble de l'historique n'est pas un
         // centre d'intérêt, c'est du bruit.
         .filter(|(_, n)| *n >= 2)
@@ -2074,22 +2423,28 @@ fn profile_from_liked_text(texts: &[String]) -> (Vec<(String, u32)>, Personality
 
 fn mode_label(mode: &RecommendMode) -> &'static str {
     match mode {
-        RecommendMode::Feed     => "feed",
+        RecommendMode::Feed => "feed",
         RecommendMode::Discover => "discover",
         RecommendMode::Trending => "trending",
-        RecommendMode::ForYou   => "for_you",
+        RecommendMode::ForYou => "for_you",
     }
 }
 
 fn adaptive_ttl(profile: &UserProfile, mode: &RecommendMode) -> u64 {
     let mut ttl = match profile.user_type {
         UserType::PowerUser => 45_u64,
-        UserType::Regular   => 90_u64,
-        UserType::Casual    => 180_u64,
+        UserType::Regular => 90_u64,
+        UserType::Casual => 180_u64,
     };
-    if profile.engagement_trend > 1.5 { ttl = ttl.saturating_sub(20); }
-    if *mode == RecommendMode::Trending { ttl = ttl.min(60); }
-    if *mode == RecommendMode::Discover { ttl = ttl.min(120); }
+    if profile.engagement_trend > 1.5 {
+        ttl = ttl.saturating_sub(20);
+    }
+    if *mode == RecommendMode::Trending {
+        ttl = ttl.min(60);
+    }
+    if *mode == RecommendMode::Discover {
+        ttl = ttl.min(120);
+    }
     ttl.max(30)
 }
 
@@ -2112,13 +2467,18 @@ mod tests {
     }
 
     fn tweet_by(author: &str) -> RawTweet {
-        RawTweet { user_id: author.to_string(), ..Default::default() }
+        RawTweet {
+            user_id: author.to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn un_compte_neuf_beneficie_du_renfort_maximal() {
         let profile = profile_following("a", 0);
-        assert!((cold_start_follow_multiplier(&profile) - COLD_START_FOLLOW_BOOST_MAX).abs() < 1e-9);
+        assert!(
+            (cold_start_follow_multiplier(&profile) - COLD_START_FOLLOW_BOOST_MAX).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -2161,18 +2521,28 @@ mod tests {
     fn les_poids_de_dimensions_somment_a_un() {
         // Une somme differente de 1 fait deriver tous les scores et casse les
         // seuils calibres ailleurs (garbage, shadowban, bandit).
-        let total: f64 = crate::admin::models::AlgoWeights::default().as_array().iter().sum();
+        let total: f64 = crate::admin::models::AlgoWeights::default()
+            .as_array()
+            .iter()
+            .sum();
         assert!((total - 1.0).abs() < 1e-9, "somme des poids = {total}");
     }
 
     // ─── Mise en forme du fil ────────────────────────────────────────────────
 
     fn tweet(id: &str) -> RawTweet {
-        RawTweet { id: id.to_string(), ..Default::default() }
+        RawTweet {
+            id: id.to_string(),
+            ..Default::default()
+        }
     }
 
     fn by(id: &str, author: &str) -> RawTweet {
-        RawTweet { id: id.to_string(), user_id: author.to_string(), ..Default::default() }
+        RawTweet {
+            id: id.to_string(),
+            user_id: author.to_string(),
+            ..Default::default()
+        }
     }
 
     // ─── Étalement par auteur ────────────────────────────────────────────────
@@ -2194,8 +2564,10 @@ mod tests {
     /// 300ᵉ recommandation, et y garantir la variété coûterait l'ordre par
     /// score sur les pages que tout le monde lit.
     fn worst_window_concentration(out: &[String], raw: &[RawTweet], depth: usize) -> u32 {
-        let author_of: HashMap<&str, &str> =
-            raw.iter().map(|t| (t.id.as_str(), t.user_id.as_str())).collect();
+        let author_of: HashMap<&str, &str> = raw
+            .iter()
+            .map(|t| (t.id.as_str(), t.user_id.as_str()))
+            .collect();
         let head = &out[..depth.min(out.len())];
         head.windows(PAGE_WINDOW.min(head.len().max(1)))
             .map(|window| {
@@ -2223,7 +2595,10 @@ mod tests {
         // Les 3 premiers de « spammy » passent, les suivants sont repoussés
         // derrière les autres auteurs.
         assert_eq!(&out[..3], &texts(&["s0", "s1", "s2"])[..]);
-        assert_eq!(&out[3..9], &texts(&["o0", "o1", "o2", "o3", "o4", "o5"])[..]);
+        assert_eq!(
+            &out[3..9],
+            &texts(&["o0", "o1", "o2", "o3", "o4", "o5"])[..]
+        );
         assert_eq!(&out[9..], &texts(&["s3", "s4", "s5"])[..]);
     }
 
@@ -2234,7 +2609,10 @@ mod tests {
 
         let out = spread_by_author(ids.clone(), &index(&raw));
 
-        assert_eq!(out, ids, "sans dépassement de quota, l'ordre par score est conservé");
+        assert_eq!(
+            out, ids,
+            "sans dépassement de quota, l'ordre par score est conservé"
+        );
     }
 
     #[test]
@@ -2246,7 +2624,10 @@ mod tests {
 
         let out = spread_by_author(ids.clone(), &index(&raw));
 
-        assert_eq!(out, ids, "aucune perte, ordre conservé, faute d'alternative");
+        assert_eq!(
+            out, ids,
+            "aucune perte, ordre conservé, faute d'alternative"
+        );
     }
 
     /// Profondeur réellement servie qu'on protège : trois pages.
@@ -2273,7 +2654,10 @@ mod tests {
         let mut sorted_out = out.clone();
         sorted_in.sort();
         sorted_out.sort();
-        assert_eq!(sorted_in, sorted_out, "l'étalement réordonne, il ne filtre pas");
+        assert_eq!(
+            sorted_in, sorted_out,
+            "l'étalement réordonne, il ne filtre pas"
+        );
         assert_eq!(
             worst_window_concentration(&out, &raw, SERVED_DEPTH),
             MAX_PER_AUTHOR_PER_PAGE,
@@ -2323,8 +2707,12 @@ mod tests {
     fn assert_replies_follow_their_parent(out: &[String], raw: &[RawTweet]) {
         let by_id: HashMap<&str, &RawTweet> = raw.iter().map(|t| (t.id.as_str(), t)).collect();
         for (i, id) in out.iter().enumerate() {
-            let Some(parent) = by_id.get(id.as_str()).and_then(|t| t.parent_tweet_id.as_deref())
-            else { continue };
+            let Some(parent) = by_id
+                .get(id.as_str())
+                .and_then(|t| t.parent_tweet_id.as_deref())
+            else {
+                continue;
+            };
             assert_eq!(
                 out.get(i.wrapping_sub(1)).map(String::as_str),
                 Some(parent),
@@ -2342,7 +2730,9 @@ mod tests {
             tweet("autre"),
         ];
         let ids: Vec<String> = ["racine", "mid", "feuille", "autre"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let links = thread_links(&as_feed_entries(&ids, &index(&raw)));
 
@@ -2369,7 +2759,10 @@ mod tests {
         let ids: Vec<String> = ["rep", "autre"].iter().map(|s| s.to_string()).collect();
 
         let entries = as_feed_entries(&ids, &index(&raw));
-        assert_eq!(entries[0].parent_id, None, "aucun parent adjacent : {entries:?}");
+        assert_eq!(
+            entries[0].parent_id, None,
+            "aucun parent adjacent : {entries:?}"
+        );
         assert!(thread_links(&entries).is_empty());
     }
 
@@ -2424,8 +2817,10 @@ mod tests {
         let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         let out = shape(&scored_of(&refs), &raw);
 
-        assert!(!out.contains(&"rep".to_string()),
-                "reponse resservie loin de son parent : {out:?}");
+        assert!(
+            !out.contains(&"rep".to_string()),
+            "reponse resservie loin de son parent : {out:?}"
+        );
         assert_replies_follow_their_parent(&out, &raw);
     }
 
@@ -2457,7 +2852,10 @@ mod tests {
         let a = author_damping(1.0);
         let b = author_damping(2.0);
         let c = author_damping(3.0);
-        assert!(b < a && c < b, "chaque refus doit peser davantage : {a}, {b}, {c}");
+        assert!(
+            b < a && c < b,
+            "chaque refus doit peser davantage : {a}, {b}, {c}"
+        );
         for strikes in [5.0, 20.0, 1_000.0] {
             let d = author_damping(strikes);
             assert!(d > 0.0, "jamais zéro, sinon c'est un blocage : {d}");
@@ -2469,12 +2867,14 @@ mod tests {
 
     /// `n` tweets de score strictement décroissant, comme `score_all` les rend.
     fn ranked(n: usize) -> Vec<ScoredTweet> {
-        (0..n).map(|i| ScoredTweet {
-            tweet_id: format!("t{i:03}"),
-            score: 1.0 - (i as f64) * 0.001,
-            breakdown: Default::default(),
-            ctr_features: None,
-        }).collect()
+        (0..n)
+            .map(|i| ScoredTweet {
+                tweet_id: format!("t{i:03}"),
+                score: 1.0 - (i as f64) * 0.001,
+                breakdown: Default::default(),
+                ctr_features: None,
+            })
+            .collect()
     }
 
     #[test]
@@ -2485,9 +2885,17 @@ mod tests {
 
         let out = trending_draw(input);
 
-        assert_eq!(out.len(), 120, "le tirage doit rendre autant de tweets qu'il en reçoit");
-        let got: std::collections::HashSet<String> = out.iter().map(|s| s.tweet_id.clone()).collect();
-        assert_eq!(got, expected, "aucun tweet ne doit apparaître ni disparaître");
+        assert_eq!(
+            out.len(),
+            120,
+            "le tirage doit rendre autant de tweets qu'il en reçoit"
+        );
+        let got: std::collections::HashSet<String> =
+            out.iter().map(|s| s.tweet_id.clone()).collect();
+        assert_eq!(
+            got, expected,
+            "aucun tweet ne doit apparaître ni disparaître"
+        );
     }
 
     #[test]
@@ -2512,11 +2920,17 @@ mod tests {
         // page à chaque rafraîchissement. Le test échoue si CENT tirages
         // successifs rendent tous exactement la même ouverture.
         let reference: Vec<String> = trending_draw(ranked(200))
-            .into_iter().take(TRENDING_HOOK_SIZE).map(|s| s.tweet_id).collect();
+            .into_iter()
+            .take(TRENDING_HOOK_SIZE)
+            .map(|s| s.tweet_id)
+            .collect();
 
         let varied = (0..100).any(|_| {
             let draw: Vec<String> = trending_draw(ranked(200))
-                .into_iter().take(TRENDING_HOOK_SIZE).map(|s| s.tweet_id).collect();
+                .into_iter()
+                .take(TRENDING_HOOK_SIZE)
+                .map(|s| s.tweet_id)
+                .collect();
             draw != reference
         });
         assert!(varied, "l'ouverture doit changer d'un tirage à l'autre");
@@ -2531,12 +2945,15 @@ mod tests {
     }
 
     fn scored_of(ids: &[&str]) -> Vec<ScoredTweet> {
-        ids.iter().enumerate().map(|(i, id)| ScoredTweet {
-            tweet_id: id.to_string(),
-            score: 1.0 - (i as f64) * 0.01,
-            breakdown: Default::default(),
-            ctr_features: None,
-        }).collect()
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| ScoredTweet {
+                tweet_id: id.to_string(),
+                score: 1.0 - (i as f64) * 0.01,
+                breakdown: Default::default(),
+                ctr_features: None,
+            })
+            .collect()
     }
 
     fn shape(scored: &[ScoredTweet], raw: &[RawTweet]) -> Vec<String> {
@@ -2549,9 +2966,18 @@ mod tests {
         let raw = vec![tweet("racine"), reply("rep", "parent"), tweet("parent")];
         let out = shape(&scored_of(&["rep", "racine"]), &raw);
 
-        let i_parent = out.iter().position(|x| x == "parent").expect("parent remonte");
-        let i_rep = out.iter().position(|x| x == "rep").expect("reponse presente");
-        assert!(i_parent < i_rep, "le parent doit passer avant la reponse : {out:?}");
+        let i_parent = out
+            .iter()
+            .position(|x| x == "parent")
+            .expect("parent remonte");
+        let i_rep = out
+            .iter()
+            .position(|x| x == "rep")
+            .expect("reponse presente");
+        assert!(
+            i_parent < i_rep,
+            "le parent doit passer avant la reponse : {out:?}"
+        );
     }
 
     #[test]
@@ -2561,10 +2987,14 @@ mod tests {
         let raw = vec![tweet("racine"), reply("rep", "parent")];
         let out = shape(&scored_of(&["rep", "racine"]), &raw);
 
-        assert!(!out.contains(&"rep".to_string()),
-                "reponse orpheline servie : {out:?}");
-        assert!(!out.contains(&"parent".to_string()),
-                "un parent filtre ne doit jamais reapparaitre : {out:?}");
+        assert!(
+            !out.contains(&"rep".to_string()),
+            "reponse orpheline servie : {out:?}"
+        );
+        assert!(
+            !out.contains(&"parent".to_string()),
+            "un parent filtre ne doit jamais reapparaitre : {out:?}"
+        );
         assert_eq!(out, vec!["racine"]);
     }
 
@@ -2588,8 +3018,11 @@ mod tests {
         let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         let out = shape(&scored_of(&refs), &raw);
 
-        let pos = |id: &str| out.iter().position(|x| x == id)
-            .unwrap_or_else(|| panic!("{id} absent de {out:?}"));
+        let pos = |id: &str| {
+            out.iter()
+                .position(|x| x == id)
+                .unwrap_or_else(|| panic!("{id} absent de {out:?}"))
+        };
         assert!(pos("racine") < pos("mid"), "racine avant mid : {out:?}");
         assert!(pos("mid") < pos("feuille"), "mid avant feuille : {out:?}");
     }
@@ -2605,7 +3038,11 @@ mod tests {
 
         let deduped = deduplicate(vec![tweet("racine"), r1, r2]);
         let ids: Vec<&str> = deduped.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids.len(), 3, "racine + 2 reponses distinctes attendues : {ids:?}");
+        assert_eq!(
+            ids.len(),
+            3,
+            "racine + 2 reponses distinctes attendues : {ids:?}"
+        );
     }
 
     #[test]
@@ -2613,8 +3050,11 @@ mod tests {
         let raw = vec![tweet("parent"), reply("rep", "parent")];
         let out = shape(&scored_of(&["parent", "rep"]), &raw);
 
-        assert_eq!(out.iter().filter(|x| *x == "parent").count(), 1,
-                   "le parent ne doit apparaitre qu'une fois : {out:?}");
+        assert_eq!(
+            out.iter().filter(|x| *x == "parent").count(),
+            1,
+            "le parent ne doit apparaitre qu'une fois : {out:?}"
+        );
         assert_eq!(out, vec!["parent", "rep"]);
     }
 
@@ -2634,7 +3074,10 @@ mod tests {
         let out = shape(&scored_of(&refs), &raw);
 
         let n_replies = out.iter().filter(|id| id.starts_with('r')).count();
-        assert!(n_replies <= 2, "trop de reponses retenues : {n_replies} dans {out:?}");
+        assert!(
+            n_replies <= 2,
+            "trop de reponses retenues : {n_replies} dans {out:?}"
+        );
     }
 
     #[test]
@@ -2650,14 +3093,17 @@ mod tests {
         ];
         let out = shape(&scored_of(&["c", "orphelin", "d", "a", "b"]), &raw);
 
-        let pos: HashMap<&str, usize> = out.iter().enumerate()
-            .map(|(i, id)| (id.as_str(), i)).collect();
-        let by_id: HashMap<&str, &RawTweet> = raw.iter()
-            .map(|t| (t.id.as_str(), t)).collect();
+        let pos: HashMap<&str, usize> = out
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        let by_id: HashMap<&str, &RawTweet> = raw.iter().map(|t| (t.id.as_str(), t)).collect();
 
         for (id, i) in &pos {
             if let Some(parent) = by_id.get(id).and_then(|t| t.parent_tweet_id.as_deref()) {
-                let pp = pos.get(parent)
+                let pp = pos
+                    .get(parent)
                     .unwrap_or_else(|| panic!("parent {parent} absent pour {id} : {out:?}"));
                 assert!(pp < i, "parent {parent} apres son enfant {id} : {out:?}");
             }
@@ -2674,8 +3120,12 @@ mod tests {
             retweet("rt2", "origine"),
         ]);
 
-        assert_eq!(deduped.len(), 1, "un seul contenu attendu : {:?}",
-                   deduped.iter().map(|t| &t.id).collect::<Vec<_>>());
+        assert_eq!(
+            deduped.len(),
+            1,
+            "un seul contenu attendu : {:?}",
+            deduped.iter().map(|t| &t.id).collect::<Vec<_>>()
+        );
         // L'original doit être conservé plutôt qu'un de ses retweets.
         assert_eq!(deduped[0].id, "origine");
     }

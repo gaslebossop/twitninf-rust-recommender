@@ -74,7 +74,11 @@ impl CtrModel {
     /// Prédit la probabilité de CTR (sigmoid)
     pub fn predict(&self, features: &[f64; N_FEATURES]) -> f64 {
         let z: f64 = self.bias
-            + features.iter().zip(self.weights.iter()).map(|(f, w)| f * w).sum::<f64>();
+            + features
+                .iter()
+                .zip(self.weights.iter())
+                .map(|(f, w)| f * w)
+                .sum::<f64>();
         sigmoid(z)
     }
 
@@ -96,20 +100,30 @@ impl CtrModel {
         }
 
         self.samples_seen += 1;
-        if clicked { self.total_clicks += 1; }
+        if clicked {
+            self.total_clicks += 1;
+        }
         self.total_views += 1;
     }
 
     pub fn global_ctr(&self) -> f64 {
-        if self.total_views == 0 { return PRIOR_CTR; }
+        if self.total_views == 0 {
+            return PRIOR_CTR;
+        }
         self.total_clicks as f64 / self.total_views as f64
     }
 }
 
 /// Extrait le vecteur de features depuis les scores et métadonnées du tweet
 pub fn extract_features(
-    d1: f64, d2: f64, d3: f64, d4: f64,
-    d5: f64, d6: f64, d7: f64, d8: f64,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+    d4: f64,
+    d5: f64,
+    d6: f64,
+    d7: f64,
+    d8: f64,
     age_h: f64,
     is_trending: bool,
     has_media: bool,
@@ -117,12 +131,19 @@ pub fn extract_features(
     acceleration: f64,
 ) -> [f64; N_FEATURES] {
     [
-        d1, d2, d3, d4, d5, d6, d7, d8,
-        (age_h / 24.0).min(1.0),                              // âge normalisé [0,1]
+        d1,
+        d2,
+        d3,
+        d4,
+        d5,
+        d6,
+        d7,
+        d8,
+        (age_h / 24.0).min(1.0), // âge normalisé [0,1]
         if is_trending { 1.0 } else { 0.0 },
         if has_media { 1.0 } else { 0.0 },
-        (author_followers as f64 + 1.0).ln() / 20.0,          // log-followers normalisé
-        if age_h < 2.0 { 1.0 } else { 0.0 },                 // is_recent
+        (author_followers as f64 + 1.0).ln() / 20.0, // log-followers normalisé
+        if age_h < 2.0 { 1.0 } else { 0.0 },         // is_recent
         acceleration.clamp(0.0, 1.0),
     ]
 }
@@ -139,16 +160,17 @@ impl CtrPredictor {
     pub async fn load_or_default() -> Self {
         if Path::new(MODEL_PATH).exists() {
             match fs::read_to_string(MODEL_PATH).await {
-                Ok(json) => {
-                    match serde_json::from_str::<CtrModel>(&json) {
-                        Ok(model) => {
-                            info!(samples = model.samples_seen, global_ctr = model.global_ctr(),
-                                  "CTR model loaded from disk");
-                            return Self(Arc::new(RwLock::new(model)));
-                        }
-                        Err(e) => warn!("Failed to parse CTR model: {e}, using default"),
+                Ok(json) => match serde_json::from_str::<CtrModel>(&json) {
+                    Ok(model) => {
+                        info!(
+                            samples = model.samples_seen,
+                            global_ctr = model.global_ctr(),
+                            "CTR model loaded from disk"
+                        );
+                        return Self(Arc::new(RwLock::new(model)));
                     }
-                }
+                    Err(e) => warn!("Failed to parse CTR model: {e}, using default"),
+                },
                 Err(e) => warn!("Failed to read CTR model: {e}, using default"),
             }
         }
@@ -213,7 +235,9 @@ mod tests {
     #[test]
     fn test_predict_range() {
         let model = CtrModel::default();
-        let features = extract_features(0.8, 0.7, 0.6, 0.5, 0.5, 0.7, 0.6, 0.4, 1.0, true, true, 10000, 0.8);
+        let features = extract_features(
+            0.8, 0.7, 0.6, 0.5, 0.5, 0.7, 0.6, 0.4, 1.0, true, true, 10000, 0.8,
+        );
         let p = model.predict(&features);
         assert!(p >= 0.0 && p <= 1.0, "CTR prediction out of range: {p}");
     }
@@ -221,7 +245,9 @@ mod tests {
     #[test]
     fn test_learning_improves_high_engagement() {
         let mut model = CtrModel::default();
-        let high_eng = extract_features(0.9, 0.8, 0.7, 0.6, 0.6, 0.8, 0.7, 0.5, 0.5, true, true, 50000, 0.9);
+        let high_eng = extract_features(
+            0.9, 0.8, 0.7, 0.6, 0.6, 0.8, 0.7, 0.5, 0.5, true, true, 50000, 0.9,
+        );
         let initial_pred = model.predict(&high_eng);
 
         // Simulate 100 clicks on high-engagement tweets
@@ -229,13 +255,18 @@ mod tests {
             model.update(&high_eng, true);
         }
         let trained_pred = model.predict(&high_eng);
-        assert!(trained_pred > initial_pred, "Model should learn to predict high CTR");
+        assert!(
+            trained_pred > initial_pred,
+            "Model should learn to predict high CTR"
+        );
     }
 
     #[test]
     fn test_sgd_update_direction() {
         let mut model = CtrModel::default();
-        let features = extract_features(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 1000, 0.5);
+        let features = extract_features(
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 1000, 0.5,
+        );
         let before = model.predict(&features);
         model.update(&features, true); // clicked → should increase
         let after = model.predict(&features);

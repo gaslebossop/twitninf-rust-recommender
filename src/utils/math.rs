@@ -71,7 +71,11 @@ pub fn normalize(values: &[f64]) -> Vec<f64> {
         return Vec::new();
     }
 
-    let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max).max(1.0);
+    let max_val = values
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(1.0);
     values.iter().map(|v| v / max_val).collect()
 }
 

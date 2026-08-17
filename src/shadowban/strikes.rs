@@ -19,9 +19,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::models::{
-    strike_ttl, ShadowbanLevel, Strike, StrikePolicy, Surface, STRIKE_TTL_DAYS,
-};
+use super::models::{strike_ttl, ShadowbanLevel, Strike, StrikePolicy, Surface, STRIKE_TTL_DAYS};
 
 /// À partir de quelle fraction du seuil de bannissement on prévient le compte.
 const NEARING_BAN_RATIO: f64 = 0.75;
@@ -45,7 +43,10 @@ pub struct StrikeLedger {
 
 impl StrikeLedger {
     pub fn new(user_id: impl Into<String>) -> Self {
-        Self { user_id: user_id.into(), ..Default::default() }
+        Self {
+            user_id: user_id.into(),
+            ..Default::default()
+        }
     }
 
     /// Avertissements encore comptabilisés à l'instant `now`.
@@ -86,7 +87,8 @@ impl StrikeLedger {
 
     /// Niveau effectif appliqué au scoring.
     pub fn level(&self, now: DateTime<Utc>) -> ShadowbanLevel {
-        self.active_override(now).unwrap_or_else(|| self.computed_level(now))
+        self.active_override(now)
+            .unwrap_or_else(|| self.computed_level(now))
     }
 
     /// Vrai si un domaine a franchi son seuil de bannissement définitif.
@@ -152,7 +154,9 @@ impl StrikeLedger {
     /// moment.
     pub fn cache_ttl_secs(&self, now: DateTime<Utc>) -> u64 {
         match self.level_expires_at(now) {
-            Some(exp) => (exp - now).num_seconds().clamp(60, strike_ttl().num_seconds()) as u64,
+            Some(exp) => (exp - now)
+                .num_seconds()
+                .clamp(60, strike_ttl().num_seconds()) as u64,
             None => 3600,
         }
     }

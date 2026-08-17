@@ -12,25 +12,23 @@
 //! 5. **Ranking** → Sort by final score
 //! 6. **Response** → Paginated results with metadata
 
-pub mod admin;     // Noeud admin : bans, shadowbans, contrôle algo
-pub mod ads;       // Targeted advertising
+pub mod admin; // Noeud admin : bans, shadowbans, contrôle algo
+pub mod ads; // Targeted advertising
 pub mod algorithm;
-pub mod bandit;    // Phase 3: Contextual Bandit
+pub mod bandit; // Phase 3: Contextual Bandit
 pub mod constants;
-pub mod error;
 pub mod experiments;
 pub mod handlers;
-pub mod ml;        // Phase 2: ML CTR Predictor + User Weights + AutoTuner
-pub mod shadowban; // Suppression des comptes contenu poubelle
-pub mod velocity;  // Frein temporaire automatique (1h), distinct du shadowban
+pub mod middleware;
+pub mod ml; // Phase 2: ML CTR Predictor + User Weights + AutoTuner
 pub mod models;
 pub mod services;
+pub mod shadowban; // Suppression des comptes contenu poubelle
 pub mod utils;
-pub mod middleware;
+pub mod velocity; // Frein temporaire automatique (1h), distinct du shadowban
 
 // Re-export common types
-pub use error::{AppError, AppResult};
-pub use models::{RecommendRequest, RecommendResponse, RawTweet, UserProfile};
+pub use models::{RawTweet, RecommendRequest, RecommendResponse, UserProfile};
 
 // Feature flags for optional functionality
 

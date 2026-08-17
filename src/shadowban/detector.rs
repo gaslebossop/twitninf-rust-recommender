@@ -9,31 +9,31 @@ use super::models::{AccountQualityScore, GarbageSignals, ShadowbanLevel};
 
 // ─── Seuils de détection ──────────────────────────────────────────────────────
 
-const SPAM_HASHTAG_RATIO:       f64 = 0.30; // hashtags / nb mots
-const SPAM_HASHTAG_MIN:         i32 = 3;    // minimum absolu pour déclencher
-const MENTION_SPAM_THRESHOLD:   i32 = 5;
-const ZERO_ENG_MIN_VIEWS:       i64 = 200;
-const REPORT_RATE_THRESHOLD:    f64 = 0.03; // 3% des vues → report
-const LINK_SPAM_MAX_CHARS:      i32 = 50;
-const LINK_SPAM_MIN_URLS:       i32 = 2;
-const EMOJI_OVERLOAD_COUNT:     i32 = 8;
+const SPAM_HASHTAG_RATIO: f64 = 0.30; // hashtags / nb mots
+const SPAM_HASHTAG_MIN: i32 = 3; // minimum absolu pour déclencher
+const MENTION_SPAM_THRESHOLD: i32 = 5;
+const ZERO_ENG_MIN_VIEWS: i64 = 200;
+const REPORT_RATE_THRESHOLD: f64 = 0.03; // 3% des vues → report
+const LINK_SPAM_MAX_CHARS: i32 = 50;
+const LINK_SPAM_MIN_URLS: i32 = 2;
+const EMOJI_OVERLOAD_COUNT: i32 = 8;
 const EMOJI_OVERLOAD_MAX_CHARS: i32 = 100;
-const REPEAT_UNIQUE_RATIO:      f64 = 0.25; // < 25% mots uniques = texte répétitif
-const REPEAT_MIN_WORDS:         usize = 10; // pas de pénalité sur tweets très courts
+const REPEAT_UNIQUE_RATIO: f64 = 0.25; // < 25% mots uniques = texte répétitif
+const REPEAT_MIN_WORDS: usize = 10; // pas de pénalité sur tweets très courts
 
 // ─── Thresholds pour le niveau de shadowban du compte ────────────────────────
 
-const THRESHOLD_GHOSTED_GARBAGE_RATIO:  f64 = 0.70;
-const THRESHOLD_GHOSTED_REPORT_RATE:    f64 = 0.10;
-const THRESHOLD_GHOSTED_STRIKES:        u32 = 10;
+const THRESHOLD_GHOSTED_GARBAGE_RATIO: f64 = 0.70;
+const THRESHOLD_GHOSTED_REPORT_RATE: f64 = 0.10;
+const THRESHOLD_GHOSTED_STRIKES: u32 = 10;
 
 const THRESHOLD_SUPPRESSED_GARBAGE_RATIO: f64 = 0.50;
-const THRESHOLD_SUPPRESSED_REPORT_RATE:   f64 = 0.05;
-const THRESHOLD_SUPPRESSED_STRIKES:       u32 = 5;
+const THRESHOLD_SUPPRESSED_REPORT_RATE: f64 = 0.05;
+const THRESHOLD_SUPPRESSED_STRIKES: u32 = 5;
 
 const THRESHOLD_MONITORING_GARBAGE_RATIO: f64 = 0.25;
-const THRESHOLD_MONITORING_REPORT_RATE:   f64 = 0.02;
-const THRESHOLD_MONITORING_STRIKES:       u32 = 2;
+const THRESHOLD_MONITORING_REPORT_RATE: f64 = 0.02;
+const THRESHOLD_MONITORING_STRIKES: u32 = 2;
 
 // ─── GarbageContentDetector ──────────────────────────────────────────────────
 
@@ -41,7 +41,9 @@ const THRESHOLD_MONITORING_STRIKES:       u32 = 2;
 pub struct GarbageContentDetector;
 
 impl GarbageContentDetector {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Analyse un tweet individuel et retourne ses signaux de qualité.
     pub fn detect(&self, tweet: &RawTweet) -> GarbageSignals {
@@ -65,8 +67,8 @@ impl GarbageContentDetector {
         let high_report_rate = report_rate > REPORT_RATE_THRESHOLD;
 
         // Spam de liens purs : beaucoup d'URLs, très peu de texte original
-        let pure_link_spam = tweet.url_count >= LINK_SPAM_MIN_URLS
-            && tweet.content_length < LINK_SPAM_MAX_CHARS;
+        let pure_link_spam =
+            tweet.url_count >= LINK_SPAM_MIN_URLS && tweet.content_length < LINK_SPAM_MAX_CHARS;
 
         // Surcharge d'émojis sans contenu textuel
         let emoji_overload = tweet.emoji_count > EMOJI_OVERLOAD_COUNT
@@ -147,25 +149,29 @@ impl GarbageContentDetector {
         let total = recent_tweets.len() as f64;
 
         // Ratio de posts poubelle
-        let garbage_count = recent_tweets.iter()
+        let garbage_count = recent_tweets
+            .iter()
             .filter(|t| self.detect(t).is_garbage())
             .count();
         let garbage_ratio = garbage_count as f64 / total;
 
         // Taux moyen de signalements
-        let avg_report_rate = recent_tweets.iter()
+        let avg_report_rate = recent_tweets
+            .iter()
             .map(|t| t.report_count as f64 / t.view_count.max(100) as f64)
             .sum::<f64>()
             / total;
 
         // Strikes consécutifs (les plus récents d'abord)
-        let spam_strikes = recent_tweets.iter()
+        let spam_strikes = recent_tweets
+            .iter()
             .rev()
             .take_while(|t| self.detect(t).is_garbage())
             .count() as u32;
 
         // Déficit d'engagement : avg (likes+comments+retweets)/vues vs baseline 2%
-        let avg_eng_rate = recent_tweets.iter()
+        let avg_eng_rate = recent_tweets
+            .iter()
             .map(|t| {
                 let eng = (t.like_count + t.comment_count + t.retweet_count) as f64;
                 eng / t.view_count.max(1) as f64
@@ -175,12 +181,12 @@ impl GarbageContentDetector {
         let engagement_deficit = avg_eng_rate - 0.02; // baseline plateforme 2%
 
         let mut updated = existing.clone();
-        updated.garbage_ratio_7d   = garbage_ratio;
+        updated.garbage_ratio_7d = garbage_ratio;
         updated.avg_report_rate_7d = avg_report_rate;
-        updated.spam_strikes       = spam_strikes;
+        updated.spam_strikes = spam_strikes;
         updated.engagement_deficit = engagement_deficit;
-        updated.level              = Self::compute_level(&updated);
-        updated.computed_at        = Utc::now();
+        updated.level = Self::compute_level(&updated);
+        updated.computed_at = Utc::now();
 
         debug!(
             user_id = %updated.user_id,
@@ -196,5 +202,7 @@ impl GarbageContentDetector {
 }
 
 impl Default for GarbageContentDetector {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

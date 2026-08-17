@@ -29,8 +29,8 @@ pub enum Surface {
 impl Surface {
     pub fn from_mode(mode: &RecommendMode) -> Self {
         match mode {
-            RecommendMode::Feed     => Surface::FollowerFeed,
-            RecommendMode::ForYou   => Surface::ForYou,
+            RecommendMode::Feed => Surface::FollowerFeed,
+            RecommendMode::ForYou => Surface::ForYou,
             RecommendMode::Discover => Surface::Discover,
             RecommendMode::Trending => Surface::Trending,
         }
@@ -45,9 +45,9 @@ impl Surface {
     pub fn label(self) -> &'static str {
         match self {
             Surface::FollowerFeed => "follower_feed",
-            Surface::ForYou       => "for_you",
-            Surface::Discover     => "discover",
-            Surface::Trending     => "trending",
+            Surface::ForYou => "for_you",
+            Surface::Discover => "discover",
+            Surface::Trending => "trending",
         }
     }
 }
@@ -70,10 +70,10 @@ impl Surface {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ShadowbanLevel {
     #[default]
-    Clean,       // Visibilité normale — aucune suppression
-    Monitoring,  // Rétrogradation légère (-15%) — aucune surface fermée
-    Suppressed,  // Rétrogradation forte (-55%) + exclu de Trending & Discover
-    Ghosted,     // Exclu de toute recommandation — reste visible des abonnés
+    Clean, // Visibilité normale — aucune suppression
+    Monitoring, // Rétrogradation légère (-15%) — aucune surface fermée
+    Suppressed, // Rétrogradation forte (-55%) + exclu de Trending & Discover
+    Ghosted,    // Exclu de toute recommandation — reste visible des abonnés
 }
 
 impl ShadowbanLevel {
@@ -84,10 +84,10 @@ impl ShadowbanLevel {
     /// fermée l'est en dur.
     pub fn score_multiplier(self) -> f64 {
         match self {
-            ShadowbanLevel::Clean      => 1.00,
+            ShadowbanLevel::Clean => 1.00,
             ShadowbanLevel::Monitoring => 0.85,
             ShadowbanLevel::Suppressed => 0.45,
-            ShadowbanLevel::Ghosted    => 0.05,
+            ShadowbanLevel::Ghosted => 0.05,
         }
     }
 
@@ -107,24 +107,28 @@ impl ShadowbanLevel {
         }
     }
 
-    pub fn excludes_discovery(self) -> bool { self.restricts(Surface::Discover) }
-    pub fn excludes_trending(self) -> bool { self.restricts(Surface::Trending) }
+    pub fn excludes_discovery(self) -> bool {
+        self.restricts(Surface::Discover)
+    }
+    pub fn excludes_trending(self) -> bool {
+        self.restricts(Surface::Trending)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
-            ShadowbanLevel::Clean      => "clean",
+            ShadowbanLevel::Clean => "clean",
             ShadowbanLevel::Monitoring => "monitoring",
             ShadowbanLevel::Suppressed => "suppressed",
-            ShadowbanLevel::Ghosted    => "ghosted",
+            ShadowbanLevel::Ghosted => "ghosted",
         }
     }
 
     pub fn from_label(s: &str) -> Option<Self> {
         match s {
-            "clean"      => Some(ShadowbanLevel::Clean),
+            "clean" => Some(ShadowbanLevel::Clean),
             "monitoring" => Some(ShadowbanLevel::Monitoring),
             "suppressed" => Some(ShadowbanLevel::Suppressed),
-            "ghosted"    => Some(ShadowbanLevel::Ghosted),
+            "ghosted" => Some(ShadowbanLevel::Ghosted),
             _ => None,
         }
     }
@@ -133,17 +137,21 @@ impl ShadowbanLevel {
     /// lire son état : c'est le seul moyen de le corriger.
     pub fn creator_summary(self) -> &'static str {
         match self {
-            ShadowbanLevel::Clean =>
-                "Ton compte est en règle. Tes posts sont distribués normalement.",
-            ShadowbanLevel::Monitoring =>
+            ShadowbanLevel::Clean => {
+                "Ton compte est en règle. Tes posts sont distribués normalement."
+            }
+            ShadowbanLevel::Monitoring => {
                 "Un avertissement est actif sur ton compte. Tes posts sont encore \
-                 recommandés, mais un peu moins mis en avant.",
-            ShadowbanLevel::Suppressed =>
+                 recommandés, mais un peu moins mis en avant."
+            }
+            ShadowbanLevel::Suppressed => {
                 "Ton compte est temporairement retiré des Tendances et de la \
-                 Découverte. Tes abonnés voient toujours tout ce que tu publies.",
-            ShadowbanLevel::Ghosted =>
+                 Découverte. Tes abonnés voient toujours tout ce que tu publies."
+            }
+            ShadowbanLevel::Ghosted => {
                 "Ton compte n'est temporairement plus recommandé. Tes posts \
-                 restent en ligne et visibles par tes abonnés et sur ton profil.",
+                 restent en ligne et visibles par tes abonnés et sur ton profil."
+            }
         }
     }
 }
@@ -160,7 +168,9 @@ impl ShadowbanLevel {
 /// comptes morts.
 pub const STRIKE_TTL_DAYS: i64 = 90;
 
-pub fn strike_ttl() -> Duration { Duration::days(STRIKE_TTL_DAYS) }
+pub fn strike_ttl() -> Duration {
+    Duration::days(STRIKE_TTL_DAYS)
+}
 
 /// Domaine de règle enfreint. Le seuil de sanction dépend du domaine.
 ///
@@ -204,27 +214,27 @@ pub struct StrikeThresholds {
 impl StrikePolicy {
     pub fn label(self) -> &'static str {
         match self {
-            StrikePolicy::Spam           => "spam",
+            StrikePolicy::Spam => "spam",
             StrikePolicy::EngagementBait => "engagement_bait",
-            StrikePolicy::Unoriginal     => "unoriginal",
+            StrikePolicy::Unoriginal => "unoriginal",
             StrikePolicy::Misinformation => "misinformation",
-            StrikePolicy::Harassment     => "harassment",
-            StrikePolicy::AdultContent   => "adult_content",
+            StrikePolicy::Harassment => "harassment",
+            StrikePolicy::AdultContent => "adult_content",
             StrikePolicy::HatefulConduct => "hateful_conduct",
-            StrikePolicy::ViolentThreat  => "violent_threat",
+            StrikePolicy::ViolentThreat => "violent_threat",
         }
     }
 
     pub fn from_label(s: &str) -> Option<Self> {
         Some(match s {
-            "spam"            => StrikePolicy::Spam,
+            "spam" => StrikePolicy::Spam,
             "engagement_bait" => StrikePolicy::EngagementBait,
-            "unoriginal"      => StrikePolicy::Unoriginal,
-            "misinformation"  => StrikePolicy::Misinformation,
-            "harassment"      => StrikePolicy::Harassment,
-            "adult_content"   => StrikePolicy::AdultContent,
+            "unoriginal" => StrikePolicy::Unoriginal,
+            "misinformation" => StrikePolicy::Misinformation,
+            "harassment" => StrikePolicy::Harassment,
+            "adult_content" => StrikePolicy::AdultContent,
             "hateful_conduct" => StrikePolicy::HatefulConduct,
-            "violent_threat"  => StrikePolicy::ViolentThreat,
+            "violent_threat" => StrikePolicy::ViolentThreat,
             _ => return None,
         })
     }
@@ -232,14 +242,14 @@ impl StrikePolicy {
     /// Formulation destinée au créateur — pas le nom technique du domaine.
     pub fn creator_reason(self) -> &'static str {
         match self {
-            StrikePolicy::Spam           => "Publication répétitive ou automatisée",
+            StrikePolicy::Spam => "Publication répétitive ou automatisée",
             StrikePolicy::EngagementBait => "Incitation artificielle à l'engagement",
-            StrikePolicy::Unoriginal     => "Contenu repris sans apport",
+            StrikePolicy::Unoriginal => "Contenu repris sans apport",
             StrikePolicy::Misinformation => "Information trompeuse",
-            StrikePolicy::Harassment     => "Harcèlement ou insultes ciblées",
-            StrikePolicy::AdultContent   => "Contenu à caractère sexuel",
+            StrikePolicy::Harassment => "Harcèlement ou insultes ciblées",
+            StrikePolicy::AdultContent => "Contenu à caractère sexuel",
             StrikePolicy::HatefulConduct => "Propos haineux",
-            StrikePolicy::ViolentThreat  => "Menace ou apologie de violence",
+            StrikePolicy::ViolentThreat => "Menace ou apologie de violence",
         }
     }
 
@@ -253,31 +263,55 @@ impl StrikePolicy {
         match self {
             // Faible nuisance : large marge avant la moindre fermeture de surface.
             StrikePolicy::Spam => StrikeThresholds {
-                monitoring: 2, suppressed: 4, ghosted: 7, permanent: 12,
+                monitoring: 2,
+                suppressed: 4,
+                ghosted: 7,
+                permanent: 12,
             },
             StrikePolicy::EngagementBait => StrikeThresholds {
-                monitoring: 2, suppressed: 4, ghosted: 7, permanent: 12,
+                monitoring: 2,
+                suppressed: 4,
+                ghosted: 7,
+                permanent: 12,
             },
             StrikePolicy::Unoriginal => StrikeThresholds {
-                monitoring: 3, suppressed: 6, ghosted: 10, permanent: 16,
+                monitoring: 3,
+                suppressed: 6,
+                ghosted: 10,
+                permanent: 16,
             },
             // Nuisance moyenne.
             StrikePolicy::Misinformation => StrikeThresholds {
-                monitoring: 1, suppressed: 3, ghosted: 5, permanent: 8,
+                monitoring: 1,
+                suppressed: 3,
+                ghosted: 5,
+                permanent: 8,
             },
             StrikePolicy::AdultContent => StrikeThresholds {
-                monitoring: 1, suppressed: 3, ghosted: 5, permanent: 8,
+                monitoring: 1,
+                suppressed: 3,
+                ghosted: 5,
+                permanent: 8,
             },
             // Nuisance forte : visant une personne ou un groupe.
             StrikePolicy::Harassment => StrikeThresholds {
-                monitoring: 1, suppressed: 2, ghosted: 4, permanent: 6,
+                monitoring: 1,
+                suppressed: 2,
+                ghosted: 4,
+                permanent: 6,
             },
             StrikePolicy::HatefulConduct => StrikeThresholds {
-                monitoring: 1, suppressed: 2, ghosted: 3, permanent: 4,
+                monitoring: 1,
+                suppressed: 2,
+                ghosted: 3,
+                permanent: 4,
             },
             // Nuisance immédiate : plus aucune recommandation dès le premier fait.
             StrikePolicy::ViolentThreat => StrikeThresholds {
-                monitoring: 1, suppressed: 1, ghosted: 1, permanent: 2,
+                monitoring: 1,
+                suppressed: 1,
+                ghosted: 1,
+                permanent: 2,
             },
         }
     }
@@ -323,8 +357,12 @@ pub struct Strike {
 }
 
 impl Strike {
-    pub fn expires_at(&self) -> DateTime<Utc> { self.issued_at + strike_ttl() }
-    pub fn is_active(&self, now: DateTime<Utc>) -> bool { self.expires_at() > now }
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        self.issued_at + strike_ttl()
+    }
+    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at() > now
+    }
 }
 
 // ─── Inéligibilité au niveau du contenu ──────────────────────────────────────
@@ -358,13 +396,13 @@ pub enum IneligibilityReason {
 impl IneligibilityReason {
     pub fn label(self) -> &'static str {
         match self {
-            IneligibilityReason::SpamSignals    => "spam_signals",
-            IneligibilityReason::Unoriginal     => "unoriginal",
-            IneligibilityReason::LinkSpam       => "link_spam",
+            IneligibilityReason::SpamSignals => "spam_signals",
+            IneligibilityReason::Unoriginal => "unoriginal",
+            IneligibilityReason::LinkSpam => "link_spam",
             IneligibilityReason::EngagementBait => "engagement_bait",
-            IneligibilityReason::UnderReview    => "under_review",
-            IneligibilityReason::Toxic          => "toxic",
-            IneligibilityReason::LowQuality     => "low_quality",
+            IneligibilityReason::UnderReview => "under_review",
+            IneligibilityReason::Toxic => "toxic",
+            IneligibilityReason::LowQuality => "low_quality",
         }
     }
 
@@ -373,25 +411,27 @@ impl IneligibilityReason {
     /// modération : rien n'est encore établi).
     pub fn policy(self) -> Option<StrikePolicy> {
         match self {
-            IneligibilityReason::SpamSignals    => Some(StrikePolicy::Spam),
-            IneligibilityReason::LinkSpam       => Some(StrikePolicy::Spam),
-            IneligibilityReason::Unoriginal     => Some(StrikePolicy::Unoriginal),
+            IneligibilityReason::SpamSignals => Some(StrikePolicy::Spam),
+            IneligibilityReason::LinkSpam => Some(StrikePolicy::Spam),
+            IneligibilityReason::Unoriginal => Some(StrikePolicy::Unoriginal),
             IneligibilityReason::EngagementBait => Some(StrikePolicy::EngagementBait),
-            IneligibilityReason::Toxic          => Some(StrikePolicy::Harassment),
-            IneligibilityReason::UnderReview    => None,
-            IneligibilityReason::LowQuality     => None,
+            IneligibilityReason::Toxic => Some(StrikePolicy::Harassment),
+            IneligibilityReason::UnderReview => None,
+            IneligibilityReason::LowQuality => None,
         }
     }
 
     pub fn creator_reason(self) -> &'static str {
         match self {
-            IneligibilityReason::SpamSignals    => "Ce post présente des signaux de spam",
-            IneligibilityReason::Unoriginal     => "Ce post reprend un contenu sans apport",
-            IneligibilityReason::LinkSpam       => "Ce post ne contient presque que des liens",
-            IneligibilityReason::EngagementBait => "Ce post cherche à capter l'engagement artificiellement",
-            IneligibilityReason::UnderReview    => "Ce post est en cours de vérification",
-            IneligibilityReason::Toxic          => "Ce post a été jugé agressif",
-            IneligibilityReason::LowQuality     => "Ce post n'a pas atteint le seuil de qualité",
+            IneligibilityReason::SpamSignals => "Ce post présente des signaux de spam",
+            IneligibilityReason::Unoriginal => "Ce post reprend un contenu sans apport",
+            IneligibilityReason::LinkSpam => "Ce post ne contient presque que des liens",
+            IneligibilityReason::EngagementBait => {
+                "Ce post cherche à capter l'engagement artificiellement"
+            }
+            IneligibilityReason::UnderReview => "Ce post est en cours de vérification",
+            IneligibilityReason::Toxic => "Ce post a été jugé agressif",
+            IneligibilityReason::LowQuality => "Ce post n'a pas atteint le seuil de qualité",
         }
     }
 }
@@ -407,7 +447,9 @@ pub enum ContentEligibility {
 }
 
 impl ContentEligibility {
-    pub fn is_eligible(self) -> bool { matches!(self, ContentEligibility::Eligible) }
+    pub fn is_eligible(self) -> bool {
+        matches!(self, ContentEligibility::Eligible)
+    }
     pub fn reason(self) -> Option<IneligibilityReason> {
         match self {
             ContentEligibility::Eligible => None,
@@ -421,30 +463,46 @@ impl ContentEligibility {
 /// Signaux extraits d'un tweet individuel.
 #[derive(Debug, Clone, Default)]
 pub struct GarbageSignals {
-    pub spam_hashtag_density: bool,  // hashtags > 30% des mots
-    pub spam_mentions: bool,         // > 5 @mentions
-    pub zero_engagement: bool,       // > 200 vues, zéro réaction
-    pub high_report_rate: bool,      // rapport/vues > 3%
-    pub pure_link_spam: bool,        // ≥ 2 URLs + texte < 50 chars
-    pub emoji_overload: bool,        // > 8 émojis + texte < 100 chars
-    pub repeat_content: bool,        // < 25% de mots uniques (texte dupliqué)
+    pub spam_hashtag_density: bool, // hashtags > 30% des mots
+    pub spam_mentions: bool,        // > 5 @mentions
+    pub zero_engagement: bool,      // > 200 vues, zéro réaction
+    pub high_report_rate: bool,     // rapport/vues > 3%
+    pub pure_link_spam: bool,       // ≥ 2 URLs + texte < 50 chars
+    pub emoji_overload: bool,       // > 8 émojis + texte < 100 chars
+    pub repeat_content: bool,       // < 25% de mots uniques (texte dupliqué)
 }
 
 impl GarbageSignals {
     /// Score de poubelle 0–1 pondéré par la gravité du signal.
     pub fn score(&self) -> f64 {
         let mut s = 0.0_f64;
-        if self.high_report_rate     { s += 0.35; } // signal le plus fort
-        if self.zero_engagement      { s += 0.25; }
-        if self.pure_link_spam       { s += 0.15; }
-        if self.spam_hashtag_density { s += 0.12; }
-        if self.repeat_content       { s += 0.10; }
-        if self.spam_mentions        { s += 0.08; }
-        if self.emoji_overload       { s += 0.05; }
+        if self.high_report_rate {
+            s += 0.35;
+        } // signal le plus fort
+        if self.zero_engagement {
+            s += 0.25;
+        }
+        if self.pure_link_spam {
+            s += 0.15;
+        }
+        if self.spam_hashtag_density {
+            s += 0.12;
+        }
+        if self.repeat_content {
+            s += 0.10;
+        }
+        if self.spam_mentions {
+            s += 0.08;
+        }
+        if self.emoji_overload {
+            s += 0.05;
+        }
         s.clamp(0.0, 1.0)
     }
 
-    pub fn is_garbage(&self) -> bool { self.score() >= 0.40 }
+    pub fn is_garbage(&self) -> bool {
+        self.score() >= 0.40
+    }
 
     /// Motif d'inéligibilité dominant, s'il y en a un.
     ///
@@ -452,9 +510,15 @@ impl GarbageSignals {
     /// spam » générique, parce qu'il est affichable au créateur et actionnable
     /// par lui.
     pub fn dominant_reason(&self) -> Option<IneligibilityReason> {
-        if self.high_report_rate     { return Some(IneligibilityReason::UnderReview); }
-        if self.pure_link_spam       { return Some(IneligibilityReason::LinkSpam); }
-        if self.repeat_content       { return Some(IneligibilityReason::Unoriginal); }
+        if self.high_report_rate {
+            return Some(IneligibilityReason::UnderReview);
+        }
+        if self.pure_link_spam {
+            return Some(IneligibilityReason::LinkSpam);
+        }
+        if self.repeat_content {
+            return Some(IneligibilityReason::Unoriginal);
+        }
         if self.spam_hashtag_density || self.spam_mentions {
             return Some(IneligibilityReason::EngagementBait);
         }
@@ -467,13 +531,27 @@ impl GarbageSignals {
     /// Résumé des signaux actifs pour les logs.
     pub fn active_signals(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
-        if self.high_report_rate     { v.push("high_report_rate"); }
-        if self.zero_engagement      { v.push("zero_engagement"); }
-        if self.pure_link_spam       { v.push("pure_link_spam"); }
-        if self.spam_hashtag_density { v.push("spam_hashtag_density"); }
-        if self.repeat_content       { v.push("repeat_content"); }
-        if self.spam_mentions        { v.push("spam_mentions"); }
-        if self.emoji_overload       { v.push("emoji_overload"); }
+        if self.high_report_rate {
+            v.push("high_report_rate");
+        }
+        if self.zero_engagement {
+            v.push("zero_engagement");
+        }
+        if self.pure_link_spam {
+            v.push("pure_link_spam");
+        }
+        if self.spam_hashtag_density {
+            v.push("spam_hashtag_density");
+        }
+        if self.repeat_content {
+            v.push("repeat_content");
+        }
+        if self.spam_mentions {
+            v.push("spam_mentions");
+        }
+        if self.emoji_overload {
+            v.push("emoji_overload");
+        }
         v
     }
 }
@@ -487,10 +565,10 @@ pub struct AccountQualityScore {
     pub user_id: String,
     pub level: ShadowbanLevel,
 
-    pub garbage_ratio_7d: f64,    // % des posts des 7 derniers jours = poubelle
-    pub avg_report_rate_7d: f64,  // taux moyen de signalements sur 7 jours
-    pub spam_strikes: u32,        // posts garbage consécutifs les plus récents
-    pub engagement_deficit: f64,  // écart vs baseline plateforme (négatif = mauvais)
+    pub garbage_ratio_7d: f64, // % des posts des 7 derniers jours = poubelle
+    pub avg_report_rate_7d: f64, // taux moyen de signalements sur 7 jours
+    pub spam_strikes: u32,     // posts garbage consécutifs les plus récents
+    pub engagement_deficit: f64, // écart vs baseline plateforme (négatif = mauvais)
 
     pub computed_at: DateTime<Utc>,
     pub manual_override: Option<ShadowbanLevel>, // surcharge équipe modération

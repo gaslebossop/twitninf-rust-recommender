@@ -112,7 +112,9 @@ pub struct AlgoWeights {
     pub d9_llm_understanding: f64,
 }
 
-fn default_d9() -> f64 { 0.10 }
+fn default_d9() -> f64 {
+    0.10
+}
 
 impl Default for AlgoWeights {
     fn default() -> Self {
@@ -124,15 +126,15 @@ impl Default for AlgoWeights {
         // 1 — invisible face à D1. Le multiplicateur FOLLOW_FEED_BOOST fait le
         // reste du travail au moment du classement.
         Self {
-            d1_engagement_velocity:  0.24,
+            d1_engagement_velocity: 0.24,
             d2_content_intelligence: 0.12,
-            d3_social_graph:         0.22,
-            d4_temporal:             0.09,
-            d5_behavioral:           0.08,
-            d6_diversity:            0.06,
-            d7_viral:                0.06,
-            d8_personalization:      0.03,
-            d9_llm_understanding:    0.10,
+            d3_social_graph: 0.22,
+            d4_temporal: 0.09,
+            d5_behavioral: 0.08,
+            d6_diversity: 0.06,
+            d7_viral: 0.06,
+            d8_personalization: 0.03,
+            d9_llm_understanding: 0.10,
         }
     }
 }

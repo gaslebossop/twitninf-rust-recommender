@@ -52,7 +52,9 @@ impl CacheManager {
     /// chacun des deux gestes pris seul est bénin.
     pub async fn set_velocity_throttle(&self, user_id: &str) {
         let mut c = self.conn.lock().await;
-        let _: Result<(), _> = c.set_ex(key(user_id), "1", VELOCITY_THROTTLE_TTL_SECS).await;
+        let _: Result<(), _> = c
+            .set_ex(key(user_id), "1", VELOCITY_THROTTLE_TTL_SECS)
+            .await;
     }
 
     /// Compte une publication dans la fenêtre de rafale, et pose le frein si
@@ -99,7 +101,11 @@ impl CacheManager {
         user_ids
             .iter()
             .enumerate()
-            .filter_map(|(i, uid)| raw.get(i)?.as_ref().map(|_| (uid.clone(), VELOCITY_THROTTLE_MULTIPLIER)))
+            .filter_map(|(i, uid)| {
+                raw.get(i)?
+                    .as_ref()
+                    .map(|_| (uid.clone(), VELOCITY_THROTTLE_MULTIPLIER))
+            })
             .collect()
     }
 }

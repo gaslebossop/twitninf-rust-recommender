@@ -110,7 +110,9 @@ pub fn expected_consumption_ms(ctx: &DwellContext) -> f64 {
             .map(|d| d as f64)
             .unwrap_or(VIDEO_FALLBACK_MS)
             .min(VIDEO_EXPECTED_CAP_MS),
-        DwellMedia::Image => IMAGE_EXPECTED_MS + ctx.content_chars as f64 / READING_CHARS_PER_SEC * 1000.0,
+        DwellMedia::Image => {
+            IMAGE_EXPECTED_MS + ctx.content_chars as f64 / READING_CHARS_PER_SEC * 1000.0
+        }
         DwellMedia::Text => ORIENT_MS + ctx.content_chars as f64 / READING_CHARS_PER_SEC * 1000.0,
     };
     raw.max(EXPECTED_FLOOR_MS)
@@ -170,10 +172,18 @@ mod tests {
     use super::*;
 
     fn text(chars: u32) -> DwellContext {
-        DwellContext { media: DwellMedia::Text, content_chars: chars, video_duration_ms: None }
+        DwellContext {
+            media: DwellMedia::Text,
+            content_chars: chars,
+            video_duration_ms: None,
+        }
     }
     fn video(duration_ms: u32) -> DwellContext {
-        DwellContext { media: DwellMedia::Video, content_chars: 0, video_duration_ms: Some(duration_ms) }
+        DwellContext {
+            media: DwellMedia::Video,
+            content_chars: 0,
+            video_duration_ms: Some(duration_ms),
+        }
     }
 
     #[test]
@@ -184,7 +194,10 @@ mod tests {
         let long = text(280);
         let w_court = dwell_weight(expected_consumption_ms(&court) as u32, Some(&court));
         let w_long = dwell_weight(expected_consumption_ms(&long) as u32, Some(&long));
-        assert!((w_court - w_long).abs() < 1e-9, "court={w_court}, long={w_long}");
+        assert!(
+            (w_court - w_long).abs() < 1e-9,
+            "court={w_court}, long={w_long}"
+        );
     }
 
     #[test]
@@ -205,7 +218,10 @@ mod tests {
         let expected = expected_consumption_ms(&ctx);
         let w = dwell_weight((expected * 0.02) as u32, Some(&ctx));
         assert!(w < 0.0, "un survol doit peser négativement, obtenu {w}");
-        assert!(w >= SKIP_PENALTY, "jamais en dessous du plancher, obtenu {w}");
+        assert!(
+            w >= SKIP_PENALTY,
+            "jamais en dessous du plancher, obtenu {w}"
+        );
     }
 
     #[test]
@@ -243,7 +259,10 @@ mod tests {
         for ctx in &cases {
             for ms in [0u32, 1, 500, 5_000, 60_000, 3_600_000] {
                 let w = dwell_weight(ms, Some(ctx));
-                assert!(w >= SKIP_PENALTY && w <= MAX_BONUS, "poids hors bornes: {w} ({ctx:?}, {ms}ms)");
+                assert!(
+                    w >= SKIP_PENALTY && w <= MAX_BONUS,
+                    "poids hors bornes: {w} ({ctx:?}, {ms}ms)"
+                );
                 assert!(w.is_finite(), "poids non fini pour {ctx:?} / {ms}ms");
             }
         }

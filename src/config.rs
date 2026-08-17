@@ -27,15 +27,15 @@ pub struct Config {
     pub internal_secret: String,
 }
 
-const DEFAULT_ADMIN_SENTINEL:    &str = "changeme-admin-secret";
+const DEFAULT_ADMIN_SENTINEL: &str = "changeme-admin-secret";
 const DEFAULT_INTERNAL_SENTINEL: &str = "changeme-internal-secret";
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
-        let admin_secret = env::var("ADMIN_SECRET")
-            .unwrap_or_else(|_| DEFAULT_ADMIN_SENTINEL.to_string());
+        let admin_secret =
+            env::var("ADMIN_SECRET").unwrap_or_else(|_| DEFAULT_ADMIN_SENTINEL.to_string());
         if admin_secret == DEFAULT_ADMIN_SENTINEL {
             bail!(
                 "ADMIN_SECRET environment variable is not set. \
@@ -44,8 +44,8 @@ impl Config {
             );
         }
 
-        let internal_secret = env::var("INTERNAL_SECRET")
-            .unwrap_or_else(|_| DEFAULT_INTERNAL_SENTINEL.to_string());
+        let internal_secret =
+            env::var("INTERNAL_SECRET").unwrap_or_else(|_| DEFAULT_INTERNAL_SENTINEL.to_string());
         if internal_secret == DEFAULT_INTERNAL_SENTINEL {
             warn!(
                 "INTERNAL_SECRET is using the default insecure value. \
@@ -53,8 +53,7 @@ impl Config {
             );
         }
 
-        let db_password = env::var("DB_PASSWORD")
-            .unwrap_or_else(|_| String::new());
+        let db_password = env::var("DB_PASSWORD").unwrap_or_else(|_| String::new());
         if db_password.is_empty() {
             warn!("DB_PASSWORD is not set — connecting to PostgreSQL without a password.");
         }
@@ -86,12 +85,12 @@ impl Config {
 
     pub fn pg_config(&self) -> deadpool_postgres::Config {
         let mut cfg = deadpool_postgres::Config::new();
-        cfg.host     = Some(self.db_host.clone());
-        cfg.port     = Some(self.db_port);
-        cfg.dbname   = Some(self.db_name.clone());
-        cfg.user     = Some(self.db_user.clone());
+        cfg.host = Some(self.db_host.clone());
+        cfg.port = Some(self.db_port);
+        cfg.dbname = Some(self.db_name.clone());
+        cfg.user = Some(self.db_user.clone());
         cfg.password = Some(self.db_password.clone());
-        cfg.pool     = Some(deadpool_postgres::PoolConfig {
+        cfg.pool = Some(deadpool_postgres::PoolConfig {
             max_size: self.db_pool_size,
             ..Default::default()
         });

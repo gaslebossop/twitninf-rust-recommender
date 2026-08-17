@@ -59,7 +59,12 @@ impl CacheManager {
                     if let Some(r) = reason {
                         let _: Result<(), _> = c.set_ex(&reason_key, r, ttl).await;
                     }
-                    debug!(user_id, level = level_str, days, "Shadowban set (temporaire)");
+                    debug!(
+                        user_id,
+                        level = level_str,
+                        days,
+                        "Shadowban set (temporaire)"
+                    );
                 }
                 _ => {
                     let _: Result<(), _> = c.set(&key, level_str).await;
@@ -84,19 +89,34 @@ impl CacheManager {
     /// nettoie donc au passage.
     pub async fn admin_get_shadowbanned_users(&self) -> Vec<ShadowbannedUser> {
         let mut c = self.conn.lock().await;
-        let user_ids: HashSet<String> = c.smembers("admin:shadowban:users").await.unwrap_or_default();
+        let user_ids: HashSet<String> = c
+            .smembers("admin:shadowban:users")
+            .await
+            .unwrap_or_default();
         drop(c);
 
         let mut result = Vec::new();
         let mut stale: Vec<String> = Vec::new();
         for uid in user_ids {
             let mut c2 = self.conn.lock().await;
-            let level: Option<String> = c2.get(format!("admin:shadowban:{uid}")).await.ok().flatten();
-            let reason: Option<String> = c2.get(format!("admin:shadowban:reason:{uid}")).await.ok().flatten();
+            let level: Option<String> = c2
+                .get(format!("admin:shadowban:{uid}"))
+                .await
+                .ok()
+                .flatten();
+            let reason: Option<String> = c2
+                .get(format!("admin:shadowban:reason:{uid}"))
+                .await
+                .ok()
+                .flatten();
             drop(c2);
 
             match level {
-                Some(l) => result.push(ShadowbannedUser { user_id: uid, level: l, reason }),
+                Some(l) => result.push(ShadowbannedUser {
+                    user_id: uid,
+                    level: l,
+                    reason,
+                }),
                 None => stale.push(uid),
             }
         }
@@ -107,7 +127,10 @@ impl CacheManager {
                 let _: Result<(), _> = c3.srem("admin:shadowban:users", uid).await;
             }
             drop(c3);
-            debug!(count = stale.len(), "Décisions manuelles expirées retirées de l'index");
+            debug!(
+                count = stale.len(),
+                "Décisions manuelles expirées retirées de l'index"
+            );
         }
         result
     }
@@ -144,9 +167,16 @@ impl CacheManager {
         let mut result = Vec::new();
         for uid in user_ids {
             let mut c2 = self.conn.lock().await;
-            let reason: Option<String> = c2.get(format!("admin:hardban:reason:{uid}")).await.ok().flatten();
+            let reason: Option<String> = c2
+                .get(format!("admin:hardban:reason:{uid}"))
+                .await
+                .ok()
+                .flatten();
             drop(c2);
-            result.push(BannedUser { user_id: uid, reason });
+            result.push(BannedUser {
+                user_id: uid,
+                reason,
+            });
         }
         result
     }
@@ -155,7 +185,10 @@ impl CacheManager {
     /// Résultat mis en cache 60 secondes dans la même clé Redis.
     pub async fn admin_get_hard_banned_set(&self) -> HashSet<String> {
         let mut c = self.conn.lock().await;
-        match c.smembers::<_, HashSet<String>>("admin:hardban:users").await {
+        match c
+            .smembers::<_, HashSet<String>>("admin:hardban:users")
+            .await
+        {
             Ok(set) => set,
             Err(e) => {
                 warn!("Failed to load hard-ban set: {e}");
@@ -167,7 +200,11 @@ impl CacheManager {
     /// Vérifie si un user est hard-banni
     pub async fn admin_is_hard_banned(&self, user_id: &str) -> bool {
         let mut c = self.conn.lock().await;
-        let val: Option<String> = c.get(format!("admin:hardban:{user_id}")).await.ok().flatten();
+        let val: Option<String> = c
+            .get(format!("admin:hardban:{user_id}"))
+            .await
+            .ok()
+            .flatten();
         val.is_some()
     }
 

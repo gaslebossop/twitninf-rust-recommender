@@ -35,8 +35,15 @@ fn check_service_key(headers: &HeaderMap, secret: &str) -> bool {
         .get("X-Service-Key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if provided.len() != secret.len() { return false; }
-    provided.as_bytes().iter().zip(secret.as_bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    if provided.len() != secret.len() {
+        return false;
+    }
+    provided
+        .as_bytes()
+        .iter()
+        .zip(secret.as_bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 pub async fn account_status_handler(
@@ -78,5 +85,8 @@ pub async fn account_status_handler(
         map.insert("velocity_throttled".to_string(), json!(velocity_throttled));
     }
 
-    (StatusCode::OK, Json(json!({ "success": true, "data": data })))
+    (
+        StatusCode::OK,
+        Json(json!({ "success": true, "data": data })),
+    )
 }

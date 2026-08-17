@@ -31,9 +31,15 @@ use crate::services::cache_manager::CacheManager;
 use super::models::{strike_ttl, ShadowbanLevel, Strike, StrikePolicy};
 use super::strikes::StrikeLedger;
 
-fn strikes_key(user_id: &str) -> String { format!("shadowban:strikes:{user_id}") }
-fn level_key(user_id: &str) -> String { format!("shadowban:level:{user_id}") }
-fn manual_key(user_id: &str) -> String { format!("admin:shadowban:{user_id}") }
+fn strikes_key(user_id: &str) -> String {
+    format!("shadowban:strikes:{user_id}")
+}
+fn level_key(user_id: &str) -> String {
+    format!("shadowban:level:{user_id}")
+}
+fn manual_key(user_id: &str) -> String {
+    format!("admin:shadowban:{user_id}")
+}
 
 /// Marqueur écrit quand le registre donne `Clean`.
 ///
@@ -77,7 +83,8 @@ impl CacheManager {
 
         let ledger = self.shadowban_load_ledger(user_id).await;
         let level = ledger.level(now);
-        self.shadowban_write_level_cache(user_id, &ledger, now).await;
+        self.shadowban_write_level_cache(user_id, &ledger, now)
+            .await;
 
         if let Some(p) = ledger.permanent_ban_reached(now) {
             // Signalé, jamais appliqué automatiquement : un bannissement définitif
@@ -143,7 +150,10 @@ impl CacheManager {
             }
             let _: Result<(), _> = c.del(level_key(user_id)).await;
         }
-        debug!(user_id, tweet_id, removed, "Avertissements annulés après recours");
+        debug!(
+            user_id,
+            tweet_id, removed, "Avertissements annulés après recours"
+        );
         removed
     }
 
@@ -156,7 +166,11 @@ impl CacheManager {
     ) {
         let level = ledger.computed_level(now);
         let ttl = ledger.cache_ttl_secs(now);
-        let value = if level == ShadowbanLevel::Clean { CLEAN_MARKER } else { level.label() };
+        let value = if level == ShadowbanLevel::Clean {
+            CLEAN_MARKER
+        } else {
+            level.label()
+        };
         let mut c = self.conn.lock().await;
         let _: Result<(), _> = c.set_ex(level_key(user_id), value, ttl).await;
     }
@@ -173,7 +187,9 @@ impl CacheManager {
             let mut c = self.conn.lock().await;
             // Élagage opportuniste : les expirés ne sont jamais relus ensuite.
             let _: Result<(), _> = c.zrembyscore(&key, f64::NEG_INFINITY, cutoff as f64).await;
-            c.zrangebyscore(&key, cutoff as f64, f64::INFINITY).await.unwrap_or_default()
+            c.zrangebyscore(&key, cutoff as f64, f64::INFINITY)
+                .await
+                .unwrap_or_default()
         };
 
         let mut strikes = Vec::with_capacity(raw.len());
@@ -186,7 +202,12 @@ impl CacheManager {
 
         let (manual_override, manual_expires_at) = self.shadowban_load_manual(user_id).await;
 
-        StrikeLedger { user_id: user_id.to_string(), strikes, manual_override, manual_expires_at }
+        StrikeLedger {
+            user_id: user_id.to_string(),
+            strikes,
+            manual_override,
+            manual_expires_at,
+        }
     }
 
     /// Décision manuelle courante et sa date de fin (dérivée du TTL Redis).
@@ -244,7 +265,10 @@ impl CacheManager {
 
         let mut out: HashMap<String, ShadowbanLevel> = HashMap::new();
         for (idx, uid) in user_ids.iter().enumerate() {
-            let level = match (manual.get(idx).copied().flatten(), derived.get(idx).copied().flatten()) {
+            let level = match (
+                manual.get(idx).copied().flatten(),
+                derived.get(idx).copied().flatten(),
+            ) {
                 (Some(m), Some(d)) => m.max(d),
                 (Some(m), None) => m,
                 (None, Some(d)) => d,
@@ -255,7 +279,11 @@ impl CacheManager {
             }
         }
         if !out.is_empty() {
-            debug!(count = out.len(), pool = user_ids.len(), "Niveaux de restriction chargés");
+            debug!(
+                count = out.len(),
+                pool = user_ids.len(),
+                "Niveaux de restriction chargés"
+            );
         }
         out
     }

@@ -40,7 +40,11 @@ pub async fn health_handler(State(state): State<AppState>) -> (StatusCode, Json<
     (
         overall,
         Json(HealthResponse {
-            status: if overall == StatusCode::OK { "healthy".into() } else { "degraded".into() },
+            status: if overall == StatusCode::OK {
+                "healthy".into()
+            } else {
+                "degraded".into()
+            },
             version: env!("CARGO_PKG_VERSION"),
             db: db_status,
             redis: redis_status,

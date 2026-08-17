@@ -108,7 +108,11 @@ mod tests {
     }
 
     fn tweet() -> RawTweet {
-        RawTweet { id: "t1".into(), view_count: 500, ..Default::default() }
+        RawTweet {
+            id: "t1".into(),
+            view_count: 500,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -121,7 +125,10 @@ mod tests {
     #[test]
     fn signalements_mettent_en_verification() {
         let t = tweet();
-        let s = GarbageSignals { high_report_rate: true, ..Default::default() };
+        let s = GarbageSignals {
+            high_report_rate: true,
+            ..Default::default()
+        };
         assert_eq!(
             content_eligibility(&t, &s),
             ContentEligibility::NotRecommended(IneligibilityReason::UnderReview)
@@ -131,15 +138,24 @@ mod tests {
     #[test]
     fn signalements_ignores_sous_le_plancher_de_vues() {
         // 12 vues et un signalement ne prouvent rien.
-        let t = RawTweet { view_count: 12, ..tweet() };
-        let s = GarbageSignals { high_report_rate: true, ..Default::default() };
+        let t = RawTweet {
+            view_count: 12,
+            ..tweet()
+        };
+        let s = GarbageSignals {
+            high_report_rate: true,
+            ..Default::default()
+        };
         // Le score des signaux (0,35) reste sous le seuil de spam : éligible.
         assert_eq!(content_eligibility(&t, &s), ContentEligibility::Eligible);
     }
 
     #[test]
     fn toxicite_confiante_coupe_la_recommandation() {
-        let t = RawTweet { llm: Some(labels(0.5, 0.75, 0.9)), ..tweet() };
+        let t = RawTweet {
+            llm: Some(labels(0.5, 0.75, 0.9)),
+            ..tweet()
+        };
         assert_eq!(
             content_eligibility(&t, &GarbageSignals::default()),
             ContentEligibility::NotRecommended(IneligibilityReason::Toxic)
@@ -150,7 +166,10 @@ mod tests {
     fn toxicite_incertaine_ne_coupe_rien() {
         // Même toxicité, annotation peu sûre : on rétrograde (Mod H) mais on ne
         // ferme aucune surface sur une supposition.
-        let t = RawTweet { llm: Some(labels(0.5, 0.75, 0.3)), ..tweet() };
+        let t = RawTweet {
+            llm: Some(labels(0.5, 0.75, 0.3)),
+            ..tweet()
+        };
         assert_eq!(
             content_eligibility(&t, &GarbageSignals::default()),
             ContentEligibility::Eligible
@@ -159,7 +178,10 @@ mod tests {
 
     #[test]
     fn qualite_au_plancher_coupe_la_recommandation() {
-        let t = RawTweet { llm: Some(labels(0.05, 0.0, 0.8)), ..tweet() };
+        let t = RawTweet {
+            llm: Some(labels(0.05, 0.0, 0.8)),
+            ..tweet()
+        };
         assert_eq!(
             content_eligibility(&t, &GarbageSignals::default()),
             ContentEligibility::NotRecommended(IneligibilityReason::LowQuality)
@@ -184,9 +206,18 @@ mod tests {
     #[test]
     fn motif_d_inegibilite_se_rattache_au_bon_domaine() {
         use super::super::models::StrikePolicy;
-        assert_eq!(IneligibilityReason::LinkSpam.policy(), Some(StrikePolicy::Spam));
-        assert_eq!(IneligibilityReason::Unoriginal.policy(), Some(StrikePolicy::Unoriginal));
-        assert_eq!(IneligibilityReason::Toxic.policy(), Some(StrikePolicy::Harassment));
+        assert_eq!(
+            IneligibilityReason::LinkSpam.policy(),
+            Some(StrikePolicy::Spam)
+        );
+        assert_eq!(
+            IneligibilityReason::Unoriginal.policy(),
+            Some(StrikePolicy::Unoriginal)
+        );
+        assert_eq!(
+            IneligibilityReason::Toxic.policy(),
+            Some(StrikePolicy::Harassment)
+        );
         // En vérification : rien n'est établi, donc rien ne se cumule.
         assert_eq!(IneligibilityReason::UnderReview.policy(), None);
         assert_eq!(IneligibilityReason::LowQuality.policy(), None);

@@ -4,5 +4,5 @@ pub mod ctr_sweeper;
 pub mod user_weights;
 
 pub use auto_tuner::AutoTuner;
-pub use ctr_predictor::{CtrPredictor, extract_features};
+pub use ctr_predictor::{extract_features, CtrPredictor};
 pub use user_weights::UserDimensionWeights;

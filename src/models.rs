@@ -7,7 +7,7 @@ use crate::shadowban::ShadowbanLevel;
 
 #[derive(Debug, Deserialize)]
 pub struct RecommendRequest {
-    pub user_id: String,   // UUID
+    pub user_id: String, // UUID
     pub limit: Option<i32>,
     pub offset: Option<i32>,
     pub mode: Option<RecommendMode>,
@@ -27,13 +27,15 @@ pub enum RecommendMode {
 }
 
 impl Default for RecommendMode {
-    fn default() -> Self { RecommendMode::ForYou }
+    fn default() -> Self {
+        RecommendMode::ForYou
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TrackInteractionRequest {
-    pub user_id: String,   // UUID
-    pub tweet_id: String,  // UUID
+    pub user_id: String,  // UUID
+    pub tweet_id: String, // UUID
     pub interaction_type: InteractionType,
     pub dwell_ms: Option<u32>,
     /// Nature du contenu regardé, pour interpréter `dwell_ms`.
@@ -57,36 +59,47 @@ pub struct TrackInteractionRequest {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InteractionType {
-    Like, Unlike, Comment, Retweet, Unretweet,
-    Share, View, Bookmark, ProfileView, Skip, Report, Block,
+    Like,
+    Unlike,
+    Comment,
+    Retweet,
+    Unretweet,
+    Share,
+    View,
+    Bookmark,
+    ProfileView,
+    Skip,
+    Report,
+    Block,
     /// Réponse explicite à la question posée dans le fil (« ça t'intéresse ? »).
     ///
     /// Distinct d'un like : on ne déclare pas aimer le tweet, on déclare vouloir
     /// — ou ne plus vouloir — ce GENRE de contenu. `NotInterested` pèse donc
     /// nettement plus lourd qu'un `Skip` constaté au chronomètre, et déclenche
     /// en plus une mise en sourdine de l'auteur (voir `track_handler`).
-    Interested, NotInterested,
+    Interested,
+    NotInterested,
 }
 
 impl InteractionType {
     pub fn weight(self) -> f64 {
         match self {
-            InteractionType::Like        =>  1.0,
-            InteractionType::Unlike      => -1.0,
-            InteractionType::Comment     =>  3.5,
-            InteractionType::Retweet     =>  5.0,
-            InteractionType::Unretweet   => -2.0,
-            InteractionType::Share       =>  4.0,
-            InteractionType::Bookmark    =>  2.5,
-            InteractionType::View        =>  0.2,
-            InteractionType::ProfileView =>  1.5,
-            InteractionType::Skip        => -0.5,
-            InteractionType::Report      => -12.0,
-            InteractionType::Block       => -20.0,
+            InteractionType::Like => 1.0,
+            InteractionType::Unlike => -1.0,
+            InteractionType::Comment => 3.5,
+            InteractionType::Retweet => 5.0,
+            InteractionType::Unretweet => -2.0,
+            InteractionType::Share => 4.0,
+            InteractionType::Bookmark => 2.5,
+            InteractionType::View => 0.2,
+            InteractionType::ProfileView => 1.5,
+            InteractionType::Skip => -0.5,
+            InteractionType::Report => -12.0,
+            InteractionType::Block => -20.0,
             // Déclaré à la main, en réponse à une question directe : ça vaut
             // plus qu'un geste deviné, moins qu'un signalement (qui vise le
             // contenu lui-même, pas le goût du lecteur).
-            InteractionType::Interested    =>  3.0,
+            InteractionType::Interested => 3.0,
             InteractionType::NotInterested => -8.0,
         }
     }
@@ -179,15 +192,29 @@ pub struct UserProfile {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub enum ContentLength { Short, #[default] Medium, Long }
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub enum PersonalityType {
-    Enthusiastic, Curious, Thoughtful, #[default] Balanced,
+pub enum ContentLength {
+    Short,
+    #[default]
+    Medium,
+    Long,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub enum UserType { PowerUser, Regular, #[default] Casual }
+pub enum PersonalityType {
+    Enthusiastic,
+    Curious,
+    Thoughtful,
+    #[default]
+    Balanced,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum UserType {
+    PowerUser,
+    Regular,
+    #[default]
+    Casual,
+}
 
 // ─── Palier d'abonnement de l'auteur ─────────────────────────────────────────
 
@@ -319,8 +346,12 @@ pub struct LlmLabels {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum TweetSource {
-    Trending, SocialGraph, Personalized, Viral,
-    Temporal, Discovery,
+    Trending,
+    SocialGraph,
+    Personalized,
+    Viral,
+    Temporal,
+    Discovery,
     #[default]
     Influencer,
     Quality,
@@ -536,7 +567,6 @@ pub struct TrackResponse {
     pub success: bool,
     pub tweet_id: String,
     pub user_id: String,
-    pub new_score: f64,
     pub weight_applied: f64,
 }
 

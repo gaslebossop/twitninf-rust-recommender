@@ -54,7 +54,9 @@ impl Default for TunerState {
 
 impl AutoTuner {
     pub fn new() -> Self {
-        Self { current: Arc::new(RwLock::new(TunerState::default())) }
+        Self {
+            current: Arc::new(RwLock::new(TunerState::default())),
+        }
     }
 
     /// Retente une mise à jour des poids depuis le CTR model.
@@ -78,8 +80,8 @@ impl AutoTuner {
         // propager du bruit à l'ensemble du feed.
         if !(MIN_PLAUSIBLE_CTR..=MAX_PLAUSIBLE_CTR).contains(&global_ctr) {
             warn!(
-                samples, global_ctr,
-                "AutoTuner: CTR global hors bande plausible — poids inchangés"
+                samples,
+                global_ctr, "AutoTuner: CTR global hors bande plausible — poids inchangés"
             );
             return;
         }
@@ -92,7 +94,10 @@ impl AutoTuner {
             state.auto_tuned = true;
             state.last_tune_at = samples;
             drop(state);
-            info!(samples, "AutoTuner: dimension weights updated from CTR model");
+            info!(
+                samples,
+                "AutoTuner: dimension weights updated from CTR model"
+            );
         }
     }
 
@@ -114,7 +119,9 @@ impl AutoTuner {
 }
 
 impl Default for AutoTuner {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─── Extension du CtrPredictor pour extraire les poids dimensionnels ─────────
@@ -161,22 +168,28 @@ impl CtrPredictor {
         let norm: Vec<f64> = clipped.iter().map(|w| w / sum * budget).collect();
 
         debug!(
-            d1 = norm[0], d2 = norm[1], d3 = norm[2], d4 = norm[3],
-            d5 = norm[4], d6 = norm[5], d7 = norm[6], d8 = norm[7],
+            d1 = norm[0],
+            d2 = norm[1],
+            d3 = norm[2],
+            d4 = norm[3],
+            d5 = norm[4],
+            d6 = norm[5],
+            d7 = norm[6],
+            d8 = norm[7],
             samples,
             "CTR-derived dimension weights"
         );
 
         Some(AlgoWeights {
-            d1_engagement_velocity:  norm[0],
+            d1_engagement_velocity: norm[0],
             d2_content_intelligence: norm[1],
-            d3_social_graph:         norm[2],
-            d4_temporal:             norm[3],
-            d5_behavioral:           norm[4],
-            d6_diversity:            norm[5],
-            d7_viral:                norm[6],
-            d8_personalization:      norm[7],
-            d9_llm_understanding:    d9,
+            d3_social_graph: norm[2],
+            d4_temporal: norm[3],
+            d5_behavioral: norm[4],
+            d6_diversity: norm[5],
+            d7_viral: norm[6],
+            d8_personalization: norm[7],
+            d9_llm_understanding: d9,
         })
     }
 }

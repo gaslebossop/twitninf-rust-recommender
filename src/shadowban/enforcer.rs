@@ -19,10 +19,18 @@ pub struct Verdict {
 
 impl Verdict {
     fn allow(multiplier: f64) -> Self {
-        Verdict { allowed: true, multiplier, blocked_by: None }
+        Verdict {
+            allowed: true,
+            multiplier,
+            blocked_by: None,
+        }
     }
     fn block(reason: &'static str) -> Self {
-        Verdict { allowed: false, multiplier: 0.0, blocked_by: Some(reason) }
+        Verdict {
+            allowed: false,
+            multiplier: 0.0,
+            blocked_by: Some(reason),
+        }
     }
 }
 
@@ -40,7 +48,9 @@ impl Verdict {
 pub struct ShadowbanEnforcer;
 
 impl ShadowbanEnforcer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Mod D — Applique le multiplicateur de compte au score final.
     pub fn apply_to_score(&self, score: f64, level: ShadowbanLevel) -> f64 {
@@ -111,7 +121,12 @@ impl ShadowbanEnforcer {
         mode: &RecommendMode,
         viewer_follows_author: bool,
     ) -> Verdict {
-        self.admit(level, eligibility, Surface::from_mode(mode), viewer_follows_author)
+        self.admit(
+            level,
+            eligibility,
+            Surface::from_mode(mode),
+            viewer_follows_author,
+        )
     }
 
     /// Surface effective d'un tweet : la source qui l'a fait entrer dans le pool
@@ -136,7 +151,7 @@ impl ShadowbanEnforcer {
             return mode_surface;
         }
         match tweet.source {
-            TweetSource::Trending  => Surface::Trending,
+            TweetSource::Trending => Surface::Trending,
             TweetSource::Discovery => Surface::Discover,
             _ => mode_surface,
         }
@@ -149,7 +164,9 @@ impl ShadowbanEnforcer {
 }
 
 impl Default for ShadowbanEnforcer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -161,20 +178,33 @@ mod tests {
     const SPAM: ContentEligibility =
         ContentEligibility::NotRecommended(IneligibilityReason::SpamSignals);
 
-    fn e() -> ShadowbanEnforcer { ShadowbanEnforcer::new() }
+    fn e() -> ShadowbanEnforcer {
+        ShadowbanEnforcer::new()
+    }
 
     #[test]
     fn compte_propre_passe_partout() {
-        for surface in [Surface::FollowerFeed, Surface::ForYou, Surface::Discover, Surface::Trending] {
+        for surface in [
+            Surface::FollowerFeed,
+            Surface::ForYou,
+            Surface::Discover,
+            Surface::Trending,
+        ] {
             assert!(e().admit(ShadowbanLevel::Clean, OK, surface, false).allowed);
         }
     }
 
     #[test]
     fn surveillance_ne_ferme_aucune_surface() {
-        for surface in [Surface::FollowerFeed, Surface::ForYou, Surface::Discover, Surface::Trending] {
+        for surface in [
+            Surface::FollowerFeed,
+            Surface::ForYou,
+            Surface::Discover,
+            Surface::Trending,
+        ] {
             assert!(
-                e().admit(ShadowbanLevel::Monitoring, OK, surface, false).allowed,
+                e().admit(ShadowbanLevel::Monitoring, OK, surface, false)
+                    .allowed,
                 "Monitoring doit rester un palier d'alerte, pas une sanction ({surface:?})"
             );
         }
@@ -185,9 +215,15 @@ mod tests {
         let v = e().admit(ShadowbanLevel::Suppressed, OK, Surface::Trending, false);
         assert!(!v.allowed);
         assert_eq!(v.blocked_by, Some("account_suppressed"));
-        assert!(!e().admit(ShadowbanLevel::Suppressed, OK, Surface::Discover, false).allowed);
+        assert!(
+            !e().admit(ShadowbanLevel::Suppressed, OK, Surface::Discover, false)
+                .allowed
+        );
         // Pour toi reste ouvert : la sanction est graduée, pas binaire.
-        assert!(e().admit(ShadowbanLevel::Suppressed, OK, Surface::ForYou, false).allowed);
+        assert!(
+            e().admit(ShadowbanLevel::Suppressed, OK, Surface::ForYou, false)
+                .allowed
+        );
     }
 
     #[test]
@@ -202,22 +238,49 @@ mod tests {
     #[test]
     fn un_abonne_ne_perd_jamais_le_compte_qu_il_suit() {
         // Ni via le fil d'abonnement…
-        assert!(e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::FollowerFeed, true).allowed);
-        assert!(e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::FollowerFeed, false).allowed);
+        assert!(
+            e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::FollowerFeed, true)
+                .allowed
+        );
+        assert!(
+            e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::FollowerFeed, false)
+                .allowed
+        );
         // …ni via « Pour toi », que l'application utilise comme fil principal.
-        assert!(e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::ForYou, true).allowed);
+        assert!(
+            e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::ForYou, true)
+                .allowed
+        );
         // Mais la mise en avant publique reste fermée, même pour un abonné.
-        assert!(!e().admit(ShadowbanLevel::Ghosted, OK, Surface::Trending, true).allowed);
+        assert!(
+            !e().admit(ShadowbanLevel::Ghosted, OK, Surface::Trending, true)
+                .allowed
+        );
     }
 
     #[test]
     fn contenu_non_recommande_sort_de_la_decouverte_seulement() {
-        assert!(!e().admit(ShadowbanLevel::Clean, SPAM, Surface::Trending, false).allowed);
-        assert!(!e().admit(ShadowbanLevel::Clean, SPAM, Surface::Discover, false).allowed);
-        assert!(!e().admit(ShadowbanLevel::Clean, SPAM, Surface::ForYou, false).allowed);
+        assert!(
+            !e().admit(ShadowbanLevel::Clean, SPAM, Surface::Trending, false)
+                .allowed
+        );
+        assert!(
+            !e().admit(ShadowbanLevel::Clean, SPAM, Surface::Discover, false)
+                .allowed
+        );
+        assert!(
+            !e().admit(ShadowbanLevel::Clean, SPAM, Surface::ForYou, false)
+                .allowed
+        );
         // Le post reste en ligne pour qui a demandé ce compte.
-        assert!(e().admit(ShadowbanLevel::Clean, SPAM, Surface::ForYou, true).allowed);
-        assert!(e().admit(ShadowbanLevel::Clean, SPAM, Surface::FollowerFeed, false).allowed);
+        assert!(
+            e().admit(ShadowbanLevel::Clean, SPAM, Surface::ForYou, true)
+                .allowed
+        );
+        assert!(
+            e().admit(ShadowbanLevel::Clean, SPAM, Surface::FollowerFeed, false)
+                .allowed
+        );
     }
 
     #[test]
@@ -228,8 +291,14 @@ mod tests {
 
     #[test]
     fn une_source_tendance_reste_une_mise_en_avant_dans_pour_toi() {
-        let promu = RawTweet { source: TweetSource::Trending, ..Default::default() };
-        let normal = RawTweet { source: TweetSource::SocialGraph, ..Default::default() };
+        let promu = RawTweet {
+            source: TweetSource::Trending,
+            ..Default::default()
+        };
+        let normal = RawTweet {
+            source: TweetSource::SocialGraph,
+            ..Default::default()
+        };
 
         assert_eq!(
             ShadowbanEnforcer::effective_surface(&promu, &RecommendMode::ForYou, false),
@@ -251,10 +320,16 @@ mod tests {
         // Le piège : la déduplication garde la source de plus fort poids. Si
         // c'est `Trending`, un abonné se retrouvait à consulter une surface
         // « mise en avant » pour un compte qu'il suit — et le perdait.
-        let promu = RawTweet { source: TweetSource::Trending, ..Default::default() };
+        let promu = RawTweet {
+            source: TweetSource::Trending,
+            ..Default::default()
+        };
         let surface = ShadowbanEnforcer::effective_surface(&promu, &RecommendMode::ForYou, true);
         assert_eq!(surface, Surface::ForYou);
-        assert!(e().admit(ShadowbanLevel::Ghosted, SPAM, surface, true).allowed);
+        assert!(
+            e().admit(ShadowbanLevel::Ghosted, SPAM, surface, true)
+                .allowed
+        );
     }
 
     #[test]
