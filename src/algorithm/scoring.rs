@@ -21,7 +21,7 @@ use crate::admin::AlgoWeights;
 use crate::algorithm::d9_llm_understanding::{
     d9_llm_understanding as calculate_d9, quality_boost, toxicity_penalty,
 };
-use crate::ml::ctr_predictor::{extract_features, CtrPredictor};
+use crate::ml::ctr_predictor::{extract_features, CtrPredictor, N_FEATURES};
 use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
     AuthorTier, ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
@@ -235,7 +235,7 @@ pub fn score_tweet_ml(
     // modèle. Le gater sur `use_ml` créait un blocage circulaire — pas de
     // features stockées → pas d'entraînement → jamais assez de samples pour
     // activer le ML.
-    let features = ctr_feature_vector(tweet, &scored);
+    let features = ctr_feature_vector(tweet, profile, &scored);
     scored.ctr_features = Some(features.to_vec());
 
     // Phase 2 : blending ML CTR predictor (40% ML + 60% règles)
@@ -277,7 +277,7 @@ pub fn score_tweet_ml_with_weights(
         weights,
     );
 
-    let features = ctr_feature_vector(tweet, &scored);
+    let features = ctr_feature_vector(tweet, profile, &scored);
     scored.ctr_features = Some(features.to_vec());
 
     if let Some(ctr_model) = ctr {
@@ -299,9 +299,16 @@ pub fn score_tweet_ml_with_weights(
 /// l'entraînement doivent tous partir d'ici. Deux constructions parallèles du
 /// vecteur, c'était précisément le bug — le modèle s'entraînait sur des
 /// constantes et prédisait sur les vraies dimensions.
-fn ctr_feature_vector(tweet: &RawTweet, scored: &ScoredTweet) -> [f64; 14] {
+fn ctr_feature_vector(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    scored: &ScoredTweet,
+) -> [f64; N_FEATURES] {
     let age_h = age_hours(tweet);
     let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
+    // 20 likes/jour ≈ un lecteur très actif : `engagement_velocity` est un
+    // compte brut (`SUM(... INTERVAL '1 day')`), sans plafond naturel.
+    let reader_engagement = (profile.engagement_velocity / 20.0).clamp(0.0, 1.0);
     extract_features(
         d1,
         scored.breakdown.content_intelligence,
@@ -316,6 +323,7 @@ fn ctr_feature_vector(tweet: &RawTweet, scored: &ScoredTweet) -> [f64; 14] {
         tweet.has_media,
         tweet.author_followers,
         ev_accel,
+        reader_engagement,
     )
 }
 

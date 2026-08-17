@@ -29,11 +29,11 @@ use crate::shadowban::{content_eligibility, GarbageContentDetector, ShadowbanEnf
 /// Convertit un vecteur de features sérialisé en tableau de taille fixe.
 /// Rejette toute taille inattendue : un vecteur tronqué décalerait chaque
 /// feature d'un cran et corromprait le modèle silencieusement.
-fn to_feature_array(features: &[f64]) -> Option<[f64; 14]> {
-    if features.len() != 14 {
+fn to_feature_array(features: &[f64]) -> Option<[f64; crate::ml::ctr_predictor::N_FEATURES]> {
+    if features.len() != crate::ml::ctr_predictor::N_FEATURES {
         return None;
     }
-    let mut out = [0.0f64; 14];
+    let mut out = [0.0f64; crate::ml::ctr_predictor::N_FEATURES];
     out.copy_from_slice(features);
     Some(out)
 }

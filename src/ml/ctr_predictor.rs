@@ -1,18 +1,25 @@
 /// Phase 2 — ML CTR Predictor
 ///
 /// Logistic regression avec SGD online learning.
-/// Input: 14 features (scores D1-D8 + contexte tweet)
+/// Input: 15 features (scores D1-D8 + contexte tweet + activité du lecteur)
 /// Output: CTR probability [0, 1]
 ///
 /// Entraînement continu depuis les interactions utilisateurs.
 /// Convergence typique : ~500 interactions, gain CTR : +1.5-2%
+///
+/// ⚠ Changer `N_FEATURES` change la forme du tableau persisté
+/// (`data/ctr_model.json`) : `load_or_default` retombe silencieusement sur un
+/// modèle neuf si la taille ne correspond plus (`samples_seen` reparti à 0).
+/// Accepté ici — le modèle réapprend en quelques centaines d'interactions
+/// réelles, et un tableau de poids à la mauvaise taille n'a de toute façon
+/// aucun sens à réutiliser tel quel.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-const N_FEATURES: usize = 14;
+pub const N_FEATURES: usize = 15;
 const MODEL_PATH: &str = "data/ctr_model.json";
 
 /// CTR de référence avant tout entraînement — cohérent avec le prior de
@@ -60,6 +67,9 @@ impl Default for CtrModel {
                 0.03,  // log(author_followers) / 20
                 0.05,  // is_recent (< 2h)
                 0.07,  // engagement_acceleration
+                0.03,  // activité du LECTEUR (engagement_velocity/20, clampé) —
+                       // seule feature qui décrit qui regarde, pas ce qui est
+                       // regardé ; prior faible tant qu'elle n'a pas appris
             ],
             bias: -2.5867, // logit(PRIOR_CTR) — au lieu d'un -0.5 arbitraire qui prédisait ~38 % de CTR à froid
             learning_rate: 0.01,
@@ -114,7 +124,13 @@ impl CtrModel {
     }
 }
 
-/// Extrait le vecteur de features depuis les scores et métadonnées du tweet
+/// Extrait le vecteur de features depuis les scores et métadonnées du tweet.
+///
+/// `reader_engagement` est la seule feature qui décrit qui regarde plutôt que
+/// ce qui est regardé — jusqu'ici ce modèle apprenait « quel tweet clique en
+/// général », un même prior de clic pour tout le monde, quel que soit le
+/// lecteur. Normalisée en amont (voir `crate::algorithm::scoring::ctr_feature_vector`).
+#[allow(clippy::too_many_arguments)]
 pub fn extract_features(
     d1: f64,
     d2: f64,
@@ -129,6 +145,7 @@ pub fn extract_features(
     has_media: bool,
     author_followers: i64,
     acceleration: f64,
+    reader_engagement: f64,
 ) -> [f64; N_FEATURES] {
     [
         d1,
@@ -145,6 +162,7 @@ pub fn extract_features(
         (author_followers as f64 + 1.0).ln() / 20.0, // log-followers normalisé
         if age_h < 2.0 { 1.0 } else { 0.0 },         // is_recent
         acceleration.clamp(0.0, 1.0),
+        reader_engagement.clamp(0.0, 1.0),
     ]
 }
 
@@ -236,7 +254,7 @@ mod tests {
     fn test_predict_range() {
         let model = CtrModel::default();
         let features = extract_features(
-            0.8, 0.7, 0.6, 0.5, 0.5, 0.7, 0.6, 0.4, 1.0, true, true, 10000, 0.8,
+            0.8, 0.7, 0.6, 0.5, 0.5, 0.7, 0.6, 0.4, 1.0, true, true, 10000, 0.8, 0.5,
         );
         let p = model.predict(&features);
         assert!(p >= 0.0 && p <= 1.0, "CTR prediction out of range: {p}");
@@ -246,7 +264,7 @@ mod tests {
     fn test_learning_improves_high_engagement() {
         let mut model = CtrModel::default();
         let high_eng = extract_features(
-            0.9, 0.8, 0.7, 0.6, 0.6, 0.8, 0.7, 0.5, 0.5, true, true, 50000, 0.9,
+            0.9, 0.8, 0.7, 0.6, 0.6, 0.8, 0.7, 0.5, 0.5, true, true, 50000, 0.9, 0.5,
         );
         let initial_pred = model.predict(&high_eng);
 
@@ -265,7 +283,7 @@ mod tests {
     fn test_sgd_update_direction() {
         let mut model = CtrModel::default();
         let features = extract_features(
-            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 1000, 0.5,
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 1000, 0.5, 0.5,
         );
         let before = model.predict(&features);
         model.update(&features, true); // clicked → should increase
