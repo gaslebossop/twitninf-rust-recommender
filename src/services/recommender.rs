@@ -259,6 +259,8 @@ impl RecommenderService {
 
         self.hydrate_semantic_candidates(&req.user_id, &profile, &mut sources, &banned_set)
             .await;
+        self.hydrate_cooccurrence_candidates(&profile, &mut sources, &banned_set)
+            .await;
 
         let total_candidates = sources.len();
         debug!(
@@ -1383,6 +1385,72 @@ impl RecommenderService {
         count
     }
 
+    /// Candidats trouvés par co-occurrence — voir `crate::cooccurrence`.
+    /// Même prudence que la source sémantique : un compte qui n'a encore
+    /// aucun auteur favori (`top_authors` vide, compte tout neuf) obtient
+    /// simplement zéro candidat de cette source, jamais une erreur.
+    async fn hydrate_cooccurrence_candidates(
+        &self,
+        profile: &UserProfile,
+        tweets: &mut Vec<RawTweet>,
+        banned_set: &std::collections::HashSet<String>,
+    ) -> usize {
+        if profile.top_authors.is_empty() {
+            return 0;
+        }
+        let seeds: Vec<String> = profile
+            .top_authors
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        let co_authors = self.cache.co_liked_authors(&seeds, 15).await;
+        if co_authors.is_empty() {
+            return 0;
+        }
+
+        let known: HashSet<String> = tweets.iter().map(|t| t.id.clone()).collect();
+        let author_uuids: Vec<uuid::Uuid> = co_authors
+            .iter()
+            .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+            .collect();
+        if author_uuids.is_empty() {
+            return 0;
+        }
+
+        let Ok(uid) = uuid::Uuid::parse_str(&profile.user_id) else {
+            return 0;
+        };
+        let banned_uuids: Vec<uuid::Uuid> = banned_set
+            .iter()
+            .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+            .collect();
+
+        let client = match self.pg.get().await {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let rows = match client
+            .query(COOCCUR_SQL.as_str(), &[&uid, &author_uuids, &banned_uuids])
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(user_id = %profile.user_id, error = %e, "Hydratation par co-occurrence échouée");
+                return 0;
+            }
+        };
+        let added: Vec<RawTweet> = map_rows(rows)
+            .into_iter()
+            .filter(|t| !known.contains(&t.id))
+            .collect();
+        let count = added.len();
+        if count > 0 {
+            debug!(user_id = %profile.user_id, count, "Candidats par co-occurrence ajoutés");
+        }
+        tweets.extend(added);
+        count
+    }
+
     async fn count_available(&self, user_id: &str) -> Result<i64> {
         let client = self.pg.get().await?;
         let uid = uuid::Uuid::parse_str(user_id)?;
@@ -1750,6 +1818,37 @@ WITH picked AS (
 )
 "#;
 
+/// Hydrate les auteurs renvoyés par `CacheManager::co_liked_authors` — voir
+/// `crate::cooccurrence`. Contrairement à `SEMANTIC_CTE` (des tweets
+/// précis), on reçoit ici des AUTEURS : on prend leurs quelques tweets les
+/// plus récents chacun (`ROW_NUMBER() OVER (PARTITION BY ...)`), pas
+/// « tout ce qu'ils ont publié ». Poids légèrement sous le sémantique :
+/// c'est un signal agrégé sur d'autres lecteurs, un cran plus indirect que
+/// « ce tweet précis ressemble à ce que TU aimes ».
+///
+/// Paramètres : $1 lecteur (inutilisé, gardé pour la même forme que les
+/// autres CTE) · $2 identifiants d'auteurs co-aimés · $3 hard_banned[]
+const COOCCUR_CTE: &str = r#"
+WITH ranked AS (
+    SELECT t.id, t.user_id,
+           ROW_NUMBER() OVER (PARTITION BY t.user_id ORDER BY t.created_at DESC) AS rn
+    FROM tweets t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.user_id = ANY($2)
+      AND t.deleted_at IS NULL
+      AND t.moderation_status = 'approved'
+      AND t.is_private = false
+      AND COALESCE(t.is_data_test, false) = false
+      AND u.is_active = true
+      AND COALESCE(u.is_suspended, false) = false
+      AND NOT (t.user_id = ANY($3))
+      AND t.created_at > NOW() - INTERVAL '7 days'
+),
+picked AS (
+    SELECT id, 4 AS src, 0.12::float8 AS w FROM ranked WHERE rn <= 3
+)
+"#;
+
 /// Les requêtes complètes, assemblées une fois pour toutes.
 ///
 /// `concat!` ne sait pas coller des constantes, et refaire le `format!` à
@@ -1760,6 +1859,8 @@ static PARENTS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{PARENTS_CTE}{PROJECTION_SQL}"));
 static SEMANTIC_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{SEMANTIC_CTE}{PROJECTION_SQL}"));
+static COOCCUR_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{COOCCUR_CTE}{PROJECTION_SQL}"));
 
 // ─── Mapping rows → RawTweet ──────────────────────────────────────────────────
 

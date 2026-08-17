@@ -4,6 +4,7 @@ mod algorithm;
 mod bandit;
 mod config;
 mod constants;
+mod cooccurrence;
 mod embeddings;
 mod experiments;
 mod handlers;

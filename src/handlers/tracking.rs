@@ -222,6 +222,21 @@ pub async fn track_handler(
         }
     }
 
+    // ── Filtrage collaboratif léger ────────────────────────────────────
+    // Uniquement sur un LIKE, pas sur tout signal positif : c'est le geste
+    // le plus intentionnel, celui qui ressemble le moins à un survol. Voir
+    // `crate::cooccurrence`.
+    if req.interaction_type == crate::models::InteractionType::Like {
+        if let Some(author_id) = req.author_id.as_deref() {
+            if uuid::Uuid::parse_str(author_id).is_ok() {
+                state
+                    .cache
+                    .record_like_cooccurrence(&req.user_id, author_id)
+                    .await;
+            }
+        }
+    }
+
     info!(
         user_id = %req.user_id,
         tweet_id = %req.tweet_id,
