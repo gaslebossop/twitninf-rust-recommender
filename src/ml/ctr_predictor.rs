@@ -8,11 +8,12 @@
 /// Convergence typique : ~500 interactions, gain CTR : +1.5-2%
 ///
 /// ⚠ Changer `N_FEATURES` change la forme du tableau persisté
-/// (`data/ctr_model.json`) : `load_or_default` retombe silencieusement sur un
-/// modèle neuf si la taille ne correspond plus (`samples_seen` reparti à 0).
-/// Accepté ici — le modèle réapprend en quelques centaines d'interactions
-/// réelles, et un tableau de poids à la mauvaise taille n'a de toute façon
-/// aucun sens à réutiliser tel quel.
+/// (`data/ctr_model.json`). `load_or_default` migre automatiquement un modèle
+/// dont `weights` est plus court (voir `migrate_legacy_weights`) : les poids
+/// appris et `samples_seen` sont conservés, seul(s) le/les nouveau(x) poids
+/// sont seedé(s) à leur valeur par défaut. Un tableau plus LONG que
+/// `N_FEATURES` (retour en arrière du code) reste, lui, un modèle neuf — pas
+/// de sens à deviner quelle feature a disparu.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -187,7 +188,18 @@ impl CtrPredictor {
                         );
                         return Self(Arc::new(RwLock::new(model)));
                     }
-                    Err(e) => warn!("Failed to parse CTR model: {e}, using default"),
+                    Err(e) => match migrate_legacy_weights(&json) {
+                        Some(model) => {
+                            info!(
+                                samples = model.samples_seen,
+                                global_ctr = model.global_ctr(),
+                                "CTR model migrated from a shorter feature vector — \
+                                 learned weights kept, new feature(s) seeded at their default"
+                            );
+                            return Self(Arc::new(RwLock::new(model)));
+                        }
+                        None => warn!("Failed to parse CTR model: {e}, using default"),
+                    },
                 },
                 Err(e) => warn!("Failed to read CTR model: {e}, using default"),
             }
@@ -246,6 +258,30 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x.clamp(-20.0, 20.0)).exp())
 }
 
+/// Complète un modèle persisté dont le vecteur `weights` est plus court que
+/// `N_FEATURES` (schéma enrichi depuis la sauvegarde), au lieu de le jeter.
+///
+/// `bias`, `samples_seen`, `total_clicks`, `total_views` et les poids déjà
+/// appris restent intacts ; seuls les poids manquants sont seedés à leur
+/// valeur par défaut. Sans ça, chaque élargissement du vecteur de features
+/// remettrait l'entraînement à zéro — ici ça representait 43 751 samples
+/// perdus au moment où `reader_engagement` (feature #15) a été ajoutée.
+fn migrate_legacy_weights(json: &str) -> Option<CtrModel> {
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let obj = value.as_object_mut()?;
+    let old_weights = obj.get("weights")?.as_array()?.clone();
+    if old_weights.is_empty() || old_weights.len() >= N_FEATURES {
+        return None;
+    }
+    let defaults = CtrModel::default().weights;
+    let mut padded = old_weights;
+    for w in defaults.iter().skip(padded.len()) {
+        padded.push(serde_json::json!(w));
+    }
+    obj.insert("weights".to_string(), serde_json::Value::Array(padded));
+    serde_json::from_value(value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +313,34 @@ mod tests {
             trained_pred > initial_pred,
             "Model should learn to predict high CTR"
         );
+    }
+
+    #[test]
+    fn migration_garde_les_poids_appris_et_seed_le_reste_au_defaut() {
+        let legacy = serde_json::json!({
+            "weights": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+            "bias": -1.2345,
+            "learning_rate": 0.01,
+            "samples_seen": 43751,
+            "total_clicks": 900,
+            "total_views": 43751,
+        });
+        let migrated =
+            migrate_legacy_weights(&legacy.to_string()).expect("14 poids doit migrer vers 15");
+        assert_eq!(migrated.weights.len(), N_FEATURES);
+        assert_eq!(
+            &migrated.weights[0..14],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]
+        );
+        assert_eq!(migrated.weights[14], CtrModel::default().weights[14]);
+        assert_eq!(migrated.samples_seen, 43751);
+        assert_eq!(migrated.bias, -1.2345);
+    }
+
+    #[test]
+    fn migration_refuse_un_vecteur_deja_a_la_bonne_taille() {
+        let current = serde_json::to_string(&CtrModel::default()).unwrap();
+        assert!(migrate_legacy_weights(&current).is_none());
     }
 
     #[test]
