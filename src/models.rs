@@ -36,6 +36,18 @@ pub struct TrackInteractionRequest {
     pub tweet_id: String,  // UUID
     pub interaction_type: InteractionType,
     pub dwell_ms: Option<u32>,
+    /// Nature du contenu regardé, pour interpréter `dwell_ms`.
+    ///
+    /// Un temps brut est confondu avec la LONGUEUR du contenu — voir
+    /// `algorithm::dwell`. Ces trois champs permettent de le rapporter au temps
+    /// que ce contenu-là demandait. Tous facultatifs : un client qui ne les
+    /// envoie pas retombe sur l'ancien calcul par paliers bruts.
+    pub dwell_media: Option<crate::algorithm::dwell::DwellMedia>,
+    pub content_chars: Option<u32>,
+    pub video_duration_ms: Option<u32>,
+    /// Auteur du tweet — nécessaire pour qu'un « ça ne m'intéresse pas » porte
+    /// sur le compte et pas seulement sur le tweet refusé (voir `track_handler`).
+    pub author_id: Option<String>,
     /// Indices renvoyés avec le tweet. Facultatifs pour rester compatible avec
     /// les anciens clients ; le moteur retombe alors sur l'affectation stockée.
     pub experiment_id: Option<String>,
@@ -47,6 +59,13 @@ pub struct TrackInteractionRequest {
 pub enum InteractionType {
     Like, Unlike, Comment, Retweet, Unretweet,
     Share, View, Bookmark, ProfileView, Skip, Report, Block,
+    /// Réponse explicite à la question posée dans le fil (« ça t'intéresse ? »).
+    ///
+    /// Distinct d'un like : on ne déclare pas aimer le tweet, on déclare vouloir
+    /// — ou ne plus vouloir — ce GENRE de contenu. `NotInterested` pèse donc
+    /// nettement plus lourd qu'un `Skip` constaté au chronomètre, et déclenche
+    /// en plus une mise en sourdine de l'auteur (voir `track_handler`).
+    Interested, NotInterested,
 }
 
 impl InteractionType {
@@ -64,6 +83,11 @@ impl InteractionType {
             InteractionType::Skip        => -0.5,
             InteractionType::Report      => -12.0,
             InteractionType::Block       => -20.0,
+            // Déclaré à la main, en réponse à une question directe : ça vaut
+            // plus qu'un geste deviné, moins qu'un signalement (qui vise le
+            // contenu lui-même, pas le goût du lecteur).
+            InteractionType::Interested    =>  3.0,
+            InteractionType::NotInterested => -8.0,
         }
     }
 
@@ -85,12 +109,14 @@ impl InteractionType {
             | InteractionType::Retweet
             | InteractionType::Share
             | InteractionType::Bookmark
+            | InteractionType::Interested
             | InteractionType::ProfileView => Some(true),
 
             InteractionType::Skip
             | InteractionType::Report
             | InteractionType::Block
             | InteractionType::Unlike
+            | InteractionType::NotInterested
             | InteractionType::Unretweet => Some(false),
 
             InteractionType::View => None,
@@ -139,6 +165,14 @@ pub struct UserProfile {
     pub lifetime_value: f64,
 
     pub seen_tweet_ids: Vec<String>,
+
+    /// Auteurs que CE lecteur a explicitement refusés → nombre de refus.
+    ///
+    /// Vient du set Redis `twitninf:damped:<user>`, alimenté par les réponses
+    /// « ça ne m'intéresse pas ». Porté par le profil (et non relu à chaque
+    /// tweet) pour rester à un aller Redis par recommandation.
+    #[serde(default)]
+    pub damped_authors: std::collections::HashMap<String, f64>,
 
     pub user_type: UserType,
     pub profile_confidence: f64,

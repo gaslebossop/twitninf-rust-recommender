@@ -3,26 +3,25 @@ use std::time::Instant;
 
 use anyhow::Result;
 use deadpool_postgres::Pool as PgPool;
+use rand::Rng;
 use tokio::join;
 use tracing::{info, warn, debug, trace};
 
-use crate::algorithm::scoring::{compute_feed_metrics, score_tweet_ml_with_weights};
+use crate::algorithm::scoring::{compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights};
 use crate::algorithm::trending::trending_score;
 use crate::bandit::bandit_select;
 use crate::constants::{
-    COLD_START_FOLLOW_BOOST_MAX, COLD_START_INTERACTION_FLOOR, FOLLOW_FEED_BOOST,
-    FOLLOW_MUTUAL_BOOST,
+    COLD_START_FOLLOW_BOOST_MAX, COLD_START_INTERACTION_FLOOR, EXCLUDE_SEEN_MIN_REMAINING,
+    FOLLOW_FEED_BOOST, FOLLOW_MUTUAL_BOOST, TRENDING_HOOK_POOL, TRENDING_HOOK_SIZE,
+    TRENDING_HOOK_TEMPERATURE, TRENDING_MEDIA_BOOST, TRENDING_MIN_POOL,
+    TRENDING_SHUFFLE_TEMPERATURE, TRENDING_WIDEN_FACTOR,
 };
 use crate::experiments;
 use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
-use crate::shadowban::GarbageContentDetector;
-
-/// Seuil dur de filtration : au-dessus, un tweet d'un auteur non suivi est
-/// retiré du feed avant scoring (le reste est seulement pénalisé via Mod E).
-const GARBAGE_HARD_DROP: f64 = 0.60;
+use crate::shadowban::{content_eligibility, GarbageContentDetector, ShadowbanEnforcer};
 
 /// Convertit un vecteur de features sérialisé en tableau de taille fixe.
 /// Rejette toute taille inattendue : un vecteur tronqué décalerait chaque
@@ -232,7 +231,10 @@ impl RecommenderService {
                 if seen.insert(t.user_id.clone()) { Some(t.user_id.clone()) } else { None }
             }).collect()
         };
-        let shadowban_levels = self.cache.admin_load_shadowban_levels(&author_ids).await;
+        // Décision manuelle ET niveau dérivé des avertissements, en deux MGET
+        // pour tout le pool (voir `shadowban/store.rs`). L'ancienne lecture
+        // faisait un aller-retour Redis par auteur, en série.
+        let shadowban_levels = self.cache.shadowban_load_levels(&author_ids).await;
         if !shadowban_levels.is_empty() {
             debug!(count = shadowban_levels.len(), "Shadowban levels loaded from Redis");
             for tweet in deduped.iter_mut() {
@@ -257,6 +259,33 @@ impl RecommenderService {
                 floor = crate::algorithm::d9_llm_understanding::MIN_QUALITY,
                 "Low-quality tweets excluded from recommendations"
             );
+        }
+
+        // ── Déjà vu : ne pas resservir la journée d'hier ────────────────────────
+        // `exclude_seen` était déclaré dans `RecommendRequest` et lu NULLE PART —
+        // de la plomberie morte, comme `force_refresh` avant lui. Or c'est le
+        // levier qui décide si une page de découverte vaut la peine d'être
+        // rouverte demain : sans lui, revenir donne la même page, et la seule
+        // fraîcheur possible vient de ce qui a été publié entre-temps.
+        //
+        // La liste vient du set Redis `twitninf:seen:<user>` (TTL 24 h, rafraîchi
+        // à chaque marquage) : c'est donc « ce que j'ai vu aujourd'hui », pas un
+        // historique définitif — un bon tweet redevient éligible le lendemain.
+        //
+        // Filtrage abandonné s'il ne laisse pas de quoi remplir la page : voir
+        // `EXCLUDE_SEEN_MIN_REMAINING`.
+        if req.exclude_seen.unwrap_or(false) && !profile.seen_tweet_ids.is_empty() {
+            let seen: HashSet<&str> = profile.seen_tweet_ids.iter().map(|s| s.as_str()).collect();
+            let remaining = deduped.iter().filter(|t| !seen.contains(t.id.as_str())).count();
+            if remaining >= EXCLUDE_SEEN_MIN_REMAINING {
+                let before = deduped.len();
+                deduped.retain(|t| !seen.contains(t.id.as_str()));
+                debug!(dropped = before - deduped.len(), remaining = deduped.len(),
+                       "Already-seen tweets excluded");
+            } else {
+                debug!(remaining, floor = EXCLUDE_SEEN_MIN_REMAINING,
+                       "Already-seen filter skipped: would leave too few candidates");
+            }
         }
 
         // ── Charger les poids actifs (admin override > auto-tuner > defaults) ────
@@ -386,20 +415,46 @@ impl RecommenderService {
         // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
         let use_ml = ctr_samples >= 200;
         let detector = GarbageContentDetector::new();
+        let enforcer = ShadowbanEnforcer::new();
         let mut dropped_garbage = 0usize;
         trace!(mode = ?mode, use_ml, ctr_samples, "Scoring all tweets with mode adjustments");
 
         for (idx, tweet) in tweets.iter().enumerate() {
-            // ── Filtration dure : retirer le pur spam des auteurs non suivis ──────
-            // On épargne les comptes suivis pour ne jamais masquer un abonnement,
-            // même si un de ses tweets est bruité.
-            if !profile.following_ids.contains(&tweet.user_id) {
-                let g = detector.detect(tweet).score();
-                if g >= GARBAGE_HARD_DROP {
-                    dropped_garbage += 1;
-                    trace!(tweet_id = %tweet.id, garbage = g, "Hard-dropped garbage candidate");
-                    continue;
-                }
+            // ── Admission par surface ────────────────────────────────────────────
+            //
+            // Deux verdicts distincts, appliqués ensemble : l'éligibilité de CE
+            // post, et le niveau de restriction de son AUTEUR. Le premier tombe
+            // sur du spam isolé publié par un compte sain, le second sur un compte
+            // qui accumule les avertissements — les confondre revenait à ne
+            // traiter correctement ni l'un ni l'autre.
+            //
+            // Ce qui change par rapport au filtre précédent :
+            //
+            // - Le seuil ne retire plus le tweet du pipeline entier, seulement des
+            //   surfaces où l'on POUSSE du contenu vers des gens qui n'ont rien
+            //   demandé. Un abonné voit toujours ce que publie le compte qu'il
+            //   suit, quel qu'en soit l'état — c'est l'invariant de `admit()`.
+            // - Le niveau de compte ferme enfin les surfaces pour de bon.
+            //   `excludes_trending()` existait déjà mais n'était appelé nulle
+            //   part : un compte `Ghosted` n'était que rétrogradé (×0,05), donc
+            //   toujours capable d'atteindre les Tendances avec un pic
+            //   d'engagement suffisant.
+            let follows_author = profile.following_ids.contains(&tweet.user_id);
+            let surface = ShadowbanEnforcer::effective_surface(tweet, mode, follows_author);
+            let signals = detector.detect(tweet);
+            let eligibility = content_eligibility(tweet, &signals);
+            let verdict = enforcer.admit(
+                tweet.author_shadowban_level,
+                eligibility,
+                surface,
+                follows_author,
+            );
+            if !verdict.allowed {
+                dropped_garbage += 1;
+                trace!(tweet_id = %tweet.id, surface = surface.label(),
+                       blocked_by = verdict.blocked_by.unwrap_or("unknown"),
+                       "Écarté de cette surface (reste visible des abonnés)");
+                continue;
             }
 
             let ac = *author_count.get(&tweet.user_id).unwrap_or(&0);
@@ -415,8 +470,29 @@ impl RecommenderService {
             match mode {
                 RecommendMode::Trending => {
                     let ts = trending_score(tweet);
-                    s.score = (s.score * 0.40 + ts * 0.60).clamp(0.0, 1.0);
-                    trace!(tweet_id = %tweet.id, base_score, trending_score = ts, final_score = s.score, "Trending mode: blended 40% base + 60% trending");
+                    let mut blended = s.score * 0.40 + ts * 0.60;
+
+                    // ── Fatigue d'exposition, appliquée APRÈS le mélange ──────
+                    // `impression_fatigue` est déjà comptée dans le score de
+                    // base, mais elle ne pesait donc que sur ses 40 % : les
+                    // 60 % de vélocité ignoraient totalement le fait que CE
+                    // lecteur a déjà vu ce tweet passer. Un tweet très partagé
+                    // restait donc en tête de la grille visite après visite,
+                    // alors que le premier rôle d'une page de découverte est de
+                    // montrer autre chose que la dernière fois.
+                    let fatigue = impression_fatigue(tweet.viewer_impressions);
+                    blended *= fatigue;
+
+                    // Un tweet illustré est ce qu'une grille sait le mieux
+                    // montrer — voir `TRENDING_MEDIA_BOOST`.
+                    if tweet.has_media {
+                        blended *= TRENDING_MEDIA_BOOST;
+                    }
+
+                    s.score = blended.clamp(0.0, 1.0);
+                    trace!(tweet_id = %tweet.id, base_score, trending_score = ts, fatigue,
+                           has_media = tweet.has_media, final_score = s.score,
+                           "Trending mode: 40% base + 60% trending, fatigue et média appliqués");
                 }
                 RecommendMode::Discover => {
                     let mut multiplier = 1.0;
@@ -443,6 +519,26 @@ impl RecommenderService {
                 }
             }
 
+            // ── Réponse explicite : « ça ne m'intéresse pas » ─────────────────
+            // Appliqué APRÈS l'ajustement de mode, et à tous les modes : une
+            // réponse donnée à la main n'a pas à être rejouée différemment
+            // selon l'onglet où on se trouve.
+            //
+            // Porte sur l'AUTEUR, pas sur le seul tweet refusé. Mesuré par
+            // Mozilla sur YouTube : le bouton « pas intéressé » n'évite que
+            // ~11 % des recommandations non voulues, quand « ne plus
+            // recommander cette chaîne » en évite 43 %. Écarter un tweet parmi
+            // les mille du même compte ne change rien de perceptible, et
+            // l'utilisateur en conclut — à raison — que le bouton est décoratif.
+            if !profile.damped_authors.is_empty() {
+                if let Some(&strikes) = profile.damped_authors.get(&tweet.user_id) {
+                    let damping = author_damping(strikes);
+                    s.score *= damping;
+                    trace!(tweet_id = %tweet.id, author = %tweet.user_id, strikes, damping,
+                           "Author damped by explicit disinterest");
+                }
+            }
+
             if idx < 3 {
                 trace!(idx, tweet_id = %tweet.id, base_score, final_score = s.score, "Sample scored tweet");
             }
@@ -452,7 +548,8 @@ impl RecommenderService {
         }
 
         if dropped_garbage > 0 {
-            debug!(dropped_garbage, kept = scored_feed.len(), "Garbage hard-filter applied");
+            debug!(dropped = dropped_garbage, kept = scored_feed.len(), mode = ?mode,
+                   "Filtre d'admission par surface appliqué");
         }
 
         debug!("Sorting {} scored tweets by final score...", scored_feed.len());
@@ -463,8 +560,25 @@ impl RecommenderService {
         let top_scores: Vec<_> = scored_feed.iter().take(3).map(|s| (&s.tweet_id, s.score)).collect();
         debug!("Top 3 final scores: {:?}", top_scores);
 
+        // Trending seul : réordonnancement aléatoire pondéré par score (Gumbel-max),
+        // tiré à neuf à CHAQUE appel de `score_all` — donc à chaque calcul non
+        // servi depuis le cache Rust (recompute déclenché par `force_refresh` ou
+        // expiration du TTL). `.score` n'est jamais modifié : seul l'ORDRE de
+        // `scored_feed` change, tout le reste du pipeline (métriques, logs,
+        // impressions CTR) continue de voir les vrais scores calculés.
+        //
+        // Les autres modes gardent le tri strict + bandit ci-dessous : Trending
+        // ne passe jamais par le bandit (personnalisé par construction, sans
+        // rapport avec « ce qui prend de l'ampleur en ce moment »).
+        if *mode == RecommendMode::Trending {
+            scored_feed = trending_draw(scored_feed);
+            let shuffled_top: Vec<_> = scored_feed.iter().take(3).map(|s| (&s.tweet_id, s.score)).collect();
+            debug!("Trending: two-temperature draw applied, new top 3: {:?}", shuffled_top);
+        }
+
         // Phase 3: Contextual Bandit — réorganise le feed (80% exploit / 20% explore)
-        // Seulement en mode ForYou/Feed, pas en Trending (déjà ordonné par trending score)
+        // Seulement en mode ForYou/Feed, pas en Trending (qui a son propre
+        // réordonnancement aléatoire ci-dessus)
         if matches!(mode, RecommendMode::ForYou | RecommendMode::Feed) {
             let selection = bandit_select(&scored_feed, tweets, profile, scored_feed.len());
             debug!(
@@ -641,6 +755,10 @@ impl RecommenderService {
             trace!(liked_tweets_count = profile.liked_tweet_ids.len(), "Liked tweet history loaded");
         }
         profile.seen_tweet_ids = self.cache.get_seen_tweet_ids(user_id).await;
+        profile.damped_authors = self.cache.get_damped_authors(user_id).await;
+        if !profile.damped_authors.is_empty() {
+            debug!(user_id, authors = profile.damped_authors.len(), "Damped authors loaded");
+        }
 
         if let Ok(rows) = retweeted_res {
             // Sans ces ids, `profile_retweet_rate` valait 0/N = 0 dans D5 et le
@@ -742,21 +860,53 @@ impl RecommenderService {
             .collect();
 
         let client = self.pg.get().await?;
-        let rows = client.query(CANDIDATES_SQL.as_str(), &[
-            &uid,                 // $1
-            &following_uuids,     // $2
-            &top_author_uuids,    // $3
-            &banned_uuids,        // $4
-            &window_trending,     // $5
-            &window_social,       // $6
-            &window_discover,     // $7
-            &window_viral,        // $8
-            &horizon,             // $9
-            &active_hour,         // $10
-            &MAX_CANDIDATES_PER_AUTHOR, // $11
-        ]).await?;
 
-        let all = map_rows(rows);
+        // ── Fenêtres élargies si le vivier est trop maigre ───────────────────
+        // Les fenêtres courtes de Trending (6 h) supposent un flux de
+        // publication soutenu. Quand il ne l'est pas, elles ne contiennent
+        // presque rien : la page de découverte affiche la même poignée de
+        // tweets toute la journée, et il n'y a aucune raison d'y revenir. On
+        // retente alors UNE fois, plus large — un aller de plus en base
+        // seulement dans ce cas, jamais sur le chemin nominal.
+        //
+        // Les autres modes n'ont qu'une tentative : leurs fenêtres sont déjà
+        // larges, et c'est Trending qui porte la page de découverte.
+        let mut attempts: Vec<(i32, i32, i32, i32)> = vec![
+            (window_trending, window_social, window_discover, window_viral),
+        ];
+        if *mode == RecommendMode::Trending {
+            attempts.push((
+                window_trending * TRENDING_WIDEN_FACTOR,
+                window_social * TRENDING_WIDEN_FACTOR,
+                window_discover,
+                window_viral * TRENDING_WIDEN_FACTOR,
+            ));
+        }
+
+        let mut all = Vec::new();
+        for (attempt, (wt, ws, wd, wv)) in attempts.into_iter().enumerate() {
+            let attempt_horizon = wt.max(ws).max(wd).max(wv).max(horizon);
+            let rows = client.query(CANDIDATES_SQL.as_str(), &[
+                &uid,                 // $1
+                &following_uuids,     // $2
+                &top_author_uuids,    // $3
+                &banned_uuids,        // $4
+                &wt,                  // $5
+                &ws,                  // $6
+                &wd,                  // $7
+                &wv,                  // $8
+                &attempt_horizon,     // $9
+                &active_hour,         // $10
+                &MAX_CANDIDATES_PER_AUTHOR, // $11
+            ]).await?;
+
+            all = map_rows(rows);
+            if all.len() >= TRENDING_MIN_POOL {
+                break;
+            }
+            debug!(attempt, candidates = all.len(), floor = TRENDING_MIN_POOL,
+                   "Candidate pool below floor");
+        }
 
         let mut stats = SourceStats::default();
         for tweet in &all {
@@ -1220,6 +1370,85 @@ fn apply_follow_boost(score: f64, tweet: &RawTweet, profile: &UserProfile, mode:
     }
 
     (score * boost).min(1.0)
+}
+
+/// Multiplicateur de score d'un auteur explicitement refusé par le lecteur.
+///
+/// Décroissance géométrique plutôt qu'un bannissement sec : un refus unique
+/// peut viser CE tweet-là plus que le compte (on tombe sur un sujet qui
+/// n'intéresse pas, d'un auteur qu'on lit par ailleurs). Un premier « non »
+/// divise donc la visibilité par ~3, et trois « non » l'effacent à peu près —
+/// ce qui reste réversible, puisque le compteur expire (30 jours).
+///
+/// Jamais zéro : un score nul sortirait l'auteur de tout classement, y compris
+/// pour un tweet exceptionnel, et rendrait le refus indistinguable d'un blocage.
+fn author_damping(strikes: f64) -> f64 {
+    const PER_STRIKE: f64 = 0.32;
+    const FLOOR: f64 = 0.02;
+    PER_STRIKE.powf(strikes.max(0.0)).max(FLOOR)
+}
+
+/// Tirage du mode Trending : une température pour l'ouverture, une pour la suite.
+///
+/// Le mélange pondéré par score (Gumbel-max) évite qu'un rafraîchissement
+/// resserve exactement le même ordre. Mais avec une température UNIQUE, la
+/// position 1 est tirée aussi au hasard que la position 50 — or ces premières
+/// cartes décident si la personne continue ou repart. Une mauvaise ouverture
+/// tirée au sort gâche une page dont la suite était bonne.
+///
+/// D'où deux temps :
+///   * l'OUVERTURE (`TRENDING_HOOK_SIZE` cartes) est échantillonnée à
+///     température réduite dans le haut du classement (`TRENDING_HOOK_POOL`) —
+///     donc du contenu solide, mais pas la même sélection à chaque tirage ;
+///   * la SUITE reprend la température pleine, qui est ce qui rend le défilement
+///     imprévisible et donne sa chance à ce qui n'est pas en tête.
+///
+/// Les tweets du vivier non retenus pour l'ouverture ne sont pas relégués
+/// derrière la queue : ils la rejoignent et sont retirés avec elle.
+///
+/// `.score` n'est jamais modifié — seul l'ORDRE change.
+fn trending_draw(scored: Vec<ScoredTweet>) -> Vec<ScoredTweet> {
+    if scored.len() <= 1 {
+        return scored;
+    }
+    let mut rng = rand::thread_rng();
+
+    // Clé Gumbel-max : trier sur `ln(score) + bruit × température` équivaut à
+    // tirer sans remise proportionnellement au score. Température basse → colle
+    // au classement ; haute → s'en écarte.
+    let mut key_of = |score: f64, temperature: f64| -> f64 {
+        let u: f64 = rng.gen_range(1e-9..1.0 - 1e-9);
+        let gumbel_noise = -(-u.ln()).ln();
+        score.max(1e-9).ln() + gumbel_noise * temperature
+    };
+
+    // `scored` arrive trié par score décroissant : le vivier d'ouverture est
+    // simplement sa tête.
+    let pool_len = TRENDING_HOOK_POOL.min(scored.len());
+    let mut pool = scored;
+    let tail = pool.split_off(pool_len);
+
+    let mut keyed_pool: Vec<(f64, ScoredTweet)> = pool
+        .into_iter()
+        .map(|s| (key_of(s.score, TRENDING_HOOK_TEMPERATURE), s))
+        .collect();
+    keyed_pool.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let hook_len = TRENDING_HOOK_SIZE.min(keyed_pool.len());
+    let leftovers = keyed_pool.split_off(hook_len);
+    let hook: Vec<ScoredTweet> = keyed_pool.into_iter().map(|(_, s)| s).collect();
+
+    let mut rest: Vec<ScoredTweet> = leftovers.into_iter().map(|(_, s)| s).collect();
+    rest.extend(tail);
+    let mut keyed_rest: Vec<(f64, ScoredTweet)> = rest
+        .into_iter()
+        .map(|s| (key_of(s.score, TRENDING_SHUFFLE_TEMPERATURE), s))
+        .collect();
+    keyed_rest.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    hook.into_iter()
+        .chain(keyed_rest.into_iter().map(|(_, s)| s))
+        .collect()
 }
 
 fn map_rows(rows: Vec<tokio_postgres::Row>) -> Vec<RawTweet> {
@@ -2181,6 +2410,98 @@ mod tests {
             original_tweet_id: Some(original.to_string()),
             is_retweet: true,
             ..Default::default()
+        }
+    }
+
+    // ── Mise en sourdine d'un auteur refusé ──────────────────────────────────
+
+    #[test]
+    fn un_auteur_jamais_refuse_n_est_pas_touche() {
+        assert_eq!(author_damping(0.0), 1.0);
+    }
+
+    #[test]
+    fn un_refus_reduit_fortement_sans_effacer() {
+        let one = author_damping(1.0);
+        assert!(one < 0.4, "un refus doit se voir tout de suite : {one}");
+        assert!(one > 0.0, "mais jamais effacer l'auteur : {one}");
+    }
+
+    #[test]
+    fn les_refus_s_accumulent_et_gardent_un_plancher() {
+        let a = author_damping(1.0);
+        let b = author_damping(2.0);
+        let c = author_damping(3.0);
+        assert!(b < a && c < b, "chaque refus doit peser davantage : {a}, {b}, {c}");
+        for strikes in [5.0, 20.0, 1_000.0] {
+            let d = author_damping(strikes);
+            assert!(d > 0.0, "jamais zéro, sinon c'est un blocage : {d}");
+            assert!(d.is_finite());
+        }
+    }
+
+    // ── Tirage Trending à deux températures ──────────────────────────────────
+
+    /// `n` tweets de score strictement décroissant, comme `score_all` les rend.
+    fn ranked(n: usize) -> Vec<ScoredTweet> {
+        (0..n).map(|i| ScoredTweet {
+            tweet_id: format!("t{i:03}"),
+            score: 1.0 - (i as f64) * 0.001,
+            breakdown: Default::default(),
+            ctr_features: None,
+        }).collect()
+    }
+
+    #[test]
+    fn le_tirage_ne_perd_ni_ne_duplique_aucun_tweet() {
+        let input = ranked(120);
+        let expected: std::collections::HashSet<String> =
+            input.iter().map(|s| s.tweet_id.clone()).collect();
+
+        let out = trending_draw(input);
+
+        assert_eq!(out.len(), 120, "le tirage doit rendre autant de tweets qu'il en reçoit");
+        let got: std::collections::HashSet<String> = out.iter().map(|s| s.tweet_id.clone()).collect();
+        assert_eq!(got, expected, "aucun tweet ne doit apparaître ni disparaître");
+    }
+
+    #[test]
+    fn l_ouverture_est_toujours_tiree_dans_le_haut_du_classement() {
+        // Le tirage est aléatoire : on le répète pour ne pas valider un coup de
+        // chance. L'invariant, lui, doit tenir à chaque fois.
+        for _ in 0..40 {
+            let out = trending_draw(ranked(200));
+            for opening in out.iter().take(TRENDING_HOOK_SIZE) {
+                let rank: usize = opening.tweet_id[1..].parse().unwrap();
+                assert!(
+                    rank < TRENDING_HOOK_POOL,
+                    "une carte d'ouverture vient du rang {rank}, hors du vivier de tête"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deux_tirages_ne_donnent_pas_la_meme_ouverture() {
+        // Sans cette propriété on retombe sur le défaut d'origine : la même
+        // page à chaque rafraîchissement. Le test échoue si CENT tirages
+        // successifs rendent tous exactement la même ouverture.
+        let reference: Vec<String> = trending_draw(ranked(200))
+            .into_iter().take(TRENDING_HOOK_SIZE).map(|s| s.tweet_id).collect();
+
+        let varied = (0..100).any(|_| {
+            let draw: Vec<String> = trending_draw(ranked(200))
+                .into_iter().take(TRENDING_HOOK_SIZE).map(|s| s.tweet_id).collect();
+            draw != reference
+        });
+        assert!(varied, "l'ouverture doit changer d'un tirage à l'autre");
+    }
+
+    #[test]
+    fn un_lot_plus_petit_que_l_ouverture_ne_panique_pas() {
+        for n in 0..=3 {
+            let out = trending_draw(ranked(n));
+            assert_eq!(out.len(), n, "lot de {n} tweet(s)");
         }
     }
 

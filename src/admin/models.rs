@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::shadowban::ShadowbanLevel;
+use crate::shadowban::{ShadowbanLevel, StrikePolicy};
 
 // ─── Requêtes admin ───────────────────────────────────────────────────────────
 
@@ -9,6 +9,37 @@ pub struct SetShadowbanRequest {
     pub user_id: String,
     pub level: ShadowbanLevel,
     pub reason: Option<String>,
+    /// Durée de la décision, en jours. Absent = sans terme.
+    ///
+    /// Une restriction sans terme est presque toujours une restriction qu'on
+    /// oubliera de lever : les clés `admin:shadowban:*` n'avaient aucune
+    /// expiration, donc chaque décision prise ici durait indéfiniment. Préférer
+    /// une durée explicite, ou mieux, un avertissement (`/admin/strike`) qui
+    /// expire seul au bout de 90 jours.
+    #[serde(default)]
+    pub expires_in_days: Option<u32>,
+}
+
+/// Émission d'un avertissement daté.
+#[derive(Debug, Deserialize)]
+pub struct IssueStrikeRequest {
+    pub user_id: String,
+    pub policy: StrikePolicy,
+    /// Tweet à l'origine de l'avertissement — nécessaire pour qu'un recours
+    /// puisse le révoquer précisément.
+    #[serde(default)]
+    pub tweet_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Recours accepté : on retire les avertissements liés à un tweet, ou tous.
+#[derive(Debug, Deserialize)]
+pub struct RevokeStrikeRequest {
+    pub user_id: String,
+    /// Absent = on vide entièrement le registre du compte.
+    #[serde(default)]
+    pub tweet_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

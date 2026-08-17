@@ -1,17 +1,22 @@
 /// Admin store — opérations Redis pour la gestion des bans et shadowbans.
 ///
 /// Clés Redis :
-///   admin:shadowban:{user_id}        → niveau ("monitoring" | "suppressed" | "ghosted")
+///   admin:shadowban:{user_id}        → niveau ("monitoring" | "suppressed" | "ghosted"),
+///                                      avec TTL si la décision est temporaire
 ///   admin:shadowban:reason:{user_id} → raison (string optionnel)
 ///   admin:shadowban:users            → SET de tous les user_ids shadowbannis
 ///   admin:hardban:{user_id}          → "1"
 ///   admin:hardban:reason:{user_id}   → raison (string optionnel)
 ///   admin:hardban:users              → SET de tous les user_ids hard-banni
 ///   admin:algo:weights               → JSON des poids overridés manuellement
-use std::collections::{HashMap, HashSet};
+///
+/// La lecture par lot des niveaux vit dans `shadowban::store` : elle combine
+/// ces décisions manuelles avec le niveau dérivé du registre d'avertissements,
+/// et c'est ce chemin-là qui alimente le scoring.
+use std::collections::HashSet;
 
 use redis::AsyncCommands;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::services::cache_manager::CacheManager;
 use crate::shadowban::ShadowbanLevel;
@@ -21,11 +26,19 @@ use super::models::{AlgoWeights, BannedUser, ShadowbannedUser};
 impl CacheManager {
     // ─── Shadowban ────────────────────────────────────────────────────────────
 
+    /// Pose (ou lève) une décision manuelle de restriction.
+    ///
+    /// `expires_in_days` borne la décision dans le temps. Sans lui, la clé reste
+    /// jusqu'à ce que quelqu'un pense à la retirer — ce qui, en pratique, veut
+    /// dire jamais. Le chemin normal reste `shadowban_add_strike`, qui expire
+    /// tout seul au bout de 90 jours ; cette fonction sert aux décisions prises
+    /// en connaissance de cause.
     pub async fn admin_set_shadowban(
         &self,
         user_id: &str,
         level: ShadowbanLevel,
         reason: Option<&str>,
+        expires_in_days: Option<u32>,
     ) {
         let mut c = self.conn.lock().await;
 
@@ -37,68 +50,66 @@ impl CacheManager {
             debug!(user_id, "Shadowban cleared (Clean)");
         } else {
             let level_str = level.label();
-            let _: Result<(), _> = c.set(format!("admin:shadowban:{user_id}"), level_str).await;
-            if let Some(r) = reason {
-                let _: Result<(), _> = c.set(format!("admin:shadowban:reason:{user_id}"), r).await;
+            let key = format!("admin:shadowban:{user_id}");
+            let reason_key = format!("admin:shadowban:reason:{user_id}");
+            match expires_in_days {
+                Some(days) if days > 0 => {
+                    let ttl = days as u64 * 86_400;
+                    let _: Result<(), _> = c.set_ex(&key, level_str, ttl).await;
+                    if let Some(r) = reason {
+                        let _: Result<(), _> = c.set_ex(&reason_key, r, ttl).await;
+                    }
+                    debug!(user_id, level = level_str, days, "Shadowban set (temporaire)");
+                }
+                _ => {
+                    let _: Result<(), _> = c.set(&key, level_str).await;
+                    if let Some(r) = reason {
+                        let _: Result<(), _> = c.set(&reason_key, r).await;
+                    }
+                    debug!(user_id, level = level_str, "Shadowban set (sans terme)");
+                }
             }
             let _: Result<(), _> = c.sadd("admin:shadowban:users", user_id).await;
-            debug!(user_id, level = level_str, "Shadowban set");
         }
 
         // Invalider le cache de profil pour forcer un rechargement
         let _: Result<(), _> = c.del(format!("twitninf:profile:{user_id}")).await;
     }
 
+    /// Liste des comptes sous décision manuelle.
+    ///
+    /// Une décision temporaire expire côté clé de niveau mais laisse son
+    /// identifiant dans le SET d'index : sans élagage, la liste d'administration
+    /// afficherait indéfiniment des comptes qui ne sont plus restreints. On
+    /// nettoie donc au passage.
     pub async fn admin_get_shadowbanned_users(&self) -> Vec<ShadowbannedUser> {
         let mut c = self.conn.lock().await;
         let user_ids: HashSet<String> = c.smembers("admin:shadowban:users").await.unwrap_or_default();
         drop(c);
 
         let mut result = Vec::new();
+        let mut stale: Vec<String> = Vec::new();
         for uid in user_ids {
             let mut c2 = self.conn.lock().await;
             let level: Option<String> = c2.get(format!("admin:shadowban:{uid}")).await.ok().flatten();
             let reason: Option<String> = c2.get(format!("admin:shadowban:reason:{uid}")).await.ok().flatten();
             drop(c2);
 
-            if let Some(l) = level {
-                result.push(ShadowbannedUser { user_id: uid, level: l, reason });
+            match level {
+                Some(l) => result.push(ShadowbannedUser { user_id: uid, level: l, reason }),
+                None => stale.push(uid),
             }
+        }
+
+        if !stale.is_empty() {
+            let mut c3 = self.conn.lock().await;
+            for uid in &stale {
+                let _: Result<(), _> = c3.srem("admin:shadowban:users", uid).await;
+            }
+            drop(c3);
+            debug!(count = stale.len(), "Décisions manuelles expirées retirées de l'index");
         }
         result
-    }
-
-    /// Charge les niveaux de shadowban pour un batch de user_ids (lecture rapide)
-    pub async fn admin_load_shadowban_levels(
-        &self,
-        user_ids: &[String],
-    ) -> HashMap<String, ShadowbanLevel> {
-        if user_ids.is_empty() {
-            return HashMap::new();
-        }
-        let mut map = HashMap::new();
-        let mut c = self.conn.lock().await;
-
-        for uid in user_ids {
-            let key = format!("admin:shadowban:{uid}");
-            if let Ok(Some(val)) = c.get::<_, Option<String>>(&key).await {
-                let level = match val.as_str() {
-                    "monitoring"  => ShadowbanLevel::Monitoring,
-                    "suppressed"  => ShadowbanLevel::Suppressed,
-                    "ghosted"     => ShadowbanLevel::Ghosted,
-                    unknown => {
-                        // Données Redis corrompues ou valeur future inconnue.
-                        // On traite comme Suppressed par sécurité plutôt que Clean,
-                        // pour ne pas lever accidentellement un ban.
-                        error!(user_id = %uid, value = unknown,
-                               "Unknown shadowban level in Redis — defaulting to Suppressed");
-                        ShadowbanLevel::Suppressed
-                    }
-                };
-                map.insert(uid.clone(), level);
-            }
-        }
-        map
     }
 
     // ─── Hard ban ─────────────────────────────────────────────────────────────

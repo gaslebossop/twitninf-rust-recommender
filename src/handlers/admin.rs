@@ -12,7 +12,8 @@ use tracing::{info, warn};
 
 use crate::admin::{
     AdminActionResponse, AlgoStatsResponse, AlgoWeights, AlgoWeightsResponse, BanRequest,
-    FiltersResponse, SetShadowbanRequest, SetWeightsRequest, UnbanRequest,
+    FiltersResponse, IssueStrikeRequest, RevokeStrikeRequest, SetShadowbanRequest,
+    SetWeightsRequest, UnbanRequest,
 };
 use crate::handlers::AppState;
 
@@ -109,14 +110,107 @@ pub async fn admin_set_shadowban_handler(
     }
 
     let level_label = req.level.label();
-    state.cache.admin_set_shadowban(&req.user_id, req.level, req.reason.as_deref()).await;
+    state.cache
+        .admin_set_shadowban(&req.user_id, req.level, req.reason.as_deref(), req.expires_in_days)
+        .await;
 
-    info!(user_id = %req.user_id, level = level_label, "Admin: shadowban level set");
+    info!(user_id = %req.user_id, level = level_label,
+          expires_in_days = req.expires_in_days, "Admin: shadowban level set");
 
+    let terme = match req.expires_in_days {
+        Some(d) if d > 0 => format!(" for {d} day(s)"),
+        _ => " with no end date".to_string(),
+    };
     (StatusCode::OK, Json(json!(AdminActionResponse {
         success: true,
-        message: format!("User {} shadowban set to {}", req.user_id, level_label),
+        message: format!("User {} shadowban set to {}{}", req.user_id, level_label, terme),
     })))
+}
+
+// ─── POST /admin/strike ───────────────────────────────────────────────────────
+
+/// Émet un avertissement daté — le chemin normal, à préférer à `/admin/shadowban`.
+///
+/// La différence tient entièrement à l'expiration : un avertissement disparaît
+/// seul au bout de 90 jours et le compte remonte de lui-même, alors qu'un niveau
+/// posé à la main reste jusqu'à ce que quelqu'un pense à le retirer. Le niveau
+/// n'est pas choisi ici : il se déduit du nombre d'avertissements actifs dans le
+/// domaine concerné, avec des seuils propres à chaque domaine.
+pub async fn admin_issue_strike_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<IssueStrikeRequest>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    if uuid::Uuid::parse_str(&req.user_id).is_err() {
+        return (StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": "user_id must be a valid UUID" })));
+    }
+    if req.tweet_id.as_deref().is_some_and(|t| uuid::Uuid::parse_str(t).is_err()) {
+        return (StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": "tweet_id must be a valid UUID" })));
+    }
+    if let Err(e) = validate_reason(&req.reason) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "success": false, "error": e })));
+    }
+
+    let ledger = state.cache
+        .shadowban_add_strike(
+            &req.user_id,
+            req.policy,
+            req.tweet_id.as_deref(),
+            req.reason.as_deref(),
+        )
+        .await;
+    let status = ledger.status(chrono::Utc::now());
+
+    info!(user_id = %req.user_id, policy = req.policy.label(),
+          level = status.level_label, active = status.active_strikes,
+          "Admin: avertissement émis");
+
+    (StatusCode::OK, Json(json!({ "success": true, "data": status })))
+}
+
+// ─── POST /admin/strike/revoke ────────────────────────────────────────────────
+
+/// Recours accepté : retire les avertissements liés à un tweet, ou tous.
+///
+/// Retirer l'avertissement fait partie du recours, pas seulement rétablir le
+/// contenu : sans cela, gagner son recours ne répare que la moitié du dommage —
+/// le post revient mais le compte reste au même palier.
+pub async fn admin_revoke_strike_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<RevokeStrikeRequest>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    if uuid::Uuid::parse_str(&req.user_id).is_err() {
+        return (StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": "user_id must be a valid UUID" })));
+    }
+
+    match req.tweet_id.as_deref() {
+        Some(tweet_id) => {
+            if uuid::Uuid::parse_str(tweet_id).is_err() {
+                return (StatusCode::BAD_REQUEST,
+                    Json(json!({ "success": false, "error": "tweet_id must be a valid UUID" })));
+            }
+            let removed = state.cache
+                .shadowban_revoke_strikes_for_tweet(&req.user_id, tweet_id)
+                .await;
+            info!(user_id = %req.user_id, tweet_id, removed, "Admin: recours accepté");
+            let status = state.cache.shadowban_account_status(&req.user_id).await;
+            (StatusCode::OK, Json(json!({ "success": true, "removed": removed, "data": status })))
+        }
+        None => {
+            state.cache.shadowban_clear_strikes(&req.user_id).await;
+            info!(user_id = %req.user_id, "Admin: registre d'avertissements vidé");
+            let status = state.cache.shadowban_account_status(&req.user_id).await;
+            (StatusCode::OK, Json(json!({ "success": true, "data": status })))
+        }
+    }
 }
 
 // ─── POST /admin/ban ──────────────────────────────────────────────────────────

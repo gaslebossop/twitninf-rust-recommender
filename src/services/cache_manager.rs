@@ -7,6 +7,9 @@ use tracing::warn;
 use crate::models::{FeedEntry, UserProfile};
 
 const TTL_SEEN_TWEETS: u64 = 86400;
+/// 30 jours : un refus explicite doit durer bien plus qu'une session, sans être
+/// définitif — les goûts changent, et rien dans l'app ne permet de « dé-refuser ».
+const TTL_DAMPED_AUTHORS: u64 = 30 * 86400;
 const TTL_USER_PROFILE: u64 = 300;
 const TWEET_SCORES_KEY: &str = "twitninf:tweet_scores";
 const MAX_TWEET_SCORE: f64 = 500.0; // plafond absolu pour éviter l'inflation Redis
@@ -116,6 +119,31 @@ impl CacheManager {
         let key = format!("twitninf:seen:{}", user_id);
         let mut c = self.conn.lock().await;
         c.smembers(&key).await.unwrap_or_default()
+    }
+
+    // ─── Auteurs mis en sourdine par le lecteur ───────────────────────────────
+    //
+    // Quand quelqu'un répond « ça ne m'intéresse pas », écarter le seul tweet
+    // concerné ne change presque rien : il en reste mille du même auteur. C'est
+    // le constat mesuré par Mozilla sur YouTube — le bouton « pas intéressé »
+    // n'évite que ~11 % des recommandations non voulues, alors que « ne plus
+    // recommander cette chaîne », qui porte sur l'AUTEUR, en évite 43 %. La
+    // réponse est donc enregistrée au niveau de l'auteur, et le compteur
+    // s'accumule : plus on le refuse, plus il descend.
+
+    pub async fn damp_author(&self, user_id: &str, author_id: &str) {
+        let key = format!("twitninf:damped:{}", user_id);
+        let mut c = self.conn.lock().await;
+        let _: Result<f64, _> = c.zincr(&key, author_id, 1.0_f64).await;
+        let _: Result<(), _> = c.expire(&key, TTL_DAMPED_AUTHORS as i64).await;
+    }
+
+    /// Auteurs refusés par ce lecteur → nombre de refus.
+    pub async fn get_damped_authors(&self, user_id: &str) -> std::collections::HashMap<String, f64> {
+        let key = format!("twitninf:damped:{}", user_id);
+        let mut c = self.conn.lock().await;
+        let entries: Vec<(String, f64)> = c.zrange_withscores(&key, 0, -1).await.unwrap_or_default();
+        entries.into_iter().collect()
     }
 
     pub async fn health_check(&self) -> bool {

@@ -36,9 +36,11 @@ use tracing_subscriber::EnvFilter;
 
 use handlers::{
     AppState,
+    account_status::account_status_handler,
     admin::{
         admin_algo_stats_handler, admin_ban_handler, admin_filters_handler,
-        admin_get_weights_handler, admin_reset_weights_handler, admin_set_shadowban_handler,
+        admin_get_weights_handler, admin_issue_strike_handler, admin_reset_weights_handler,
+        admin_revoke_strike_handler, admin_set_shadowban_handler,
         admin_set_weights_handler, admin_unban_handler, admin_ui_handler,
         admin_logs_handler, admin_data_handler,
     },
@@ -119,10 +121,14 @@ async fn main() -> Result<()> {
         .route("/recommendations", post(recommend_handler))
         .route("/track",           post(track_handler))
         .route("/invalidate",      post(invalidate_handler))
+        // État de compte lisible par le créateur concerné (service-à-service).
+        .route("/account-status",  get(account_status_handler))
         // ── Admin node ────────────────────────────────────────────────────────
         .route("/admin/panel",                get(admin_ui_handler))
         .route("/admin/filters",              get(admin_filters_handler))
         .route("/admin/shadowban",            post(admin_set_shadowban_handler))
+        .route("/admin/strike",               post(admin_issue_strike_handler))
+        .route("/admin/strike/revoke",        post(admin_revoke_strike_handler))
         .route("/admin/ban",                  post(admin_ban_handler))
         .route("/admin/unban",                post(admin_unban_handler))
         .route("/admin/algo/weights",         get(admin_get_weights_handler))

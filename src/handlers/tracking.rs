@@ -2,6 +2,7 @@ use axum::{extract::State, http::{HeaderMap, StatusCode}, Json};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
+use crate::algorithm::dwell::{dwell_weight, DwellContext};
 use crate::handlers::AppState;
 use crate::experiments;
 use crate::models::{TrackInteractionRequest, TrackResponse};
@@ -49,13 +50,21 @@ pub async fn track_handler(
 
     let weight = req.interaction_type.weight();
 
-    // Plafonner dwell_ms pour éviter l'amplification du score
-    let dwell_bonus = req.dwell_ms.map(|ms| {
-        let capped = ms.min(MAX_DWELL_MS);
-        if capped > 10_000 { 0.5 }
-        else if capped > 3_000 { 0.2 }
-        else { 0.0 }
-    }).unwrap_or(0.0);
+    // Le temps passé est rapporté au temps que CE contenu demandait, pas jugé
+    // à l'aveugle sur sa valeur brute : sans ça le classement apprend que le
+    // public préfère les contenus longs, ce qui est une propriété du
+    // chronomètre et pas du public. Voir `algorithm::dwell`.
+    //
+    // Le plafond reste en place en amont : il ne corrige pas un biais, il
+    // écarte les valeurs absurdes (téléphone laissé allumé sur un tweet).
+    let dwell_context = req.dwell_media.map(|media| DwellContext {
+        media,
+        content_chars: req.content_chars.unwrap_or(0),
+        video_duration_ms: req.video_duration_ms,
+    });
+    let dwell_bonus = req.dwell_ms
+        .map(|ms| dwell_weight(ms.min(MAX_DWELL_MS), dwell_context.as_ref()))
+        .unwrap_or(0.0);
 
     let total_weight = weight + dwell_bonus;
 
@@ -91,7 +100,46 @@ pub async fn track_handler(
             if total_weight > 0.0 {
                 state.cache.mark_tweet_seen(&req.user_id, &req.tweet_id).await;
             }
-            state.cache.invalidate_recommendations(&req.user_id).await;
+
+            // ── Une VUE n'invalide pas le classement ────────────────────────
+            // Toute interaction jetait le classement caché du lecteur. Tant que
+            // seules les actions délibérées (like, retweet, commentaire…)
+            // étaient suivies, ça restait rare. Une vue, elle, arrive à CHAQUE
+            // tweet regardé : invalider dessus rendrait le cache inutile
+            // précisément pour les lecteurs les plus actifs, et surtout ferait
+            // recalculer le classement ENTRE deux pages d'une même session de
+            // lecture — la pagination avancerait alors dans un classement qui
+            // n'est plus celui d'où venait la page précédente, en sautant des
+            // tweets et en en resservant d'autres.
+            //
+            // La vue n'est pas perdue pour autant : `mark_tweet_seen` ci-dessus
+            // et l'impression mémorisée la font peser sur le prochain recalcul
+            // naturel (expiration du TTL ou `force_refresh`).
+            if req.interaction_type != crate::models::InteractionType::View {
+                state.cache.invalidate_recommendations(&req.user_id).await;
+            }
+
+            // ── « Ça ne m'intéresse pas » : la réponse doit se voir ──────────
+            // Deux effets, parce qu'un seul ne suffit pas :
+            //   * le tweet est marqué vu, donc il ne peut plus revenir ;
+            //   * l'AUTEUR est mis en sourdine pour ce lecteur (voir
+            //     `author_damping`) — c'est le seul niveau où le refus produit
+            //     un changement perceptible dans le fil, mesures de Mozilla sur
+            //     YouTube à l'appui.
+            // Sans `author_id` (client ancien) seul le premier effet s'applique,
+            // ce qui redonne exactement le bouton décoratif qu'on veut éviter :
+            // à surveiller si le geste paraît sans effet.
+            if req.interaction_type == crate::models::InteractionType::NotInterested {
+                state.cache.mark_tweet_seen(&req.user_id, &req.tweet_id).await;
+                match req.author_id.as_deref() {
+                    Some(author_id) if uuid::Uuid::parse_str(author_id).is_ok() => {
+                        state.cache.damp_author(&req.user_id, author_id).await;
+                        info!(user_id = %req.user_id, author_id, "Author damped by explicit disinterest");
+                    }
+                    _ => warn!(user_id = %req.user_id, tweet_id = %req.tweet_id,
+                               "NotInterested sans author_id : le refus ne portera que sur ce tweet"),
+                }
+            }
 
             // Alimente le modèle CTR avec le vecteur de features réellement
             // utilisé pour classer ce tweet dans le feed de ce lecteur. On ne
