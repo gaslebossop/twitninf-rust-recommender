@@ -1053,6 +1053,35 @@ pub fn diversity_multiplier(author_count_in_feed: u32) -> f64 {
     mult
 }
 
+/// Anti-répétition THÉMATIQUE — le pendant de `diversity_multiplier`, un cran
+/// au niveau du sujet plutôt que du compte.
+///
+/// `diversity_multiplier` empêche un même AUTEUR de saturer le fil ; rien
+/// n'empêchait dix comptes différents de tenir dix tweets sur le même sujet,
+/// alors que le champ `theme` (annotation LLM) était déjà chargé et
+/// disponible — juste jamais lu pour ça, seulement pour repérer deux
+/// catégories de contenu dégradant (voir `d9_llm_understanding`).
+///
+/// Pente nettement plus douce que la répétition d'auteur : un thème est une
+/// catégorie large (« actualité », « sport »…), pas une identité — un fil
+/// d'actualité un jour de gros événement DOIT pouvoir en montrer plusieurs
+/// sans que chacun soit traité comme un quasi-doublon.
+pub fn theme_diversity_multiplier(theme_count_in_feed: u32) -> f64 {
+    let mult = match theme_count_in_feed {
+        0 | 1 | 2 | 3 => 1.00,
+        4 => 0.90,
+        5 => 0.80,
+        6 => 0.68,
+        _ => 0.55,
+    };
+    trace!(
+        theme_count_in_feed,
+        mult,
+        "Theme diversity multiplier applied"
+    );
+    mult
+}
+
 /// Pénalité pour contenu rapporté ou signalé.
 fn moderation_penalty(t: &RawTweet) -> f64 {
     if t.report_count == 0 {

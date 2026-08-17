@@ -9,6 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::algorithm::scoring::{
     compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights,
+    theme_diversity_multiplier,
 };
 use crate::algorithm::trending::trending_score;
 use crate::bandit::bandit_select;
@@ -558,6 +559,11 @@ impl RecommenderService {
         realtime_author_boosts: &HashMap<String, f64>,
     ) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
+        // Anti-répétition THÉMATIQUE — voir `theme_diversity_multiplier`. Le
+        // champ `theme` (annotation LLM) était déjà chargé et disponible ;
+        // rien ne le lisait jamais pour de la diversité, seulement D9 pour
+        // repérer deux catégories dégradantes.
+        let mut theme_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
         let (ctr_samples, _) = self.ctr_predictor.stats();
         // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
@@ -709,6 +715,25 @@ impl RecommenderService {
                 s.score *= mult;
                 trace!(tweet_id = %tweet.id, author = %tweet.user_id, mult,
                        "Velocity throttle applied");
+            }
+
+            // ── Anti-répétition thématique ───────────────────────────────────
+            // Uniquement sur un tweet ANNOTÉ : un thème vide/inconnu partagé
+            // par tout le non-annoté formerait un faux « sujet » géant et
+            // pénaliserait des tweets qui n'ont rien en commun.
+            if let Some(theme) = tweet
+                .llm
+                .as_ref()
+                .map(|l| l.theme.as_str())
+                .filter(|t| !t.is_empty())
+            {
+                let tc = *theme_count.get(theme).unwrap_or(&0);
+                if tc > 0 {
+                    let theme_mult = theme_diversity_multiplier(tc);
+                    s.score *= theme_mult;
+                    trace!(tweet_id = %tweet.id, theme, tc, theme_mult, "Theme diversity applied");
+                }
+                *theme_count.entry(theme.to_string()).or_insert(0) += 1;
             }
 
             if idx < 3 {
