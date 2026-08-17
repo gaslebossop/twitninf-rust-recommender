@@ -17,6 +17,7 @@ pub mod ads; // Targeted advertising
 pub mod algorithm;
 pub mod bandit; // Phase 3: Contextual Bandit
 pub mod constants;
+pub mod embeddings;
 pub mod experiments;
 pub mod handlers;
 pub mod middleware;

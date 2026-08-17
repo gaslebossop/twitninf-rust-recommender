@@ -1,6 +1,5 @@
 use anyhow::Result;
 use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::warn;

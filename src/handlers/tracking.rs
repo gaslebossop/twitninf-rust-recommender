@@ -4,7 +4,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::algorithm::dwell::{dwell_weight, DwellContext};
 use crate::experiments;

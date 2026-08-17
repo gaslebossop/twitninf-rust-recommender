@@ -4,6 +4,7 @@ mod algorithm;
 mod bandit;
 mod config;
 mod constants;
+mod embeddings;
 mod experiments;
 mod handlers;
 mod middleware;
@@ -39,6 +40,7 @@ use handlers::{
         admin_reset_weights_handler, admin_revoke_strike_handler, admin_set_shadowban_handler,
         admin_set_weights_handler, admin_ui_handler, admin_unban_handler,
     },
+    embeddings::embed_tweet_handler,
     health::health_handler,
     invalidate::invalidate_handler,
     recommendations::recommend_handler,
@@ -72,6 +74,12 @@ async fn main() -> Result<()> {
     experiments::ensure_schema(&pg_pool).await?;
     info!("A/B experiment schema ready");
 
+    // Chargé en tâche de fond, jamais attendu ici : le téléchargement du
+    // premier démarrage (~90 Mo) prendrait plus longtemps que le contrôle de
+    // santé du déploiement ne patiente. Voir la doc de `AppState::embeddings`.
+    let embeddings: Arc<tokio::sync::OnceCell<embeddings::EmbeddingService>> =
+        Arc::new(tokio::sync::OnceCell::new());
+
     let cache = CacheManager::new(&cfg.redis_url).await?;
     info!("Redis connected");
 
@@ -89,6 +97,45 @@ async fn main() -> Result<()> {
     // négatifs et persiste le modèle. C'est elle qui rend l'apprentissage réel.
     ml::ctr_sweeper::spawn(recommender.clone(), cache.clone());
 
+    // Chargement du modèle + rattrapage des tweets sans embedding, tous deux
+    // en tâche de fond. Le serveur écoute déjà pendant que ça se passe — voir
+    // le commentaire sur `embeddings` plus haut.
+    {
+        let embeddings = embeddings.clone();
+        let pg_for_embeddings = pg_pool.clone();
+        tokio::spawn(async move {
+            let loaded = match tokio::task::spawn_blocking(embeddings::EmbeddingService::load).await
+            {
+                Ok(Ok(svc)) => svc,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "Modèle d'embedding non chargé — désactivé");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Tâche de chargement du modèle échouée — désactivé");
+                    return;
+                }
+            };
+            if let Err(e) = embeddings::ensure_schema(&pg_for_embeddings).await {
+                tracing::warn!(error = %e, "Schéma embeddings indisponible — désactivé");
+                return;
+            }
+            let _ = embeddings.set(loaded);
+            tracing::info!("Embeddings sémantiques actifs");
+
+            // Rattrapage des tweets publiés avant ce module (ou dont
+            // l'embedding à la publication a échoué) — par petits lots,
+            // jamais en concurrence avec le trafic de recommandation pour le
+            // CPU.
+            loop {
+                if let Some(svc) = embeddings.get() {
+                    embeddings::backfill_sweep(&pg_for_embeddings, svc, 20).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
     let state = AppState {
         pg: pg_pool,
         cache,
@@ -97,6 +144,7 @@ async fn main() -> Result<()> {
         admin_secret: cfg.admin_secret.clone(),
         internal_secret: cfg.internal_secret.clone(),
         start_time: SystemTime::now(),
+        embeddings,
     };
 
     // CORS : autorise le backend Node.js et l'IP publique (pour le panel admin)
@@ -130,6 +178,8 @@ async fn main() -> Result<()> {
         // registre d'avertissements, voir `crate::velocity`.
         .route("/velocity-throttle", post(velocity_throttle_handler))
         .route("/velocity/post-burst", post(velocity_post_burst_handler))
+        // Embedding sémantique d'un tweet — voir `crate::embeddings`.
+        .route("/embed-tweet", post(embed_tweet_handler))
         // ── Admin node ────────────────────────────────────────────────────────
         .route("/admin/panel", get(admin_ui_handler))
         .route("/admin/filters", get(admin_filters_handler))

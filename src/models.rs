@@ -187,6 +187,14 @@ pub struct UserProfile {
     #[serde(default)]
     pub damped_authors: std::collections::HashMap<String, f64>,
 
+    /// Moyenne des embeddings des tweets likés récents — voir
+    /// `crate::embeddings`. `None` pour un compte neuf, ou tant que le
+    /// rattrapage n'a pas encore embedded ses tweets aimés.
+    /// `#[serde(default)]` : les profils déjà en cache avant l'ajout de ce
+    /// champ n'en portent pas, la désérialisation ne doit pas échouer dessus.
+    #[serde(default)]
+    pub taste_vector: Option<Vec<f32>>,
+
     pub user_type: UserType,
     pub profile_confidence: f64,
 }

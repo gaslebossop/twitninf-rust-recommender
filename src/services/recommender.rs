@@ -257,6 +257,9 @@ impl RecommenderService {
             warn!(error = ?error, "Remontée des parents de fil impossible, les réponses seront écartées");
         }
 
+        self.hydrate_semantic_candidates(&req.user_id, &profile, &mut sources, &banned_set)
+            .await;
+
         let total_candidates = sources.len();
         debug!(
             total_candidates,
@@ -1006,6 +1009,14 @@ impl RecommenderService {
         }
         profile.seen_tweet_ids = self.cache.get_seen_tweet_ids(user_id).await;
         profile.damped_authors = self.cache.get_damped_authors(user_id).await;
+        // Absent du `join!` ci-dessus : ne coûte qu'un aller-retour de plus sur
+        // un profil déjà mis en cache 300s, et une panne ici (modèle
+        // désactivé, requête échouée) ne doit pas faire échouer tout le reste
+        // du profil — juste laisser `taste_vector` à `None`.
+        match crate::embeddings::user_taste_vector(&self.pg, user_id).await {
+            Ok(v) => profile.taste_vector = v,
+            Err(e) => debug!(user_id, error = %e, "Vecteur de goût indisponible"),
+        }
         if !profile.damped_authors.is_empty() {
             debug!(
                 user_id,
@@ -1300,6 +1311,76 @@ impl RecommenderService {
             );
         }
         Ok(added)
+    }
+
+    /// Candidats trouvés par similarité de CONTENU avec le vecteur de goût du
+    /// lecteur — voir `crate::embeddings`. Absent des 8 sources SQL de
+    /// `collect_candidates`, qui ne comparent que récence/popularité/follow,
+    /// jamais ce dont un tweet parle réellement.
+    ///
+    /// `None`/erreur silencieuse à chaque étape (pas de vecteur de goût, modèle
+    /// désactivé, requête échouée) : cette source est un COMPLÉMENT, jamais un
+    /// prérequis — un compte neuf ou un moteur sans embeddings doit continuer
+    /// à recevoir un feed normal par les 8 autres sources.
+    async fn hydrate_semantic_candidates(
+        &self,
+        user_id: &str,
+        profile: &UserProfile,
+        tweets: &mut Vec<RawTweet>,
+        banned_set: &std::collections::HashSet<String>,
+    ) -> usize {
+        let Some(taste) = profile.taste_vector.as_ref() else {
+            return 0;
+        };
+
+        let ids = match crate::embeddings::nearest_tweets(&self.pg, taste, user_id, 40).await {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => return 0,
+            Err(e) => {
+                debug!(user_id, error = %e, "Candidats sémantiques indisponibles");
+                return 0;
+            }
+        };
+
+        let known: HashSet<String> = tweets.iter().map(|t| t.id.clone()).collect();
+        let missing: Vec<uuid::Uuid> = ids
+            .into_iter()
+            .filter(|id| !known.contains(id))
+            .filter_map(|id| uuid::Uuid::parse_str(&id).ok())
+            .collect();
+        if missing.is_empty() {
+            return 0;
+        }
+
+        let Ok(uid) = uuid::Uuid::parse_str(user_id) else {
+            return 0;
+        };
+        let banned_uuids: Vec<uuid::Uuid> = banned_set
+            .iter()
+            .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+            .collect();
+
+        let client = match self.pg.get().await {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let rows = match client
+            .query(SEMANTIC_SQL.as_str(), &[&uid, &missing, &banned_uuids])
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(user_id, error = %e, "Hydratation des candidats sémantiques échouée");
+                return 0;
+            }
+        };
+        let added = map_rows(rows);
+        let count = added.len();
+        if count > 0 {
+            debug!(user_id, count, "Candidats sémantiques ajoutés");
+        }
+        tweets.extend(added);
+        count
     }
 
     async fn count_available(&self, user_id: &str) -> Result<i64> {
@@ -1643,7 +1724,33 @@ WITH picked AS (
 )
 "#;
 
-/// Les deux requêtes complètes, assemblées une fois pour toutes.
+/// Hydrate les résultats de `embeddings::nearest_tweets` — mêmes identifiants
+/// que `PARENTS_CTE`, poids un peu plus haut qu'un parent (0.15 plutôt que
+/// 0.05) : contrairement à un parent, un candidat sémantique concourt
+/// réellement pour une place dans le fil, il n'est pas là pour la lisibilité
+/// d'un autre tweet. Étiqueté `src=4` (Discovery) : c'est déjà la source
+/// « contenu qu'on n'a pas explicitement demandé », et ajouter une neuvième
+/// variante à `TweetSource` pour une seule ligne de statistiques ne se
+/// justifiait pas — le classement, lui, ne regarde que `w`.
+///
+/// Paramètres : $1 lecteur · $2 identifiants trouvés par similarité · $3 hard_banned[]
+const SEMANTIC_CTE: &str = r#"
+WITH picked AS (
+    SELECT t.id, 4 AS src, 0.15::float8 AS w
+    FROM tweets t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.id = ANY($2)
+      AND t.deleted_at IS NULL
+      AND t.moderation_status = 'approved'
+      AND t.is_private = false
+      AND COALESCE(t.is_data_test, false) = false
+      AND u.is_active = true
+      AND COALESCE(u.is_suspended, false) = false
+      AND NOT (t.user_id = ANY($3))
+)
+"#;
+
+/// Les requêtes complètes, assemblées une fois pour toutes.
 ///
 /// `concat!` ne sait pas coller des constantes, et refaire le `format!` à
 /// chaque requête réallouerait plusieurs kilo-octets par recommandation.
@@ -1651,6 +1758,8 @@ static CANDIDATES_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{CANDIDATES_CTE}{PROJECTION_SQL}"));
 static PARENTS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{PARENTS_CTE}{PROJECTION_SQL}"));
+static SEMANTIC_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{SEMANTIC_CTE}{PROJECTION_SQL}"));
 
 // ─── Mapping rows → RawTweet ──────────────────────────────────────────────────
 
