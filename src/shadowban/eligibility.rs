@@ -222,4 +222,39 @@ mod tests {
         assert_eq!(IneligibilityReason::UnderReview.policy(), None);
         assert_eq!(IneligibilityReason::LowQuality.policy(), None);
     }
+
+    #[test]
+    fn la_categorie_de_toxicite_affine_le_domaine_du_strike() {
+        use super::super::models::StrikePolicy;
+
+        // Une menace ne doit pas se noyer dans le harcèlement générique : son
+        // seuil de bannissement est bien plus court.
+        assert_eq!(
+            IneligibilityReason::Toxic.policy_for(Some("menace")),
+            Some(StrikePolicy::ViolentThreat)
+        );
+        assert_eq!(
+            IneligibilityReason::Toxic.policy_for(Some("haine_identitaire")),
+            Some(StrikePolicy::HatefulConduct)
+        );
+        assert_eq!(
+            IneligibilityReason::Toxic.policy_for(Some("contenu_sexuel")),
+            Some(StrikePolicy::AdultContent)
+        );
+        // Catégorie générique ou absente : repli sur le domaine générique.
+        assert_eq!(
+            IneligibilityReason::Toxic.policy_for(Some("insulte_ciblee")),
+            Some(StrikePolicy::Harassment)
+        );
+        assert_eq!(
+            IneligibilityReason::Toxic.policy_for(None),
+            Some(StrikePolicy::Harassment)
+        );
+        // Les motifs non toxiques ne changent pas de comportement : `policy_for`
+        // ignore la catégorie et retombe sur `policy()`.
+        assert_eq!(
+            IneligibilityReason::LinkSpam.policy_for(Some("menace")),
+            Some(StrikePolicy::Spam)
+        );
+    }
 }

@@ -1,11 +1,10 @@
 use std::collections::HashSet;
 
-use chrono::Utc;
 use tracing::debug;
 
 use crate::models::RawTweet;
 
-use super::models::{AccountQualityScore, GarbageSignals, ShadowbanLevel};
+use super::models::GarbageSignals;
 
 // ─── Seuils de détection ──────────────────────────────────────────────────────
 
@@ -20,20 +19,6 @@ const EMOJI_OVERLOAD_COUNT: i32 = 8;
 const EMOJI_OVERLOAD_MAX_CHARS: i32 = 100;
 const REPEAT_UNIQUE_RATIO: f64 = 0.25; // < 25% mots uniques = texte répétitif
 const REPEAT_MIN_WORDS: usize = 10; // pas de pénalité sur tweets très courts
-
-// ─── Thresholds pour le niveau de shadowban du compte ────────────────────────
-
-const THRESHOLD_GHOSTED_GARBAGE_RATIO: f64 = 0.70;
-const THRESHOLD_GHOSTED_REPORT_RATE: f64 = 0.10;
-const THRESHOLD_GHOSTED_STRIKES: u32 = 10;
-
-const THRESHOLD_SUPPRESSED_GARBAGE_RATIO: f64 = 0.50;
-const THRESHOLD_SUPPRESSED_REPORT_RATE: f64 = 0.05;
-const THRESHOLD_SUPPRESSED_STRIKES: u32 = 5;
-
-const THRESHOLD_MONITORING_GARBAGE_RATIO: f64 = 0.25;
-const THRESHOLD_MONITORING_REPORT_RATE: f64 = 0.02;
-const THRESHOLD_MONITORING_STRIKES: u32 = 2;
 
 // ─── GarbageContentDetector ──────────────────────────────────────────────────
 
@@ -99,105 +84,6 @@ impl GarbageContentDetector {
         }
 
         signals
-    }
-
-    /// Calcule le ShadowbanLevel pour un compte à partir de son score agrégé.
-    /// Les seuils sont appliqués par ordre décroissant de gravité.
-    pub fn compute_level(score: &AccountQualityScore) -> ShadowbanLevel {
-        if score.manual_override.is_some() {
-            return score.manual_override.unwrap();
-        }
-
-        if score.garbage_ratio_7d > THRESHOLD_GHOSTED_GARBAGE_RATIO
-            || score.avg_report_rate_7d > THRESHOLD_GHOSTED_REPORT_RATE
-            || score.spam_strikes >= THRESHOLD_GHOSTED_STRIKES
-        {
-            return ShadowbanLevel::Ghosted;
-        }
-
-        if score.garbage_ratio_7d > THRESHOLD_SUPPRESSED_GARBAGE_RATIO
-            || score.avg_report_rate_7d > THRESHOLD_SUPPRESSED_REPORT_RATE
-            || score.spam_strikes >= THRESHOLD_SUPPRESSED_STRIKES
-        {
-            return ShadowbanLevel::Suppressed;
-        }
-
-        if score.garbage_ratio_7d > THRESHOLD_MONITORING_GARBAGE_RATIO
-            || score.avg_report_rate_7d > THRESHOLD_MONITORING_REPORT_RATE
-            || score.spam_strikes >= THRESHOLD_MONITORING_STRIKES
-        {
-            return ShadowbanLevel::Monitoring;
-        }
-
-        ShadowbanLevel::Clean
-    }
-
-    /// Recalcule le AccountQualityScore depuis un lot de tweets récents (fenêtre 7j).
-    pub fn update_account_score(
-        &self,
-        existing: &AccountQualityScore,
-        recent_tweets: &[RawTweet],
-    ) -> AccountQualityScore {
-        if recent_tweets.is_empty() {
-            // Pas de nouveaux posts → score inchangé, niveau recalculé
-            let mut updated = existing.clone();
-            updated.level = Self::compute_level(&updated);
-            updated.computed_at = Utc::now();
-            return updated;
-        }
-
-        let total = recent_tweets.len() as f64;
-
-        // Ratio de posts poubelle
-        let garbage_count = recent_tweets
-            .iter()
-            .filter(|t| self.detect(t).is_garbage())
-            .count();
-        let garbage_ratio = garbage_count as f64 / total;
-
-        // Taux moyen de signalements
-        let avg_report_rate = recent_tweets
-            .iter()
-            .map(|t| t.report_count as f64 / t.view_count.max(100) as f64)
-            .sum::<f64>()
-            / total;
-
-        // Strikes consécutifs (les plus récents d'abord)
-        let spam_strikes = recent_tweets
-            .iter()
-            .rev()
-            .take_while(|t| self.detect(t).is_garbage())
-            .count() as u32;
-
-        // Déficit d'engagement : avg (likes+comments+retweets)/vues vs baseline 2%
-        let avg_eng_rate = recent_tweets
-            .iter()
-            .map(|t| {
-                let eng = (t.like_count + t.comment_count + t.retweet_count) as f64;
-                eng / t.view_count.max(1) as f64
-            })
-            .sum::<f64>()
-            / total;
-        let engagement_deficit = avg_eng_rate - 0.02; // baseline plateforme 2%
-
-        let mut updated = existing.clone();
-        updated.garbage_ratio_7d = garbage_ratio;
-        updated.avg_report_rate_7d = avg_report_rate;
-        updated.spam_strikes = spam_strikes;
-        updated.engagement_deficit = engagement_deficit;
-        updated.level = Self::compute_level(&updated);
-        updated.computed_at = Utc::now();
-
-        debug!(
-            user_id = %updated.user_id,
-            level = updated.level.label(),
-            garbage_ratio,
-            avg_report_rate,
-            spam_strikes,
-            "Account quality score updated"
-        );
-
-        updated
     }
 }
 

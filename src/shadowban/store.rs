@@ -40,6 +40,23 @@ fn level_key(user_id: &str) -> String {
 fn manual_key(user_id: &str) -> String {
     format!("admin:shadowban:{user_id}")
 }
+fn auto_struck_key(tweet_id: &str) -> String {
+    format!("shadowban:auto_struck:{tweet_id}")
+}
+
+/// Un tweet dont le scoring vient de détecter, automatiquement, un motif qui
+/// compte au niveau du compte — voir `IneligibilityReason::policy_for`.
+///
+/// Ce n'est pas encore un avertissement : `shadowban_process_auto_strikes`
+/// tranche, un par un, si celui-ci en devient un.
+#[derive(Debug, Clone)]
+pub struct AutoStrikeCandidate {
+    pub tweet_id: String,
+    pub author_id: String,
+    pub policy: StrikePolicy,
+    /// Motif d'inéligibilité d'origine, pour le champ `reason` de l'avertissement.
+    pub reason_label: &'static str,
+}
 
 /// Marqueur écrit quand le registre donne `Clean`.
 ///
@@ -105,6 +122,63 @@ impl CacheManager {
             "Avertissement enregistré"
         );
         ledger
+    }
+
+    /// Traite un lot de candidats détectés pendant le scoring — un avertissement
+    /// automatique par tweet, jamais deux.
+    ///
+    /// Le même tweet garbage repasse dans le scoring à chaque fois qu'il entre
+    /// dans le pool de candidats d'un lecteur, potentiellement des dizaines de
+    /// fois par minute sur un compte suivi par du monde : sans réclamation
+    /// préalable (`shadowban_claim_auto_strike`), chaque lecture aurait émis
+    /// son propre avertissement pour le même post.
+    ///
+    /// `IneligibilityReason::policy_for` (le domaine visé) et cette fonction
+    /// (l'émission elle-même) existaient déjà séparément — `policy()` ne
+    /// servait que dans les tests. La détection automatique ne comptait donc
+    /// jamais au niveau du compte : un contenu écarté à répétition des
+    /// surfaces de recommandation restait Clean tant que personne ne le
+    /// signalait à la main.
+    pub async fn shadowban_process_auto_strikes(&self, candidates: Vec<AutoStrikeCandidate>) {
+        for c in candidates {
+            if !self.shadowban_claim_auto_strike(&c.tweet_id).await {
+                continue;
+            }
+            self.shadowban_add_strike(
+                &c.author_id,
+                c.policy,
+                Some(&c.tweet_id),
+                Some(&format!("Détection automatique : {}", c.reason_label)),
+            )
+            .await;
+            debug!(
+                tweet_id = %c.tweet_id,
+                author_id = %c.author_id,
+                policy = c.policy.label(),
+                "Avertissement automatique émis depuis le scoring"
+            );
+        }
+    }
+
+    /// Réclame, pour ce tweet précis, le droit d'émettre son unique
+    /// avertissement automatique — vrai seulement la première fois.
+    ///
+    /// TTL calé sur [`STRIKE_TTL_DAYS`] via `strike_ttl()` : une fois
+    /// l'avertissement lui-même expiré, rien n'empêche plus une nouvelle
+    /// détection sur ce tweet de compter à nouveau si le contenu recommence à
+    /// circuler.
+    async fn shadowban_claim_auto_strike(&self, tweet_id: &str) -> bool {
+        let mut c = self.conn.lock().await;
+        let claimed: Option<String> = redis::cmd("SET")
+            .arg(auto_struck_key(tweet_id))
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(strike_ttl().num_seconds())
+            .query_async(&mut *c)
+            .await
+            .unwrap_or_default();
+        claimed.is_some()
     }
 
     /// Annule tous les avertissements d'un compte (recours accepté, erreur de

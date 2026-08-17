@@ -27,7 +27,8 @@ pub use detector::GarbageContentDetector;
 pub use eligibility::content_eligibility;
 pub use enforcer::{ShadowbanEnforcer, Verdict};
 pub use models::{
-    AccountQualityScore, ContentEligibility, GarbageSignals, IneligibilityReason, ShadowbanLevel,
-    Strike, StrikePolicy, Surface, STRIKE_TTL_DAYS,
+    ContentEligibility, GarbageSignals, IneligibilityReason, ShadowbanLevel, Strike, StrikePolicy,
+    Surface, STRIKE_TTL_DAYS,
 };
+pub use store::AutoStrikeCandidate;
 pub use strikes::{AccountStatus, StrikeLedger};

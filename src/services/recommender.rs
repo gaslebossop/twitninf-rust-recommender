@@ -24,7 +24,10 @@ use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
-use crate::shadowban::{content_eligibility, GarbageContentDetector, ShadowbanEnforcer};
+use crate::shadowban::{
+    content_eligibility, AutoStrikeCandidate, ContentEligibility, GarbageContentDetector,
+    ShadowbanEnforcer,
+};
 
 /// Convertit un vecteur de features sérialisé en tableau de taille fixe.
 /// Rejette toute taille inattendue : un vecteur tronqué décalerait chaque
@@ -411,6 +414,7 @@ impl RecommenderService {
         let arm_stats = self.cache.load_arm_stats(&author_ids).await;
 
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
+        let mut auto_strike_candidates = Vec::new();
         let scored = self.score_all(
             &deduped,
             &profile,
@@ -419,8 +423,14 @@ impl RecommenderService {
             &velocity_throttles,
             &realtime_author_boosts,
             &arm_stats,
+            &mut auto_strike_candidates,
         );
         debug!(scored_count = scored.len(), "Scoring complete");
+        if !auto_strike_candidates.is_empty() {
+            self.cache
+                .shadowban_process_auto_strikes(auto_strike_candidates)
+                .await;
+        }
 
         // Show top 5 scores
         let top_5: Vec<_> = scored
@@ -564,6 +574,7 @@ impl RecommenderService {
         velocity_throttles: &HashMap<String, f64>,
         realtime_author_boosts: &HashMap<String, f64>,
         arm_stats: &HashMap<String, (f64, u32)>,
+        auto_strike_candidates: &mut Vec<AutoStrikeCandidate>,
     ) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         // Anti-répétition THÉMATIQUE — voir `theme_diversity_multiplier`. Le
@@ -604,6 +615,24 @@ impl RecommenderService {
             let surface = ShadowbanEnforcer::effective_surface(tweet, mode, follows_author);
             let signals = detector.detect(tweet);
             let eligibility = content_eligibility(tweet, &signals);
+            // Un motif d'inéligibilité qui compte au niveau du compte (voir
+            // `IneligibilityReason::policy_for`) devient un candidat à
+            // l'avertissement automatique — traité en aval, après le scoring,
+            // pour ne pas mêler d'écriture Redis à cette boucle synchrone. Ça
+            // vaut pour toute surface, pas seulement celles fermées à CE
+            // lecteur : un compte suivi qui publie du spam doit accumuler des
+            // avertissements même si son abonné continue de le voir.
+            if let ContentEligibility::NotRecommended(reason) = eligibility {
+                let toxicity_category = tweet.llm.as_ref().map(|l| l.toxicity_category.as_str());
+                if let Some(policy) = reason.policy_for(toxicity_category) {
+                    auto_strike_candidates.push(AutoStrikeCandidate {
+                        tweet_id: tweet.id.clone(),
+                        author_id: tweet.user_id.clone(),
+                        policy,
+                        reason_label: reason.label(),
+                    });
+                }
+            }
             let verdict = enforcer.admit(
                 tweet.author_shadowban_level,
                 eligibility,

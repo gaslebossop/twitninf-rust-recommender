@@ -113,22 +113,6 @@ impl ShadowbanEnforcer {
         Verdict::allow(level.score_multiplier())
     }
 
-    /// Variante à partir du mode de recommandation.
-    pub fn admit_for_mode(
-        &self,
-        level: ShadowbanLevel,
-        eligibility: ContentEligibility,
-        mode: &RecommendMode,
-        viewer_follows_author: bool,
-    ) -> Verdict {
-        self.admit(
-            level,
-            eligibility,
-            Surface::from_mode(mode),
-            viewer_follows_author,
-        )
-    }
-
     /// Surface effective d'un tweet : la source qui l'a fait entrer dans le pool
     /// peut être plus « poussée » que le mode demandé.
     ///

@@ -239,6 +239,30 @@ impl StrikePolicy {
         })
     }
 
+    /// Domaine déduit de la catégorie de toxicité posée par l'annotateur LLM
+    /// (vocabulaire fermé, voir `annotator-schema.json` côté API — c'est la
+    /// source de vérité).
+    ///
+    /// Sans ça, tout contenu toxique retombe sur [`Self::Harassment`] via
+    /// [`IneligibilityReason::policy`] : une menace et une vulgarité légère
+    /// compteraient alors pour le même seuil, alors que [`Self::ViolentThreat`]
+    /// existe précisément pour couper dès le premier fait constaté et que
+    /// [`Self::HatefulConduct`] a un seuil bien plus bas que le harcèlement
+    /// générique.
+    pub fn from_toxicity_category(category: &str) -> Self {
+        match category {
+            "menace" => StrikePolicy::ViolentThreat,
+            "haine_identitaire" => StrikePolicy::HatefulConduct,
+            "contenu_sexuel" => StrikePolicy::AdultContent,
+            // "harcelement", "insulte_ciblee", "vulgarite_legere", "aucune"
+            // (ne devrait pas atteindre cet appel — voir le seuil de score
+            // dans `eligibility::content_eligibility`) et toute valeur future
+            // inconnue de l'annotateur : le domaine générique reste le repli
+            // le plus sûr.
+            _ => StrikePolicy::Harassment,
+        }
+    }
+
     /// Formulation destinée au créateur — pas le nom technique du domaine.
     pub fn creator_reason(self) -> &'static str {
         match self {
@@ -421,6 +445,21 @@ impl IneligibilityReason {
         }
     }
 
+    /// Comme [`Self::policy`], mais affine `Toxic` avec la catégorie posée par
+    /// l'annotateur LLM quand elle est disponible — voir
+    /// [`StrikePolicy::from_toxicity_category`]. Les autres motifs n'ont pas
+    /// de sous-catégorie : `policy()` fait déjà foi pour eux.
+    pub fn policy_for(self, toxicity_category: Option<&str>) -> Option<StrikePolicy> {
+        match self {
+            IneligibilityReason::Toxic => Some(
+                toxicity_category
+                    .map(StrikePolicy::from_toxicity_category)
+                    .unwrap_or(StrikePolicy::Harassment),
+            ),
+            other => other.policy(),
+        }
+    }
+
     pub fn creator_reason(self) -> &'static str {
         match self {
             IneligibilityReason::SpamSignals => "Ce post présente des signaux de spam",
@@ -553,44 +592,5 @@ impl GarbageSignals {
             v.push("emoji_overload");
         }
         v
-    }
-}
-
-// ─── Score de qualité du compte (agrégé sur 7 jours) ─────────────────────────
-
-/// Score calculé périodiquement (ex: toutes les heures via job background).
-/// Stocké en Redis + PostgreSQL, chargé avec le profil candidat.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccountQualityScore {
-    pub user_id: String,
-    pub level: ShadowbanLevel,
-
-    pub garbage_ratio_7d: f64, // % des posts des 7 derniers jours = poubelle
-    pub avg_report_rate_7d: f64, // taux moyen de signalements sur 7 jours
-    pub spam_strikes: u32,     // posts garbage consécutifs les plus récents
-    pub engagement_deficit: f64, // écart vs baseline plateforme (négatif = mauvais)
-
-    pub computed_at: DateTime<Utc>,
-    pub manual_override: Option<ShadowbanLevel>, // surcharge équipe modération
-}
-
-impl AccountQualityScore {
-    /// Niveau effectif : la surcharge manuelle prime toujours sur le calculé.
-    pub fn effective_level(&self) -> ShadowbanLevel {
-        self.manual_override.unwrap_or(self.level)
-    }
-
-    /// Compte propre avec score par défaut.
-    pub fn clean(user_id: String) -> Self {
-        Self {
-            user_id,
-            level: ShadowbanLevel::Clean,
-            garbage_ratio_7d: 0.0,
-            avg_report_rate_7d: 0.0,
-            spam_strikes: 0,
-            engagement_deficit: 0.0,
-            computed_at: Utc::now(),
-            manual_override: None,
-        }
     }
 }
