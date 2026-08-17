@@ -218,6 +218,12 @@ pub async fn track_handler(
                     .cache
                     .record_author_feedback(&req.user_id, author_id, clicked)
                     .await;
+                // Bras du bandit d'exploration — voir `bandit::contextual`.
+                // Même signal, même auteur : ça vaut la peine de dupliquer
+                // l'écriture plutôt que de faire dépendre le bandit d'une clé
+                // pensée pour un usage différent (30 min, par lecteur) qui
+                // pourrait changer de forme sans prévenir.
+                state.cache.record_arm_reward(author_id, clicked).await;
             }
         }
     }

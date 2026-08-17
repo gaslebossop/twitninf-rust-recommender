@@ -405,6 +405,11 @@ impl RecommenderService {
             .maybe_update(&self.ctr_predictor, admin_weights.as_ref());
         let active_weights = self.auto_tuner.active_weights(admin_weights.as_ref());
 
+        // Bras du bandit (Phase 3) = auteurs de ce pool. Même `author_ids` que
+        // le shadowban/frein de vélocité ci-dessus, un seul aller-retour de
+        // plus (deux `MGET`, voir `bandit::contextual::store::load_arm_stats`).
+        let arm_stats = self.cache.load_arm_stats(&author_ids).await;
+
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
         let scored = self.score_all(
             &deduped,
@@ -413,6 +418,7 @@ impl RecommenderService {
             &active_weights,
             &velocity_throttles,
             &realtime_author_boosts,
+            &arm_stats,
         );
         debug!(scored_count = scored.len(), "Scoring complete");
 
@@ -557,6 +563,7 @@ impl RecommenderService {
         weights: &crate::admin::AlgoWeights,
         velocity_throttles: &HashMap<String, f64>,
         realtime_author_boosts: &HashMap<String, f64>,
+        arm_stats: &HashMap<String, (f64, u32)>,
     ) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
         // Anti-répétition THÉMATIQUE — voir `theme_diversity_multiplier`. Le
@@ -793,7 +800,8 @@ impl RecommenderService {
         // Seulement en mode ForYou/Feed, pas en Trending (qui a son propre
         // réordonnancement aléatoire ci-dessus)
         if matches!(mode, RecommendMode::ForYou | RecommendMode::Feed) {
-            let selection = bandit_select(&scored_feed, tweets, profile, scored_feed.len());
+            let selection =
+                bandit_select(&scored_feed, tweets, profile, scored_feed.len(), arm_stats);
             debug!(
                 exploit = selection.exploit_count,
                 explore = selection.explore_count,
