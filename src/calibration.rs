@@ -1,15 +1,29 @@
 //! Recalibration de l'algorithme — page dédiée, accessible uniquement depuis
 //! les Paramètres, jamais proposée automatiquement (demande explicite).
 //!
-//! 5 tours de 6 tweets. Les deux premiers tours explorent large — thèmes et
-//! auteurs distincts, sans tenir compte de ce que l'algorithme croit déjà
-//! savoir — pour cartographier ce qui intéresse le compte plutôt que de
-//! confirmer un préjugé existant. Les tours suivants resserrent : plus
-//! proches voisins sémantiques (même mécanisme que `embeddings::nearest_tweets`)
-//! des tweets choisis dans CETTE session, sans contrainte de diversité
-//! d'auteur — si le compte montre un intérêt marqué pour un auteur précis, le
-//! reflet fidèle de ça, c'est de lui en proposer plus, pas de l'en priver
-//! pour la forme.
+//! 3 tours de 6 cartes, sélectionnées dans l'espace des embeddings — pas par
+//! auteur ni par thème, qui ne sont que des étiquettes posées à côté du
+//! contenu.
+//!
+//! **Tour 1 — couverture.** On ne sait rien : les 6 cartes sont choisies pour
+//! être le plus éloignées possible les unes des autres, de façon que
+//! n'importe quel goût trouve au moins une prise. C'est un échantillonnage du
+//! point le plus éloigné, obtenu par la pénalité de redondance de
+//! `greedy_pick`.
+//!
+//! **Tours 2-3 — la frontière, pas le déjà-acquis.** La première version
+//! montrait ici les plus proches voisins de ce qui venait d'être aimé : une
+//! question dont on connaît déjà la réponse n'apprend rien, et sur un corpus
+//! dominé par quelques comptes elle ramenait toujours les mêmes. On cherche
+//! désormais les contenus À ÉGALE DISTANCE de ce qui a été accepté et de ce
+//! qui a été refusé — là où le modèle ne sait pas trancher, donc là où une
+//! réponse vaut le plus. C'est la transposition de la sélection par
+//! entropie/variance en apprentissage actif.
+//!
+//! Dans les deux cas la sélection est GLOUTONNE AVEC PÉNALITÉ DE REDONDANCE :
+//! chaque carte est choisie en tenant compte de celles déjà retenues pour ce
+//! tour. Noter les items isolément produit des graines redondantes — c'est le
+//! résultat central de « Deep Rating Elicitation » (arXiv 2402.16327).
 //!
 //! Signal privé : contrairement à un like normal, un choix de recalibration
 //! n'écrit jamais dans `tweet_likes` (pas de notification à l'auteur, pas de
@@ -26,7 +40,6 @@ use std::collections::HashSet;
 use anyhow::Result;
 use deadpool_postgres::Pool as PgPool;
 use pgvector::Vector;
-use rand::seq::SliceRandom;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -34,8 +47,22 @@ use tracing::debug;
 use crate::embeddings::average_vectors;
 use crate::services::cache_manager::CacheManager;
 
-pub const ROUNDS: u8 = 4;
-pub const TWEETS_PER_ROUND: i64 = 5;
+pub const ROUNDS: u8 = 3;
+pub const TWEETS_PER_ROUND: i64 = 6;
+
+/// Taille du vivier chargé à chaque tour. Assez large pour que la dispersion
+/// et l'incertitude aient de quoi choisir, assez borné pour que le calcul de
+/// distances reste instantané (O(vivier × cartes), quelques milliers
+/// d'opérations).
+const POOL_LIMIT: i64 = 240;
+
+/// Tweets max par auteur DANS LE VIVIER (avant même la sélection).
+const POOL_PER_AUTHOR: i64 = 8;
+
+/// Poids de la pénalité de redondance dans la sélection gloutonne. À 1.0, un
+/// candidat identique à une carte déjà retenue est écarté aussi sûrement
+/// qu'un candidat sans aucun intérêt propre.
+const REDUNDANCY_WEIGHT: f32 = 1.0;
 
 /// Tours purement diversifiés, sans aucun signal de similarité — la
 /// cartographie initiale. Au-delà, chaque tour reste un MÉLANGE (voir
@@ -139,6 +166,181 @@ pub fn blend_taste(calibration: &[f32], natural: &[f32]) -> Vec<f32> {
 /// diversifié. Une bascule totale vers la similarité donnait, sur le corpus
 /// actuel, le même auteur tour après tour : resserrer ne doit pas dégénérer
 /// en boucle sur deux ou trois comptes.
+/// Un candidat du vivier, avec son vecteur — tout le raisonnement de
+/// sélection se fait en mémoire sur ce vivier, pas en SQL : les critères
+/// (dispersion, incertitude) portent sur les distances ENTRE candidats, ce
+/// qu'une requête `ORDER BY` ne sait pas exprimer.
+struct Candidate {
+    id: String,
+    author: String,
+    vec: Vec<f32>,
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = (na.sqrt() * nb.sqrt()).max(1e-9);
+    dot / denom
+}
+
+/// Charge le vivier une fois par tour : tweets visibles, embeddés, plafonnés
+/// par auteur DÈS LA REQUÊTE.
+///
+/// Le plafond SQL est ce qui rend la suite honnête : sans lui, un vivier
+/// trié globalement est composé aux trois quarts du compte le plus
+/// prolifique (169 tweets éligibles contre 78 au suivant, relevé en prod), et
+/// aucune sélection en aval ne peut réparer un vivier déjà biaisé.
+async fn load_pool(
+    pg: &PgPool,
+    user_id: &str,
+    excluded: &HashSet<String>,
+) -> Result<Vec<Candidate>> {
+    let client = pg.get().await?;
+    let uid = uuid::Uuid::parse_str(user_id)?;
+    let rows = client
+        .query(
+            r#"
+            SELECT id::text, author::text, embedding FROM (
+                SELECT t.id, t.user_id AS author, t.embedding,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.user_id
+                           ORDER BY COALESCE(ll.quality_score, 0.5) DESC, t.created_at DESC
+                       ) AS rn
+                FROM tweets t
+                JOIN users u ON u.id = t.user_id
+                LEFT JOIN tweet_llm_labels ll ON ll.tweet_id = t.id
+                WHERE t.embedding IS NOT NULL
+                  AND t.deleted_at IS NULL
+                  AND t.moderation_status = 'approved'
+                  AND t.is_private = false
+                  AND COALESCE(t.is_data_test, false) = false
+                  AND u.is_active = true
+                  AND COALESCE(u.is_suspended, false) = false
+                  AND t.user_id != $1
+                  AND t.parent_tweet_id IS NULL
+                  AND COALESCE(t.is_retweet, false) = false
+                  AND COALESCE(t.content, '') != ''
+                  AND LENGTH(COALESCE(t.content, '')) >= 40
+                  AND COALESCE(ll.theme, 'autre') != 'spam_vide'
+            ) ranked
+            WHERE rn <= $2
+            LIMIT $3
+            "#,
+            &[&uid, &POOL_PER_AUTHOR, &POOL_LIMIT],
+        )
+        .await?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id: String = r.try_get(0).ok()?;
+            if excluded.contains(&id) {
+                return None;
+            }
+            let author: String = r.try_get(1).ok()?;
+            let v: Vector = r.try_get(2).ok()?;
+            Some(Candidate {
+                id,
+                author,
+                vec: v.as_slice().to_vec(),
+            })
+        })
+        .collect())
+}
+
+/// Sélection gloutonne commune aux deux stratégies.
+///
+/// `base_score` dit ce qu'on cherche (dispersion, ou incertitude) ; la
+/// pénalité de redondance est ajoutée ici, une fois, parce qu'elle vaut dans
+/// les deux cas : deux cartes quasi identiques dans le même tour, c'est une
+/// question posée deux fois. C'est le point central de la littérature sur le
+/// sujet — les méthodes qui notent chaque item isolément sélectionnent des
+/// graines redondantes, et il faut tenir compte des interactions entre elles
+/// (voir « Deep Rating Elicitation », arXiv 2402.16327).
+fn greedy_pick<F>(pool: &[Candidate], k: usize, base_score: F) -> Vec<String>
+where
+    F: Fn(&Candidate) -> f32,
+{
+    let mut picked: Vec<usize> = Vec::new();
+    let mut per_author: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+
+    while picked.len() < k {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, c) in pool.iter().enumerate() {
+            if picked.contains(&i) {
+                continue;
+            }
+            if per_author.get(c.author.as_str()).copied().unwrap_or(0) >= MAX_PER_AUTHOR_PER_ROUND {
+                continue;
+            }
+            // Redondance : proximité maximale à ce qui est DÉJÀ retenu pour
+            // ce tour.
+            let redundancy = picked
+                .iter()
+                .map(|&j| cosine(&c.vec, &pool[j].vec))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let redundancy = if redundancy == f32::NEG_INFINITY {
+                0.0
+            } else {
+                redundancy
+            };
+            let score = base_score(c) - REDUNDANCY_WEIGHT * redundancy;
+            if best.map_or(true, |(_, b)| score > b) {
+                best = Some((i, score));
+            }
+        }
+        match best {
+            Some((i, _)) => {
+                *per_author.entry(pool[i].author.as_str()).or_insert(0) += 1;
+                picked.push(i);
+            }
+            None => break,
+        }
+    }
+    picked.into_iter().map(|i| pool[i].id.clone()).collect()
+}
+
+/// Premier tour — couverture maximale de l'espace des goûts.
+///
+/// On ne sait rien du lecteur : le meilleur usage de 6 cartes est de couvrir
+/// le plus largement possible ce que la plateforme contient, pour que
+/// n'importe quel goût trouve au moins une prise. La dispersion est obtenue
+/// par la seule pénalité de redondance de `greedy_pick` (score de base
+/// constant) — c'est exactement un échantillonnage du point le plus éloigné.
+fn spread_pick(pool: &[Candidate], k: usize) -> Vec<String> {
+    greedy_pick(pool, k, |_| 0.0)
+}
+
+/// Tours suivants — les cartes les plus INFORMATIVES, pas les plus proches.
+///
+/// Montrer les plus proches voisins de ce qui vient d'être aimé était l'erreur
+/// de la première version : la réponse est connue d'avance, donc la carte
+/// n'apprend rien. Ce qui apprend, c'est la frontière — les contenus dont on
+/// ne sait pas trancher s'ils plaisent ou non, ceux qui sont à égale distance
+/// de ce qui a été accepté et de ce qui a été refusé. C'est la transposition
+/// directe de la sélection par entropie/variance en apprentissage actif :
+/// interroger là où le désaccord est maximal, pas là où le résultat est acquis.
+fn informative_pick(
+    pool: &[Candidate],
+    liked: Option<&Vec<f32>>,
+    disliked: Option<&Vec<f32>>,
+    k: usize,
+) -> Vec<String> {
+    greedy_pick(pool, k, |c| {
+        let s_like = liked.map(|v| cosine(&c.vec, v)).unwrap_or(0.0);
+        let s_dislike = disliked.map(|v| cosine(&c.vec, v)).unwrap_or(0.0);
+        // Marge proche de zéro = frontière = incertitude maximale.
+        -(s_like - s_dislike).abs()
+    })
+}
+
+/// Sélectionne les candidats d'UN tour.
 pub async fn round_candidates(
     pg: &PgPool,
     user_id: &str,
@@ -149,218 +351,31 @@ pub async fn round_candidates(
     let mut excluded: HashSet<String> = liked_so_far.iter().cloned().collect();
     excluded.extend(skipped_so_far.iter().cloned());
 
-    let mut picks: Vec<String> = Vec::new();
-    if round > DIVERSITY_ENFORCED_THROUGH_ROUND {
-        if let Some(taste) = mean_embedding(pg, liked_so_far).await? {
-            let sim_target = TWEETS_PER_ROUND / 2;
-            let sim = similarity_candidates(pg, user_id, &taste, &excluded, sim_target).await?;
-            excluded.extend(sim.iter().cloned());
-            picks.extend(sim);
-        }
-    }
-
-    let remaining = TWEETS_PER_ROUND - picks.len() as i64;
-    if remaining > 0 {
-        let filler = diverse_candidates(pg, user_id, &excluded, remaining).await?;
-        picks.extend(filler);
-    }
-    // Mélange l'ordre d'affichage : sans ça, un tour blendé montrerait
-    // toujours les similaires d'abord, le diversifié en second — un ordre
-    // qui trahirait le mécanisme au lieu de le laisser transparent.
-    picks.shuffle(&mut rand::thread_rng());
-    Ok(picks)
-}
-
-/// Vivier large et diversifié : thèmes et auteurs distincts en priorité,
-/// relâché seulement si le vivier ne suffit pas à remplir le tour — un
-/// dataset encore petit (voir la volumétrie réelle de la plateforme) ne doit
-/// jamais renvoyer un tour vide faute de diversité disponible.
-async fn diverse_candidates(
-    pg: &PgPool,
-    user_id: &str,
-    excluded: &HashSet<String>,
-    limit: i64,
-) -> Result<Vec<String>> {
-    if limit <= 0 {
+    let pool = load_pool(pg, user_id, &excluded).await?;
+    if pool.is_empty() {
         return Ok(Vec::new());
     }
-    let client = pg.get().await?;
-    let uid = uuid::Uuid::parse_str(user_id)?;
-    let pool_limit = (limit * 10).max(60);
-    // Le vivier est constitué PAR AUTEUR (`ROW_NUMBER` partitionné), pas par
-    // qualité globale : un simple `ORDER BY quality DESC LIMIT 60` sur une
-    // table où un seul compte publie plus que tous les autres réunis ramène
-    // un vivier composé quasi uniquement de lui — le plafond en aval n'a
-    // alors plus rien d'autre à choisir. On prend les meilleurs de CHACUN,
-    // puis on trie.
-    let rows = client
-        .query(
-            r#"
-            SELECT id::text, author::text, theme FROM (
-                SELECT t.id, t.user_id AS author, COALESCE(ll.theme, 'autre') AS theme,
-                       COALESCE(ll.quality_score, 0.5) AS q,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY t.user_id
-                           ORDER BY COALESCE(ll.quality_score, 0.5) DESC, t.created_at DESC
-                       ) AS rn
-                FROM tweets t
-                JOIN users u ON u.id = t.user_id
-                LEFT JOIN tweet_llm_labels ll ON ll.tweet_id = t.id
-                WHERE t.deleted_at IS NULL
-                  AND t.moderation_status = 'approved'
-                  AND t.is_private = false
-                  AND COALESCE(t.is_data_test, false) = false
-                  AND u.is_active = true
-                  AND COALESCE(u.is_suspended, false) = false
-                  AND t.user_id != $1
-                  AND t.parent_tweet_id IS NULL
-                  AND COALESCE(t.is_retweet, false) = false
-                  AND COALESCE(t.content, '') != ''
-                  AND COALESCE(ll.theme, 'autre') != 'spam_vide'
-            ) ranked
-            WHERE rn <= 6
-            ORDER BY rn, q DESC
-            LIMIT $2
-            "#,
-            &[&uid, &pool_limit],
-        )
-        .await?;
+    let k = TWEETS_PER_ROUND as usize;
 
-    // Trois passes, dans cet ordre de priorité — c'est la DIVERSITÉ
-    // D'AUTEURS qui compte le plus pour ce que cet écran doit apprendre.
-    //
-    // Une seule passe qui exigeait auteur ET thème inédits était trop
-    // stricte : dès qu'un thème était pris, un auteur encore jamais montré
-    // se faisait écarter à cause de son sujet, et le tour se remplissait
-    // ensuite avec les seconds tweets des mêmes comptes. Résultat mesuré :
-    // 3 auteurs sur un tour de 5, alors que 10 comptes étaient éligibles.
-    let candidates: Vec<(String, String, String)> = rows
-        .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2)))
-        .filter(|(id, _, _): &(String, String, String)| !excluded.contains(id))
-        .collect();
+    if round <= DIVERSITY_ENFORCED_THROUGH_ROUND {
+        return Ok(spread_pick(&pool, k));
+    }
 
-    let mut author_seen: HashSet<String> = HashSet::new();
-    let mut theme_seen: HashSet<String> = HashSet::new();
-    let mut per_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut picked: Vec<String> = Vec::new();
-    let mut taken: HashSet<String> = HashSet::new();
-
-    // Passe 1 — auteur ET thème inédits : l'idéal.
-    for (id, author, theme) in &candidates {
-        if picked.len() as i64 >= limit {
-            break;
-        }
-        if author_seen.contains(author) || theme_seen.contains(theme) {
-            continue;
-        }
-        author_seen.insert(author.clone());
-        theme_seen.insert(theme.clone());
-        *per_author.entry(author.clone()).or_insert(0) += 1;
-        taken.insert(id.clone());
-        picked.push(id.clone());
+    let liked_vec = mean_embedding(pg, liked_so_far).await?;
+    let disliked_vec = mean_embedding(pg, skipped_so_far).await?;
+    if liked_vec.is_none() && disliked_vec.is_none() {
+        // Aucune réponse exploitable (tout ignoré, ou embeddings absents) :
+        // continuer à couvrir large vaut mieux que de deviner.
+        return Ok(spread_pick(&pool, k));
     }
-    // Passe 2 — auteur inédit, quel que soit le thème. Mieux vaut deux
-    // tweets du même thème par deux comptes différents que deux tweets du
-    // même compte.
-    for (id, author, _) in &candidates {
-        if picked.len() as i64 >= limit {
-            break;
-        }
-        if taken.contains(id) || author_seen.contains(author) {
-            continue;
-        }
-        author_seen.insert(author.clone());
-        *per_author.entry(author.clone()).or_insert(0) += 1;
-        taken.insert(id.clone());
-        picked.push(id.clone());
-    }
-    // Passe 3 — remplissage, plafond par auteur toujours actif.
-    for (id, author, _) in &candidates {
-        if picked.len() as i64 >= limit {
-            break;
-        }
-        if taken.contains(id) {
-            continue;
-        }
-        let count = per_author.entry(author.clone()).or_insert(0);
-        if *count >= MAX_PER_AUTHOR_PER_ROUND {
-            continue;
-        }
-        *count += 1;
-        taken.insert(id.clone());
-        picked.push(id.clone());
-    }
-    Ok(picked)
+    Ok(informative_pick(
+        &pool,
+        liked_vec.as_ref(),
+        disliked_vec.as_ref(),
+        k,
+    ))
 }
 
-/// Plus proches voisins sémantiques du goût accumulé CETTE session — même
-/// filtre de visibilité que `diverse_candidates`, avec le même plafond par
-/// auteur (voir `MAX_PER_AUTHOR_PER_ROUND`) : sans lui, les N voisins les
-/// plus proches d'un vecteur de goût peuvent tous appartenir au compte qui
-/// domine le corpus embeddé — exactement ce qui rendait le mécanisme
-/// perceptible et pas juste redondant.
-async fn similarity_candidates(
-    pg: &PgPool,
-    user_id: &str,
-    taste: &[f32],
-    excluded: &HashSet<String>,
-    limit: i64,
-) -> Result<Vec<String>> {
-    if limit <= 0 {
-        return Ok(Vec::new());
-    }
-    let client = pg.get().await?;
-    let uid = uuid::Uuid::parse_str(user_id)?;
-    let vector = Vector::from(taste.to_vec());
-    let pool_limit = (limit * 8).max(48);
-    let rows = client
-        .query(
-            r#"
-            SELECT t.id::text, t.user_id::text FROM tweets t
-            JOIN users u ON u.id = t.user_id
-            WHERE t.embedding IS NOT NULL
-              AND t.deleted_at IS NULL
-              AND t.moderation_status = 'approved'
-              AND t.is_private = false
-              AND COALESCE(t.is_data_test, false) = false
-              AND u.is_active = true
-              AND COALESCE(u.is_suspended, false) = false
-              AND t.user_id != $1
-              AND t.parent_tweet_id IS NULL
-              AND COALESCE(t.is_retweet, false) = false
-            ORDER BY t.embedding <=> $2
-            LIMIT $3
-            "#,
-            &[&uid, &vector, &pool_limit],
-        )
-        .await?;
-
-    let mut per_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut picked = Vec::new();
-    for row in &rows {
-        if picked.len() as i64 >= limit {
-            break;
-        }
-        let id: String = row.get(0);
-        if excluded.contains(&id) {
-            continue;
-        }
-        let author: String = row.get(1);
-        let count = per_author.entry(author).or_insert(0);
-        if *count >= MAX_PER_AUTHOR_PER_ROUND {
-            continue;
-        }
-        *count += 1;
-        picked.push(id);
-    }
-    Ok(picked)
-}
-
-/// Moyenne des embeddings déjà stockés des tweets donnés — pas de calcul
-/// d'embedding ici, seulement une lecture : `mean_embedding` ne dépend donc
-/// jamais de la disponibilité du modèle ONNX (`AppState::embeddings`),
-/// seulement de Postgres.
 async fn mean_embedding(pg: &PgPool, tweet_ids: &[String]) -> Result<Option<Vec<f32>>> {
     if tweet_ids.is_empty() {
         return Ok(None);
@@ -451,6 +466,75 @@ mod tests {
         let natural = vec![0.0f32; EMBEDDING_DIM];
         let blended = blend_taste(&calib, &natural);
         assert!((blended[0] - CALIBRATION_TASTE_WEIGHT).abs() < 1e-6);
+    }
+
+    fn cand(id: &str, author: &str, v: &[f32]) -> Candidate {
+        let mut vec = vec![0.0f32; EMBEDDING_DIM];
+        vec[..v.len()].copy_from_slice(v);
+        Candidate {
+            id: id.into(),
+            author: author.into(),
+            vec,
+        }
+    }
+
+    #[test]
+    fn le_premier_tour_disperse_au_lieu_de_regrouper() {
+        // Trois quasi-jumeaux et deux contenus distincts : une sélection de 3
+        // doit prendre UN des jumeaux, pas les trois. C'est le défaut que la
+        // pénalité de redondance existe pour corriger.
+        let pool = vec![
+            cand("a1", "u1", &[1.0, 0.0, 0.0]),
+            cand("a2", "u2", &[0.99, 0.01, 0.0]),
+            cand("a3", "u3", &[0.98, 0.02, 0.0]),
+            cand("b", "u4", &[0.0, 1.0, 0.0]),
+            cand("c", "u5", &[0.0, 0.0, 1.0]),
+        ];
+        let picked = spread_pick(&pool, 3);
+        assert_eq!(picked.len(), 3);
+        assert!(picked.contains(&"b".to_string()), "picked={picked:?}");
+        assert!(picked.contains(&"c".to_string()), "picked={picked:?}");
+        let jumeaux = picked.iter().filter(|id| id.starts_with('a')).count();
+        assert_eq!(jumeaux, 1, "un seul des trois jumeaux : {picked:?}");
+    }
+
+    #[test]
+    fn les_tours_suivants_visent_la_frontiere_pas_le_deja_acquis() {
+        // Aimé = axe X, rejeté = axe Y. Le contenu le plus informatif est
+        // celui qui tient des deux (la diagonale), pas celui qui ressemble
+        // exactement à ce qui a déjà été aimé : sa réponse est déjà connue.
+        let pool = vec![
+            cand("deja_acquis", "u1", &[1.0, 0.0, 0.0]),
+            cand("deja_rejete", "u2", &[0.0, 1.0, 0.0]),
+            cand("frontiere", "u3", &[0.7, 0.7, 0.0]),
+        ];
+        let liked = {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[0] = 1.0;
+            v
+        };
+        let disliked = {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[1] = 1.0;
+            v
+        };
+        let picked = informative_pick(&pool, Some(&liked), Some(&disliked), 1);
+        assert_eq!(picked, vec!["frontiere".to_string()]);
+    }
+
+    #[test]
+    fn le_plafond_par_auteur_tient_meme_si_un_compte_domine_le_vivier() {
+        let pool = vec![
+            cand("x1", "gros", &[1.0, 0.0, 0.0]),
+            cand("x2", "gros", &[0.0, 1.0, 0.0]),
+            cand("x3", "gros", &[0.0, 0.0, 1.0]),
+            cand("y1", "petit", &[0.5, 0.5, 0.0]),
+        ];
+        let picked = spread_pick(&pool, 4);
+        assert!(
+            picked.iter().filter(|id| id.starts_with('x')).count() <= MAX_PER_AUTHOR_PER_ROUND,
+            "picked={picked:?}"
+        );
     }
 
     #[test]
