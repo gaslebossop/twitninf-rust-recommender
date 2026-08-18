@@ -34,13 +34,24 @@ use tracing::debug;
 use crate::embeddings::average_vectors;
 use crate::services::cache_manager::CacheManager;
 
-pub const ROUNDS: u8 = 5;
-pub const TWEETS_PER_ROUND: i64 = 6;
+pub const ROUNDS: u8 = 4;
+pub const TWEETS_PER_ROUND: i64 = 5;
 
-/// Tours où la diversité d'auteur/thème est forcée. Au-delà, on suit le
-/// signal sémantique même s'il ramène au même auteur plusieurs fois — voir
-/// la doc de module.
-const DIVERSITY_ENFORCED_THROUGH_ROUND: u8 = 2;
+/// Tours purement diversifiés, sans aucun signal de similarité — la
+/// cartographie initiale. Au-delà, chaque tour reste un MÉLANGE (voir
+/// `round_candidates`), jamais une bascule totale vers la seule similarité :
+/// sur un corpus aussi mince que celui de la plateforme aujourd'hui (une
+/// poignée de tweets embeddés, deux ou trois auteurs qui dominent), une
+/// similarité pure ne renvoie plus que ces mêmes comptes — observé en test
+/// réel : 2 auteurs sur les 5 tours.
+const DIVERSITY_ENFORCED_THROUGH_ROUND: u8 = 1;
+
+/// Nombre max de tweets d'un même auteur DANS UN TOUR, quelle que soit la
+/// source (diversifiée ou par similarité). Sans lui, `similarity_candidates`
+/// n'avait aucune limite : les plus proches voisins d'un vecteur de goût
+/// peuvent très bien être 6 tweets du même compte si c'est lui qui domine le
+/// corpus embeddé.
+const MAX_PER_AUTHOR_PER_ROUND: usize = 2;
 
 /// TTL du vecteur de goût de calibration. Rien ne le fait naturellement
 /// expirer comme un avertissement (voir `shadowban::strikes`) : un compte qui
@@ -122,6 +133,12 @@ pub fn blend_taste(calibration: &[f32], natural: &[f32]) -> Vec<f32> {
 }
 
 /// Sélectionne les candidats d'UN tour.
+///
+/// Au-delà de `DIVERSITY_ENFORCED_THROUGH_ROUND`, le tour reste un MÉLANGE —
+/// la moitié au plus vient de la similarité sémantique, le reste du vivier
+/// diversifié. Une bascule totale vers la similarité donnait, sur le corpus
+/// actuel, le même auteur tour après tour : resserrer ne doit pas dégénérer
+/// en boucle sur deux ou trois comptes.
 pub async fn round_candidates(
     pg: &PgPool,
     user_id: &str,
@@ -132,27 +149,26 @@ pub async fn round_candidates(
     let mut excluded: HashSet<String> = liked_so_far.iter().cloned().collect();
     excluded.extend(skipped_so_far.iter().cloned());
 
+    let mut picks: Vec<String> = Vec::new();
     if round > DIVERSITY_ENFORCED_THROUGH_ROUND {
         if let Some(taste) = mean_embedding(pg, liked_so_far).await? {
-            let mut ids =
-                similarity_candidates(pg, user_id, &taste, &excluded, TWEETS_PER_ROUND * 3).await?;
-            ids.shuffle(&mut rand::thread_rng());
-            ids.truncate(TWEETS_PER_ROUND as usize);
-            if ids.len() as i64 == TWEETS_PER_ROUND {
-                return Ok(ids);
-            }
-            // Pas assez de voisins sémantiques (dataset encore petit) : on
-            // complète avec le vivier diversifié plutôt que de renvoyer un
-            // tour incomplet.
-            excluded.extend(ids.iter().cloned());
-            let filler =
-                diverse_candidates(pg, user_id, &excluded, TWEETS_PER_ROUND - ids.len() as i64)
-                    .await?;
-            ids.extend(filler);
-            return Ok(ids);
+            let sim_target = TWEETS_PER_ROUND / 2;
+            let sim = similarity_candidates(pg, user_id, &taste, &excluded, sim_target).await?;
+            excluded.extend(sim.iter().cloned());
+            picks.extend(sim);
         }
     }
-    diverse_candidates(pg, user_id, &excluded, TWEETS_PER_ROUND).await
+
+    let remaining = TWEETS_PER_ROUND - picks.len() as i64;
+    if remaining > 0 {
+        let filler = diverse_candidates(pg, user_id, &excluded, remaining).await?;
+        picks.extend(filler);
+    }
+    // Mélange l'ordre d'affichage : sans ça, un tour blendé montrerait
+    // toujours les similaires d'abord, le diversifié en second — un ordre
+    // qui trahirait le mécanisme au lieu de le laisser transparent.
+    picks.shuffle(&mut rand::thread_rng());
+    Ok(picks)
 }
 
 /// Vivier large et diversifié : thèmes et auteurs distincts en priorité,
@@ -198,8 +214,9 @@ async fn diverse_candidates(
 
     let mut author_seen: HashSet<String> = HashSet::new();
     let mut theme_seen: HashSet<String> = HashSet::new();
+    let mut per_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut picked: Vec<String> = Vec::new();
-    let mut leftovers: Vec<String> = Vec::new();
+    let mut leftovers: Vec<(String, String)> = Vec::new(); // (id, author)
 
     for row in &rows {
         if picked.len() as i64 >= limit {
@@ -212,26 +229,38 @@ async fn diverse_candidates(
         let author: String = row.get(1);
         let theme: String = row.get(2);
         if author_seen.contains(&author) || theme_seen.contains(&theme) {
-            leftovers.push(id);
+            leftovers.push((id, author));
             continue;
         }
-        author_seen.insert(author);
+        author_seen.insert(author.clone());
         theme_seen.insert(theme);
+        *per_author.entry(author).or_insert(0) += 1;
         picked.push(id);
     }
-    for id in leftovers {
+    // Repli : le plafond par auteur reste actif, même ici — sans lui, un
+    // vivier dominé par 2-3 comptes finissait par les répéter jusqu'à
+    // remplir le tour, la diversité stricte ci-dessus n'ayant plus rien à
+    // offrir de nouveau après leurs premiers tweets.
+    for (id, author) in leftovers {
         if picked.len() as i64 >= limit {
             break;
         }
+        let count = per_author.entry(author).or_insert(0);
+        if *count >= MAX_PER_AUTHOR_PER_ROUND {
+            continue;
+        }
+        *count += 1;
         picked.push(id);
     }
     Ok(picked)
 }
 
 /// Plus proches voisins sémantiques du goût accumulé CETTE session — même
-/// filtre de visibilité que `diverse_candidates`, sans la contrainte de
-/// diversité : un tour resserré est le but à partir de
-/// `DIVERSITY_ENFORCED_THROUGH_ROUND`, pas un accident à corriger.
+/// filtre de visibilité que `diverse_candidates`, avec le même plafond par
+/// auteur (voir `MAX_PER_AUTHOR_PER_ROUND`) : sans lui, les N voisins les
+/// plus proches d'un vecteur de goût peuvent tous appartenir au compte qui
+/// domine le corpus embeddé — exactement ce qui rendait le mécanisme
+/// perceptible et pas juste redondant.
 async fn similarity_candidates(
     pg: &PgPool,
     user_id: &str,
@@ -239,14 +268,17 @@ async fn similarity_candidates(
     excluded: &HashSet<String>,
     limit: i64,
 ) -> Result<Vec<String>> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
     let client = pg.get().await?;
     let uid = uuid::Uuid::parse_str(user_id)?;
     let vector = Vector::from(taste.to_vec());
-    let pool_limit = (limit * 4).max(24);
+    let pool_limit = (limit * 8).max(48);
     let rows = client
         .query(
             r#"
-            SELECT t.id::text FROM tweets t
+            SELECT t.id::text, t.user_id::text FROM tweets t
             JOIN users u ON u.id = t.user_id
             WHERE t.embedding IS NOT NULL
               AND t.deleted_at IS NULL
@@ -264,12 +296,26 @@ async fn similarity_candidates(
             &[&uid, &vector, &pool_limit],
         )
         .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|r| r.try_get::<_, String>(0).ok())
-        .filter(|id| !excluded.contains(id))
-        .take(limit as usize)
-        .collect())
+
+    let mut per_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut picked = Vec::new();
+    for row in &rows {
+        if picked.len() as i64 >= limit {
+            break;
+        }
+        let id: String = row.get(0);
+        if excluded.contains(&id) {
+            continue;
+        }
+        let author: String = row.get(1);
+        let count = per_author.entry(author).or_insert(0);
+        if *count >= MAX_PER_AUTHOR_PER_ROUND {
+            continue;
+        }
+        *count += 1;
+        picked.push(id);
+    }
+    Ok(picked)
 }
 
 /// Moyenne des embeddings déjà stockés des tweets donnés — pas de calcul
@@ -317,6 +363,16 @@ pub async fn finish(
     if let Some(taste) = mean_embedding(pg, liked_tweet_ids).await? {
         cache.calibration_save_taste(user_id, &taste).await;
     }
+
+    // Sans ces deux invalidations, une recalibration ne change RIEN au
+    // fil pendant jusqu'à 5 minutes : le profil (`twitninf:profile:*`,
+    // contient le vecteur de goût) et la liste déjà classée
+    // (`twitninf:reco:*`) restent tous deux en cache indépendamment de ce
+    // qui vient d'être écrit ci-dessus. C'est le point même de la
+    // fonctionnalité — la sanctionner par un délai silencieux la rend
+    // indiscernable d'un bouton qui ne fait rien.
+    cache.invalidate_profile(user_id).await;
+    cache.invalidate_recommendations(user_id).await;
 
     let uuids: Vec<uuid::Uuid> = liked_tweet_ids
         .iter()

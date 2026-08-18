@@ -99,6 +99,16 @@ impl CacheManager {
         }
     }
 
+    /// Force la reconstruction du profil au prochain appel — sans ça, un
+    /// changement qui vit dans le profil (vecteur de goût de calibration,
+    /// notamment) reste invisible jusqu'à expiration du cache (300s), même
+    /// après avoir invalidé la liste de recommandations.
+    pub async fn invalidate_profile(&self, user_id: &str) {
+        let key = format!("twitninf:profile:{user_id}");
+        let mut c = self.conn.lock().await;
+        let _: Result<(), _> = c.del(&key).await;
+    }
+
     // ─── Scores de tweets ─────────────────────────────────────────────────────
 
     // ─── Tweets vus ───────────────────────────────────────────────────────────
