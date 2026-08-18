@@ -77,6 +77,24 @@ pub const TRENDING_HOOK_TEMPERATURE: f64 = 0.35;
 /// vélocité comparable, jamais assez pour faire remonter un tweet faible.
 pub const TRENDING_MEDIA_BOOST: f64 = 1.12;
 
+/// Mode Trending UNIQUEMENT : renfort maximal des tweets proches du goût du
+/// lecteur (`UserProfile::taste_vector`, moyenne des embeddings de ses likes).
+///
+/// ── Pourquoi seulement ici ────────────────────────────────────────────────
+/// `ForYou` part déjà du graphe social et de l'affinité d'auteur ; `Discover`
+/// fait exprès l'inverse (il déprécie les comptes suivis). Trending, lui, ne
+/// regardait QUE la vélocité d'engagement : la page de découverte montrait donc
+/// à tout le monde la même chose, quels que soient les goûts. Ce renfort la
+/// personnalise sans lui retirer son rôle — la vélocité reste le premier
+/// facteur, l'affinité ne fait que départager.
+///
+/// ── Pourquoi ce plafond ───────────────────────────────────────────────────
+/// 1,18 est du même ordre que `TRENDING_MEDIA_BOOST` : de quoi trancher entre
+/// deux tweets de vélocité comparable, jamais de quoi faire remonter un tweet
+/// faible. Plus haut, la grille se refermerait sur ce que le lecteur aime déjà
+/// — ce qui est précisément ce qu'une page d'exploration doit éviter.
+pub const TRENDING_TASTE_BOOST_MAX: f64 = 1.18;
+
 /// `exclude_seen` : nombre de candidats à conserver au minimum après filtrage.
 ///
 /// Écarter tout ce que le lecteur a déjà vu est ce qui rend la page neuve d'une

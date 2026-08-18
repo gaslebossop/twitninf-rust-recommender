@@ -17,7 +17,7 @@ use crate::constants::{
     COLD_START_FOLLOW_BOOST_MAX, COLD_START_INTERACTION_FLOOR, EXCLUDE_SEEN_MIN_REMAINING,
     FOLLOW_FEED_BOOST, FOLLOW_MUTUAL_BOOST, TRENDING_HOOK_POOL, TRENDING_HOOK_SIZE,
     TRENDING_HOOK_TEMPERATURE, TRENDING_MEDIA_BOOST, TRENDING_MIN_POOL,
-    TRENDING_SHUFFLE_TEMPERATURE, TRENDING_WIDEN_FACTOR,
+    TRENDING_SHUFFLE_TEMPERATURE, TRENDING_TASTE_BOOST_MAX, TRENDING_WIDEN_FACTOR,
 };
 use crate::experiments;
 use crate::ml::auto_tuner::AutoTuner;
@@ -443,6 +443,11 @@ impl RecommenderService {
         // plus (deux `MGET`, voir `bandit::contextual::store::load_arm_stats`).
         let arm_stats = self.cache.load_arm_stats(&author_ids).await;
 
+        // Renfort d'affinité, mode Trending (= onglet Explorer) UNIQUEMENT.
+        // Calculé ici et non dans `score_all`, qui est synchrone : même patron
+        // que `velocity_throttles` et `realtime_author_boosts` juste au-dessus.
+        let taste_boosts = self.taste_boosts(&mode, &profile, &deduped).await;
+
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
         let mut auto_strike_candidates = Vec::new();
         let scored = self.score_all(
@@ -453,6 +458,7 @@ impl RecommenderService {
             &velocity_throttles,
             &realtime_author_boosts,
             &arm_stats,
+            &taste_boosts,
             &mut auto_strike_candidates,
         );
         debug!(scored_count = scored.len(), "Scoring complete");
@@ -604,6 +610,61 @@ impl RecommenderService {
         })
     }
 
+    /// Facteurs de renfort d'affinité, indexés par id de tweet.
+    ///
+    /// Vide partout SAUF en mode Trending : c'est une décision de produit, pas
+    /// une optimisation. `ForYou` est déjà personnalisé par le graphe social et
+    /// l'affinité d'auteur, et `Discover` cherche délibérément l'inverse (il
+    /// déprécie les comptes suivis) — y ajouter ce renfort brouillerait ce que
+    /// chaque mode est censé faire. Voir `TRENDING_TASTE_BOOST_MAX`.
+    ///
+    /// Vide aussi quand le lecteur n'a pas encore de vecteur de goût (compte
+    /// neuf, ou likes pas encore embeddés) : la page reste alors exactement ce
+    /// qu'elle était avant ce renfort.
+    async fn taste_boosts(
+        &self,
+        mode: &RecommendMode,
+        profile: &UserProfile,
+        tweets: &[RawTweet],
+    ) -> HashMap<String, f64> {
+        if *mode != RecommendMode::Trending {
+            return HashMap::new();
+        }
+        let Some(taste) = profile.taste_vector.as_ref() else {
+            debug!(
+                user_id = %profile.user_id,
+                "Trending: pas de vecteur de goût, aucun renfort d'affinité"
+            );
+            return HashMap::new();
+        };
+
+        let ids: Vec<String> = tweets.iter().map(|t| t.id.clone()).collect();
+        let similarities = match crate::embeddings::taste_similarities(&self.pg, taste, &ids).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // Silencieux à dessein : le renfort est un complément, son
+                // absence doit laisser une page de tendances normale.
+                debug!(user_id = %profile.user_id, error = %e,
+                       "Trending: similarités de goût indisponibles");
+                return HashMap::new();
+            }
+        };
+
+        let factors = crate::algorithm::trending::taste_boost_factors(
+            &similarities,
+            TRENDING_TASTE_BOOST_MAX,
+        );
+        debug!(
+            user_id = %profile.user_id,
+            mesures = similarities.len(),
+            renforces = factors.len(),
+            candidats = tweets.len(),
+            "Trending: renfort d'affinité calculé"
+        );
+        factors
+    }
+
     fn score_all(
         &self,
         tweets: &[RawTweet],
@@ -613,6 +674,7 @@ impl RecommenderService {
         velocity_throttles: &HashMap<String, f64>,
         realtime_author_boosts: &HashMap<String, f64>,
         arm_stats: &HashMap<String, (f64, u32)>,
+        taste_boosts: &HashMap<String, f64>,
         auto_strike_candidates: &mut Vec<AutoStrikeCandidate>,
     ) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
@@ -732,10 +794,18 @@ impl RecommenderService {
                         blended *= TRENDING_MEDIA_BOOST;
                     }
 
+                    // ── Affinité de goût, propre à ce mode ────────────────────
+                    // Absent de la map = 1,0 : soit le tweet n'a pas
+                    // d'embedding, soit il est sous la médiane du vivier. Dans
+                    // les deux cas il garde son score, il n'est jamais pénalisé
+                    // — voir `taste_boost_factors`.
+                    let taste_boost = taste_boosts.get(&tweet.id).copied().unwrap_or(1.0);
+                    blended *= taste_boost;
+
                     s.score = blended.clamp(0.0, 1.0);
                     trace!(tweet_id = %tweet.id, base_score, trending_score = ts, fatigue,
-                           has_media = tweet.has_media, final_score = s.score,
-                           "Trending mode: 40% base + 60% trending, fatigue et média appliqués");
+                           has_media = tweet.has_media, taste_boost, final_score = s.score,
+                           "Trending mode: 40% base + 60% trending, fatigue, média et affinité appliqués");
                 }
                 RecommendMode::Discover => {
                     let mut multiplier = 1.0;
