@@ -32,16 +32,22 @@ use tracing::{debug, warn};
 use crate::models::{UserProfile, UserType};
 use crate::services::cache_manager::CacheManager;
 
-/// Position de l'UNIQUE emplacement publicitaire d'une page.
+/// Position du premier emplacement publicitaire, puis intervalle entre deux.
 ///
 /// Jamais en tête : la première chose vue à l'ouverture doit être du contenu.
-///
-/// Il y avait avant un emplacement tous les 4 tweets, jusqu'à 12 par page, et
-/// la boucle de remplissage tournait en rond sur l'inventaire — donc avec une
-/// seule campagne active, le lecteur voyait la MÊME publicité toutes les
-/// quatre lignes, douze fois par page. Un fil n'est pas un espace publicitaire
-/// avec du contenu entre deux encarts : une page, une publicité.
-const AD_SLOT: usize = 4;
+/// La cadence (un emplacement tous les 4 tweets) est un choix produit assumé
+/// — répéter la MÊME publicité d'un emplacement à l'autre est acceptable tant
+/// qu'une seule campagne est éligible pour ce lecteur ; c'est `fatigued_score`
+/// plus bas qui fait tourner l'affichage vers une autre dès qu'il y en a
+/// plusieurs, plutôt que de laisser la mieux notée occuper tous les
+/// emplacements.
+const FIRST_SLOT: usize = 4;
+const SLOT_INTERVAL: usize = 4;
+
+/// Plafond de sécurité par page. C'est l'intervalle ci-dessus qui règle la
+/// densité perçue, pas ce nombre — il n'est là que pour éviter qu'une page
+/// très longue ne devienne un catalogue.
+const MAX_ADS_PER_PAGE: usize = 12;
 
 /// Plafond d'impressions par lecteur et par publicité sur 24 h, quand
 /// l'annonceur n'en a pas fixé un.
@@ -64,10 +70,12 @@ const FREQ_CAP_TTL_SECS: i64 = 86_400;
 /// Décote appliquée au score à chaque fois que ce lecteur a déjà vu la
 /// publicité aujourd'hui.
 ///
-/// Avec un seul emplacement par page, un classement par score seul donnerait
-/// TOUT l'inventaire à la mieux notée : le lecteur reverrait la même campagne
-/// page après page, et les autres annonceurs ne sortiraient jamais. La décote
-/// laisse la meilleure passer d'abord, puis s'efface au profit des suivantes.
+/// Sans elle, un classement par score seul donnerait TOUS les emplacements à
+/// la mieux notée à chaque page : le lecteur reverrait la même campagne en
+/// boucle, et les autres annonceurs ne sortiraient jamais tant qu'elle reste
+/// éligible. La décote laisse la meilleure passer d'abord, puis s'efface au
+/// profit des suivantes — d'une page à l'autre, et au sein d'une même page
+/// via la rotation de `select_for_feed`.
 const FATIGUE_PER_VIEW: f64 = 0.85;
 
 /// Décalage horaire de la plateforme par rapport à UTC.
@@ -382,7 +390,7 @@ pub async fn select_for_feed(
     profile: &UserProfile,
     page_len: usize,
 ) -> Vec<AdPlacement> {
-    if page_len < AD_SLOT {
+    if page_len < FIRST_SLOT {
         return Vec::new();
     }
     let ads = match load_active_ads(pg, user_id).await {
@@ -435,31 +443,65 @@ pub async fn select_for_feed(
             )
     });
 
-    let Some((ad, raw, _)) = scored.first() else {
+    if scored.is_empty() {
         return Vec::new();
-    };
+    }
 
-    // UNE publicité, à un seul endroit de la page. Voir `AD_SLOT`.
-    let placements = vec![AdPlacement {
-        advertisement_id: ad.id.clone(),
-        target_type: ad.target_type.clone(),
-        tweet_id: ad.tweet_id.clone(),
-        target_user_id: ad.target_user_id.clone(),
-        position: AD_SLOT,
-        match_score: (raw * 1000.0).round() / 1000.0,
-    }];
+    // On remplit TOUS les emplacements de la page, en tournant sur les
+    // publicités retenues. Avec une seule campagne éligible, la même
+    // publicité revient à chaque emplacement — c'est voulu : mieux vaut
+    // répéter ce qu'on a que laisser des emplacements vides. Avec plusieurs
+    // campagnes, `fatigued_score` fait déjà pencher le tri vers celles que ce
+    // lecteur a le moins vues, donc la rotation qui suit ne se contente pas de
+    // resservir la mieux notée en boucle.
+    let mut placements = Vec::new();
+    let mut position = FIRST_SLOT;
+    let mut i = 0usize;
+    let mut used: HashMap<&str, u32> = HashMap::new();
+
+    while position < page_len && placements.len() < MAX_ADS_PER_PAGE {
+        // Une publicité peut se répéter, mais pas au-delà de son plafond
+        // journalier restant : sinon une seule page pourrait le franchir.
+        let mut placed = false;
+        for _ in 0..scored.len() {
+            let (ad, raw, _) = &scored[i % scored.len()];
+            i += 1;
+            let cap = ad.targeting.daily_cap.unwrap_or(DEFAULT_DAILY_CAP);
+            let already = seen.get(&ad.id).copied().unwrap_or(0);
+            let this_page = used.get(ad.id.as_str()).copied().unwrap_or(0);
+            if already + this_page >= cap {
+                continue;
+            }
+            *used.entry(ad.id.as_str()).or_insert(0) += 1;
+            placements.push(AdPlacement {
+                advertisement_id: ad.id.clone(),
+                target_type: ad.target_type.clone(),
+                tweet_id: ad.tweet_id.clone(),
+                target_user_id: ad.target_user_id.clone(),
+                position,
+                match_score: (raw * 1000.0).round() / 1000.0,
+            });
+            placed = true;
+            break;
+        }
+        if !placed {
+            break; // toutes les publicités ont atteint leur plafond
+        }
+        position += SLOT_INTERVAL;
+    }
 
     for p in &placements {
         cache
             .ads_record_impression(user_id, &p.advertisement_id)
             .await;
     }
-    debug!(
-        user_id,
-        ad_id = %ad.id,
-        target = %ad.target_type,
-        "Publicité ciblée servie"
-    );
+    if !placements.is_empty() {
+        debug!(
+            user_id,
+            count = placements.len(),
+            "Publicités ciblées servies"
+        );
+    }
     placements
 }
 
@@ -568,9 +610,9 @@ mod tests {
 
     #[test]
     fn la_repetition_fait_passer_la_main_a_une_autre_campagne() {
-        // Avec un seul emplacement par page, la mieux notée le prendrait
-        // indéfiniment. Après quelques vues, une campagne un peu moins bien
-        // notée mais jamais servie doit passer devant.
+        // Sans décote, la mieux notée occuperait tous les emplacements de
+        // toutes les pages indéfiniment. Après quelques vues, une campagne un
+        // peu moins bien notée mais jamais servie doit passer devant.
         let forte = 0.90;
         let autre = 0.70;
         assert!(
