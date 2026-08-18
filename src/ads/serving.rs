@@ -36,11 +36,22 @@ use crate::services::cache_manager::CacheManager;
 ///
 /// Jamais en tête : la première chose vue à l'ouverture doit être du contenu.
 const FIRST_SLOT: usize = 4;
-const SLOT_INTERVAL: usize = 12;
+const SLOT_INTERVAL: usize = 4;
 
-/// Nombre maximum de publicités par page servie, quel qu'en soit le nombre
-/// d'éligibles.
-const MAX_ADS_PER_PAGE: usize = 3;
+/// Plafond de sécurité par page. Volontairement large : c'est l'intervalle
+/// ci-dessus qui règle la densité, pas ce nombre — il n'est là que pour
+/// éviter qu'une page très longue ne devienne un catalogue.
+const MAX_ADS_PER_PAGE: usize = 12;
+
+/// Plafond d'impressions par lecteur et par publicité sur 24 h, quand
+/// l'annonceur n'en a pas fixé un.
+///
+/// Généreux à dessein : une publicité vue une fois doit pouvoir revenir. Ce
+/// n'est pas parce qu'un lecteur l'a croisée qu'elle a produit son effet —
+/// la répétition est le mécanisme même de la publicité. Le plafond n'existe
+/// que pour éviter qu'un budget soit consommé par un seul lecteur en une
+/// session.
+const DEFAULT_DAILY_CAP: u32 = 150;
 
 /// Score de correspondance en dessous duquel la publicité n'est pas servie du
 /// tout. Mieux vaut un emplacement vide qu'une publicité hors sujet : elle
@@ -49,6 +60,22 @@ const MIN_MATCH_SCORE: f64 = 0.20;
 
 /// Fenêtre de plafonnement par lecteur et par publicité.
 const FREQ_CAP_TTL_SECS: i64 = 86_400;
+
+/// Décalage horaire de la plateforme par rapport à UTC.
+///
+/// Le ciblage par heure était évalué en UTC pendant que l'annonceur
+/// choisissait ses heures en pensant à l'heure qu'il lit sur son téléphone :
+/// une campagne réglée sur « 21h » ne sortait donc pas à 21h locales. Le
+/// serveur tourne en `Etc/UTC` et n'a aucun moyen de deviner le fuseau du
+/// lecteur ; on retient donc celui de la plateforme, et la liste d'heures
+/// proposée côté API est calculée avec le MÊME décalage — sans quoi les
+/// effectifs affichés désigneraient d'autres heures que celles ciblées.
+fn platform_hour_offset() -> i64 {
+    std::env::var("PLATFORM_UTC_OFFSET_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AdPlacement {
@@ -316,7 +343,7 @@ pub async fn select_for_feed(
 
     let ids: Vec<String> = ads.iter().map(|a| a.id.clone()).collect();
     let seen = cache.ads_load_seen_counts(user_id, &ids).await;
-    let hour_now = chrono::Utc::now()
+    let hour_now = (chrono::Utc::now() + chrono::Duration::hours(platform_hour_offset()))
         .format("%H")
         .to_string()
         .parse::<u32>()
@@ -325,12 +352,12 @@ pub async fn select_for_feed(
     let mut scored: Vec<(&AdRow, f64)> = ads
         .iter()
         .filter(|a| {
+            // `max_impressions_per_user` (colonne, défaut 1) ne sert plus de
+            // plafond d'affichage : à 1, une publicité disparaissait
+            // définitivement après une seule vue. Elle reste le plafond de
+            // FACTURATION côté API, ce qui est un autre sujet.
             let already = seen.get(&a.id).copied().unwrap_or(0);
-            let cap = a
-                .targeting
-                .daily_cap
-                .unwrap_or_else(|| a.max_per_user.max(1) as u32);
-            already < cap
+            already < a.targeting.daily_cap.unwrap_or(DEFAULT_DAILY_CAP)
         })
         .map(|a| {
             let s = match_score(a, profile, hour_now);
@@ -351,26 +378,49 @@ pub async fn select_for_feed(
             )
     });
 
-    let mut placements = Vec::new();
-    let mut used_advertisers: Vec<&str> = Vec::new();
-    let mut position = FIRST_SLOT;
+    if scored.is_empty() {
+        return Vec::new();
+    }
 
-    for (ad, score) in scored {
-        if placements.len() >= MAX_ADS_PER_PAGE || position >= page_len {
+    // On remplit TOUS les emplacements de la page, en tournant sur les
+    // publicités retenues. Une même publicité peut donc revenir plusieurs
+    // fois : avec une seule campagne active, l'alternative serait un unique
+    // emplacement occupé et tous les autres vides.
+    //
+    // La rotation part des mieux notées et repasse au début une fois la
+    // liste épuisée — l'ordre du classement est ainsi respecté à chaque tour,
+    // plutôt que de servir la meilleure partout.
+    let mut placements = Vec::new();
+    let mut position = FIRST_SLOT;
+    let mut i = 0usize;
+    let mut used: HashMap<&str, u32> = HashMap::new();
+
+    while position < page_len && placements.len() < MAX_ADS_PER_PAGE {
+        // Une publicité peut se répéter, mais pas au-delà de son plafond
+        // journalier restant : sinon une seule page pourrait le franchir.
+        let mut placed = false;
+        for _ in 0..scored.len() {
+            let (ad, score) = &scored[i % scored.len()];
+            i += 1;
+            let cap = ad.targeting.daily_cap.unwrap_or(DEFAULT_DAILY_CAP);
+            let already = seen.get(&ad.id).copied().unwrap_or(0);
+            let this_page = used.get(ad.id.as_str()).copied().unwrap_or(0);
+            if already + this_page >= cap {
+                continue;
+            }
+            *used.entry(ad.id.as_str()).or_insert(0) += 1;
+            placements.push(AdPlacement {
+                advertisement_id: ad.id.clone(),
+                tweet_id: ad.tweet_id.clone(),
+                position,
+                match_score: (score * 1000.0).round() / 1000.0,
+            });
+            placed = true;
             break;
         }
-        // Jamais deux publicités du même annonceur sur une page : sinon un
-        // seul budget suffit à occuper tous les emplacements.
-        if used_advertisers.contains(&ad.advertiser_id.as_str()) {
-            continue;
+        if !placed {
+            break; // toutes les publicités ont atteint leur plafond
         }
-        used_advertisers.push(&ad.advertiser_id);
-        placements.push(AdPlacement {
-            advertisement_id: ad.id.clone(),
-            tweet_id: ad.tweet_id.clone(),
-            position,
-            match_score: (score * 1000.0).round() / 1000.0,
-        });
         position += SLOT_INTERVAL;
     }
 
