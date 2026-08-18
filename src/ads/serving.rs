@@ -32,16 +32,16 @@ use tracing::{debug, warn};
 use crate::models::{UserProfile, UserType};
 use crate::services::cache_manager::CacheManager;
 
-/// Position de la première publicité dans le fil, puis intervalle.
+/// Position de l'UNIQUE emplacement publicitaire d'une page.
 ///
 /// Jamais en tête : la première chose vue à l'ouverture doit être du contenu.
-const FIRST_SLOT: usize = 4;
-const SLOT_INTERVAL: usize = 4;
-
-/// Plafond de sécurité par page. Volontairement large : c'est l'intervalle
-/// ci-dessus qui règle la densité, pas ce nombre — il n'est là que pour
-/// éviter qu'une page très longue ne devienne un catalogue.
-const MAX_ADS_PER_PAGE: usize = 12;
+///
+/// Il y avait avant un emplacement tous les 4 tweets, jusqu'à 12 par page, et
+/// la boucle de remplissage tournait en rond sur l'inventaire — donc avec une
+/// seule campagne active, le lecteur voyait la MÊME publicité toutes les
+/// quatre lignes, douze fois par page. Un fil n'est pas un espace publicitaire
+/// avec du contenu entre deux encarts : une page, une publicité.
+const AD_SLOT: usize = 4;
 
 /// Plafond d'impressions par lecteur et par publicité sur 24 h, quand
 /// l'annonceur n'en a pas fixé un.
@@ -60,6 +60,15 @@ const MIN_MATCH_SCORE: f64 = 0.20;
 
 /// Fenêtre de plafonnement par lecteur et par publicité.
 const FREQ_CAP_TTL_SECS: i64 = 86_400;
+
+/// Décote appliquée au score à chaque fois que ce lecteur a déjà vu la
+/// publicité aujourd'hui.
+///
+/// Avec un seul emplacement par page, un classement par score seul donnerait
+/// TOUT l'inventaire à la mieux notée : le lecteur reverrait la même campagne
+/// page après page, et les autres annonceurs ne sortiraient jamais. La décote
+/// laisse la meilleure passer d'abord, puis s'efface au profit des suivantes.
+const FATIGUE_PER_VIEW: f64 = 0.85;
 
 /// Décalage horaire de la plateforme par rapport à UTC.
 ///
@@ -80,7 +89,12 @@ fn platform_hour_offset() -> i64 {
 #[derive(Debug, Clone, Serialize)]
 pub struct AdPlacement {
     pub advertisement_id: String,
-    pub tweet_id: String,
+    /// `tweet` ou `profile` — une publicité met en avant un post OU un compte.
+    pub target_type: String,
+    /// Renseigné pour `target_type = "tweet"`.
+    pub tweet_id: Option<String>,
+    /// Renseigné pour `target_type = "profile"`.
+    pub target_user_id: Option<String>,
     /// Index d'insertion dans la page servie.
     pub position: usize,
     pub match_score: f64,
@@ -118,11 +132,14 @@ pub struct AlgoTargeting {
 
 struct AdRow {
     id: String,
-    tweet_id: String,
+    target_type: String,
+    tweet_id: Option<String>,
+    target_user_id: Option<String>,
     advertiser_id: String,
     targeting: AlgoTargeting,
-    /// Embedding du tweet promu — permet de mesurer la proximité avec le
-    /// vecteur de goût du lecteur sans qu'aucun critère n'ait été saisi.
+    /// Embedding de ce qui est promu — le tweet lui-même, ou le dernier tweet
+    /// du compte promu. Permet de mesurer la proximité avec le vecteur de goût
+    /// du lecteur sans qu'aucun critère n'ait été saisi.
     embedding: Option<Vec<f32>>,
     remaining_budget: f64,
     max_per_user: i32,
@@ -180,30 +197,64 @@ async fn load_active_ads(pg: &PgPool, reader_id: &str) -> Result<Vec<AdRow>> {
     let rows = client
         .query(
             r#"
-            SELECT a.id::text, a.tweet_id::text, a.user_id::text,
+            SELECT a.id::text,
+                   COALESCE(a.target_type, 'tweet'),
+                   a.tweet_id::text,
+                   a.target_user_id::text,
+                   a.user_id::text,
                    COALESCE(a.targeting_criteria, '{}'::jsonb),
-                   t.embedding,
+                   -- Un tweet promu porte son propre embedding. Un COMPTE
+                   -- promu n'en a pas : on prend celui de son dernier tweet,
+                   -- qui est ce qu'on a de plus proche de « ce que ce compte
+                   -- publie ». Approximatif et assumé — à défaut, le score
+                   -- retomberait sur la valeur neutre.
+                   COALESCE(t.embedding, (
+                       SELECT t2.embedding FROM tweets t2
+                       WHERE t2.user_id = a.target_user_id
+                         AND t2.embedding IS NOT NULL
+                         AND t2.deleted_at IS NULL
+                       ORDER BY t2.created_at DESC LIMIT 1
+                   )),
                    a.budget::float8 - COALESCE((
                        SELECT COUNT(*) * a.cost_per_impression
                        FROM ad_impressions i WHERE i.advertisement_id = a.id
                    ), 0)::float8,
                    COALESCE(a.max_impressions_per_user, 1)
             FROM advertisements a
-            JOIN tweets t ON t.id = a.tweet_id
+            LEFT JOIN tweets t  ON t.id  = a.tweet_id
+            LEFT JOIN users  ta ON ta.id = t.user_id
+            LEFT JOIN users  pu ON pu.id = a.target_user_id
             JOIN users u ON u.id = a.user_id
             WHERE a.status = 'active'
               AND a.start_date <= NOW()
               AND (a.end_date IS NULL OR a.end_date > NOW())
-              -- Le tweet promu obéit aux mêmes règles de visibilité que
+              -- Ce qui est promu obéit aux mêmes règles de visibilité que
               -- n'importe quel candidat : payer ne dispense pas d'être
-              -- publiable.
-              AND t.deleted_at IS NULL
-              AND t.moderation_status = 'approved'
-              AND t.is_private = false
+              -- publiable. Depuis qu'on peut promouvoir le contenu d'un
+              -- AUTRE, c'est bien l'auteur du tweet (`ta`) qu'il faut
+              -- vérifier, pas seulement l'annonceur (`u`) qui paie.
+              AND (
+                (COALESCE(a.target_type, 'tweet') = 'tweet'
+                   AND t.id IS NOT NULL
+                   AND t.deleted_at IS NULL
+                   AND t.moderation_status = 'approved'
+                   AND t.is_private = false
+                   AND ta.is_active = true
+                   AND COALESCE(ta.is_suspended, false) = false
+                   AND COALESCE(ta.is_private_account, false) = false)
+                OR
+                (a.target_type = 'profile'
+                   AND pu.id IS NOT NULL
+                   AND pu.is_active = true
+                   AND COALESCE(pu.is_suspended, false) = false
+                   AND COALESCE(pu.is_private_account, false) = false)
+              )
               AND u.is_active = true
               AND COALESCE(u.is_suspended, false) = false
-              -- On ne sert jamais à quelqu'un sa propre publicité.
+              -- On ne sert jamais à quelqu'un sa propre publicité, ni la
+              -- promotion de son propre compte.
               AND a.user_id <> $1
+              AND (a.target_user_id IS NULL OR a.target_user_id <> $1)
             "#,
             &[&uid],
         )
@@ -213,22 +264,24 @@ async fn load_active_ads(pg: &PgPool, reader_id: &str) -> Result<Vec<AdRow>> {
         .iter()
         .filter_map(|r| {
             let targeting: AlgoTargeting = r
-                .try_get::<_, serde_json::Value>(3)
+                .try_get::<_, serde_json::Value>(5)
                 .ok()
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
             Some(AdRow {
                 id: r.try_get(0).ok()?,
-                tweet_id: r.try_get(1).ok()?,
-                advertiser_id: r.try_get(2).ok()?,
+                target_type: r.try_get(1).unwrap_or_else(|_| "tweet".to_string()),
+                tweet_id: r.try_get::<_, Option<String>>(2).ok().flatten(),
+                target_user_id: r.try_get::<_, Option<String>>(3).ok().flatten(),
+                advertiser_id: r.try_get(4).ok()?,
                 targeting,
                 embedding: r
-                    .try_get::<_, Option<Vector>>(4)
+                    .try_get::<_, Option<Vector>>(6)
                     .ok()
                     .flatten()
                     .map(|v| v.as_slice().to_vec()),
-                remaining_budget: r.try_get(5).unwrap_or(0.0),
-                max_per_user: r.try_get(6).unwrap_or(1),
+                remaining_budget: r.try_get(7).unwrap_or(0.0),
+                max_per_user: r.try_get(8).unwrap_or(1),
             })
         })
         .filter(|a| a.remaining_budget > 0.0)
@@ -329,7 +382,7 @@ pub async fn select_for_feed(
     profile: &UserProfile,
     page_len: usize,
 ) -> Vec<AdPlacement> {
-    if page_len < FIRST_SLOT {
+    if page_len < AD_SLOT {
         return Vec::new();
     }
     let ads = match load_active_ads(pg, user_id).await {
@@ -349,27 +402,31 @@ pub async fn select_for_feed(
         .parse::<u32>()
         .unwrap_or(12);
 
-    let mut scored: Vec<(&AdRow, f64)> = ads
+    let mut scored: Vec<(&AdRow, f64, f64)> = ads
         .iter()
         .filter(|a| {
-            // `max_impressions_per_user` (colonne, défaut 1) ne sert plus de
-            // plafond d'affichage : à 1, une publicité disparaissait
+            // `max_impressions_per_user` (colonne, défaut 1) ne sert pas de
+            // plafond d'affichage : à 1, une publicité disparaîtrait
             // définitivement après une seule vue. Elle reste le plafond de
             // FACTURATION côté API, ce qui est un autre sujet.
             let already = seen.get(&a.id).copied().unwrap_or(0);
             already < a.targeting.daily_cap.unwrap_or(DEFAULT_DAILY_CAP)
         })
         .map(|a| {
-            let s = match_score(a, profile, hour_now);
-            (a, s)
+            let raw = match_score(a, profile, hour_now);
+            let already = seen.get(&a.id).copied().unwrap_or(0);
+            (a, raw, fatigued_score(raw, already))
         })
-        .filter(|(_, s)| *s >= MIN_MATCH_SCORE)
+        // Le seuil porte sur le score BRUT : la décote de répétition sert à
+        // faire tourner l'inventaire, pas à disqualifier une publicité qui
+        // correspond réellement au lecteur.
+        .filter(|(_, raw, _)| *raw >= MIN_MATCH_SCORE)
         .collect();
 
     // Le budget restant départage à correspondance égale — une campagne qui
-    // s'éteint ne doit pas monopoliser les emplacements.
+    // s'éteint ne doit pas monopoliser l'emplacement.
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+        b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(
                 b.0.remaining_budget
@@ -378,65 +435,37 @@ pub async fn select_for_feed(
             )
     });
 
-    if scored.is_empty() {
+    let Some((ad, raw, _)) = scored.first() else {
         return Vec::new();
-    }
+    };
 
-    // On remplit TOUS les emplacements de la page, en tournant sur les
-    // publicités retenues. Une même publicité peut donc revenir plusieurs
-    // fois : avec une seule campagne active, l'alternative serait un unique
-    // emplacement occupé et tous les autres vides.
-    //
-    // La rotation part des mieux notées et repasse au début une fois la
-    // liste épuisée — l'ordre du classement est ainsi respecté à chaque tour,
-    // plutôt que de servir la meilleure partout.
-    let mut placements = Vec::new();
-    let mut position = FIRST_SLOT;
-    let mut i = 0usize;
-    let mut used: HashMap<&str, u32> = HashMap::new();
-
-    while position < page_len && placements.len() < MAX_ADS_PER_PAGE {
-        // Une publicité peut se répéter, mais pas au-delà de son plafond
-        // journalier restant : sinon une seule page pourrait le franchir.
-        let mut placed = false;
-        for _ in 0..scored.len() {
-            let (ad, score) = &scored[i % scored.len()];
-            i += 1;
-            let cap = ad.targeting.daily_cap.unwrap_or(DEFAULT_DAILY_CAP);
-            let already = seen.get(&ad.id).copied().unwrap_or(0);
-            let this_page = used.get(ad.id.as_str()).copied().unwrap_or(0);
-            if already + this_page >= cap {
-                continue;
-            }
-            *used.entry(ad.id.as_str()).or_insert(0) += 1;
-            placements.push(AdPlacement {
-                advertisement_id: ad.id.clone(),
-                tweet_id: ad.tweet_id.clone(),
-                position,
-                match_score: (score * 1000.0).round() / 1000.0,
-            });
-            placed = true;
-            break;
-        }
-        if !placed {
-            break; // toutes les publicités ont atteint leur plafond
-        }
-        position += SLOT_INTERVAL;
-    }
+    // UNE publicité, à un seul endroit de la page. Voir `AD_SLOT`.
+    let placements = vec![AdPlacement {
+        advertisement_id: ad.id.clone(),
+        target_type: ad.target_type.clone(),
+        tweet_id: ad.tweet_id.clone(),
+        target_user_id: ad.target_user_id.clone(),
+        position: AD_SLOT,
+        match_score: (raw * 1000.0).round() / 1000.0,
+    }];
 
     for p in &placements {
         cache
             .ads_record_impression(user_id, &p.advertisement_id)
             .await;
     }
-    if !placements.is_empty() {
-        debug!(
-            user_id,
-            count = placements.len(),
-            "Publicités ciblées servies"
-        );
-    }
+    debug!(
+        user_id,
+        ad_id = %ad.id,
+        target = %ad.target_type,
+        "Publicité ciblée servie"
+    );
     placements
+}
+
+/// Score après décote de répétition — voir `FATIGUE_PER_VIEW`.
+fn fatigued_score(raw: f64, already_seen: u32) -> f64 {
+    raw * FATIGUE_PER_VIEW.powi(already_seen.min(32) as i32)
 }
 
 #[cfg(test)]
@@ -457,7 +486,9 @@ mod tests {
     fn ad(t: AlgoTargeting) -> AdRow {
         AdRow {
             id: "ad".into(),
-            tweet_id: "tw".into(),
+            target_type: "tweet".into(),
+            tweet_id: Some("tw".into()),
+            target_user_id: None,
             advertiser_id: "adv".into(),
             targeting: t,
             embedding: None,
@@ -533,6 +564,23 @@ mod tests {
             12,
         );
         assert!(mot_present > 0.0, "la casse ne doit pas faire échouer");
+    }
+
+    #[test]
+    fn la_repetition_fait_passer_la_main_a_une_autre_campagne() {
+        // Avec un seul emplacement par page, la mieux notée le prendrait
+        // indéfiniment. Après quelques vues, une campagne un peu moins bien
+        // notée mais jamais servie doit passer devant.
+        let forte = 0.90;
+        let autre = 0.70;
+        assert!(
+            fatigued_score(forte, 0) > fatigued_score(autre, 0),
+            "à égalité de vues, la meilleure passe d'abord"
+        );
+        assert!(
+            fatigued_score(forte, 3) < fatigued_score(autre, 0),
+            "après 3 vues, la place revient à celle qui n'a pas encore été vue"
+        );
     }
 
     #[test]
