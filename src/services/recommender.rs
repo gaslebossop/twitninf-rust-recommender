@@ -1678,9 +1678,25 @@ cand AS (
                      WHERE l.tweet_id = v.id AND l.created_at > NOW() - INTERVAL '6 hours') DESC
           LIMIT 250)
   UNION ALL
-        (SELECT id, 4, 0.05 FROM visible v
-          WHERE NOT (v.user_id = ANY($2))
-            AND v.created_at > NOW() - make_interval(hours => $7)
+        -- Borner AVANT de mélanger, pas après : `ORDER BY RANDOM()` trie
+        -- l'intégralité des lignes qui passent le WHERE, sans qu'aucun index
+        -- puisse l'aider — son coût suit le volume de tweets récents de TOUTE
+        -- la plateforme, pas la taille du résultat qu'on en tire. À 40
+        -- lecteurs ça ne se voit pas ; au premier vrai pic de publication ça
+        -- devient le poste le plus cher de toute la requête, sur CHAQUE appel
+        -- de feed. Le sous-select prend d'abord les 2000 plus récents (même
+        -- index que `v.created_at DESC` utilisé partout ailleurs ici), et
+        -- c'est seulement ce lot borné que `RANDOM()` mélange : le coût du tri
+        -- aléatoire reste constant, quelle que soit l'échelle de la
+        -- plateforme. En dessous de 2000 lignes candidates, le comportement
+        -- est identique à l'ancienne requête.
+        (SELECT id, 4, 0.05 FROM (
+              SELECT v.id FROM visible v
+              WHERE NOT (v.user_id = ANY($2))
+                AND v.created_at > NOW() - make_interval(hours => $7)
+              ORDER BY v.created_at DESC
+              LIMIT 2000
+            ) discovery_pool
           ORDER BY RANDOM() LIMIT 150)
   UNION ALL
         (SELECT id, 5, 0.06 FROM visible v
