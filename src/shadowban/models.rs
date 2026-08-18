@@ -509,6 +509,9 @@ pub struct GarbageSignals {
     pub pure_link_spam: bool,       // ≥ 2 URLs + texte < 50 chars
     pub emoji_overload: bool,       // > 8 émojis + texte < 100 chars
     pub repeat_content: bool,       // < 25% de mots uniques (texte dupliqué)
+    /// Compte créé il y a ≤ 2 jours avec déjà ≥ 50 tweets publiés — la
+    /// signature d'un compte créé pour publier en masse, pas pour échanger.
+    pub new_account_burst: bool,
 }
 
 impl GarbageSignals {
@@ -528,6 +531,9 @@ impl GarbageSignals {
             s += 0.12;
         }
         if self.repeat_content {
+            s += 0.10;
+        }
+        if self.new_account_burst {
             s += 0.10;
         }
         if self.spam_mentions {
@@ -561,7 +567,7 @@ impl GarbageSignals {
         if self.spam_hashtag_density || self.spam_mentions {
             return Some(IneligibilityReason::EngagementBait);
         }
-        if self.emoji_overload || self.zero_engagement {
+        if self.emoji_overload || self.zero_engagement || self.new_account_burst {
             return Some(IneligibilityReason::SpamSignals);
         }
         None
@@ -590,6 +596,9 @@ impl GarbageSignals {
         }
         if self.emoji_overload {
             v.push("emoji_overload");
+        }
+        if self.new_account_burst {
+            v.push("new_account_burst");
         }
         v
     }
