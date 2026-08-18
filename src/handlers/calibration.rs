@@ -28,8 +28,19 @@ fn check_service_key(headers: &HeaderMap, secret: &str) -> bool {
         == 0
 }
 
+/// Borne haute acceptée, volontairement plus large que [`ROUNDS`].
+///
+/// Le nombre de tours est décidé par le CLIENT (il sait quand appeler
+/// `/calibration/finish`), et une application déjà installée ne se met pas à
+/// jour au même instant que ce service. Refuser un tour au-delà de `ROUNDS`
+/// cassait le dernier tour de tout client encore réglé sur l'ancienne valeur
+/// — un « tour indisponible » en fin de parcours, au pire moment. Le moteur
+/// sait servir un tour de plus sans rien de spécial : il n'y a pas de raison
+/// de le refuser.
+const MAX_ACCEPTED_ROUND: u8 = 10;
+
 fn valid_round(round: u8) -> bool {
-    (1..=ROUNDS).contains(&round)
+    (1..=MAX_ACCEPTED_ROUND).contains(&round)
 }
 
 pub async fn calibration_round_handler(
