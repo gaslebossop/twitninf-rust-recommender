@@ -209,15 +209,29 @@ impl RecommenderService {
                 // fréquence et du budget restant — tous deux mouvants à la
                 // minute. Un profil est rechargé pour ça (cache 300 s, donc
                 // sans coût dans le cas courant).
-                if let Ok(profile) = self.build_user_profile(&req.user_id).await {
-                    response.ads = crate::ads::select_for_feed(
-                        &self.pg,
-                        &self.cache,
-                        &req.user_id,
-                        &profile,
-                        response.tweet_ids.len(),
-                    )
-                    .await;
+                //
+                // Uniquement en `for_you` : c'est le seul fil dont le client
+                // sait afficher une publicité (étiquette « Sponsorisé »,
+                // carte de compte promu). La grille Explorer (`trending`) n'a
+                // jamais eu ce rendu — elle affichait la publicité comme un
+                // tweet ordinaire, EN PLUS de la version organique du même
+                // tweet quand elle apparaissait aussi, deux entrées de même
+                // id dans une grille qui ne les distingue pas : React y
+                // voyait une clé dupliquée. Sélectionner quand même consommait
+                // en pure perte le plafond de fréquence du lecteur (compteur
+                // Redis incrémenté dans `select_for_feed`) pour une
+                // publicité jamais montrée nulle part.
+                if mode_str == "for_you" {
+                    if let Ok(profile) = self.build_user_profile(&req.user_id).await {
+                        response.ads = crate::ads::select_for_feed(
+                            &self.pg,
+                            &self.cache,
+                            &req.user_id,
+                            &profile,
+                            response.tweet_ids.len(),
+                        )
+                        .await;
+                    }
                 }
                 if req.enable_experiments.unwrap_or(false) {
                     response.experiments = experiments::assign_variants(
@@ -530,8 +544,13 @@ impl RecommenderService {
             "NeuralRank recommendations computed"
         );
 
-        let ads =
-            crate::ads::select_for_feed(&self.pg, &self.cache, &req.user_id, &profile, count).await;
+        // Voir le commentaire équivalent sur le chemin servi depuis le cache,
+        // plus haut : uniquement en `for_you`.
+        let ads = if mode_str == "for_you" {
+            crate::ads::select_for_feed(&self.pg, &self.cache, &req.user_id, &profile, count).await
+        } else {
+            Vec::new()
+        };
 
         Ok(RecommendResponse {
             success: true,
