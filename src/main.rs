@@ -2,6 +2,7 @@ mod admin;
 mod ads;
 mod algorithm;
 mod bandit;
+mod calibration;
 mod config;
 mod constants;
 mod cooccurrence;
@@ -41,6 +42,7 @@ use handlers::{
         admin_reset_weights_handler, admin_revoke_strike_handler, admin_set_shadowban_handler,
         admin_set_weights_handler, admin_ui_handler, admin_unban_handler,
     },
+    calibration::{calibration_finish_handler, calibration_round_handler},
     embeddings::embed_tweet_handler,
     health::health_handler,
     invalidate::invalidate_handler,
@@ -181,6 +183,8 @@ async fn main() -> Result<()> {
         .route("/velocity/post-burst", post(velocity_post_burst_handler))
         // Embedding sémantique d'un tweet — voir `crate::embeddings`.
         .route("/embed-tweet", post(embed_tweet_handler))
+        .route("/calibration/round", post(calibration_round_handler))
+        .route("/calibration/finish", post(calibration_finish_handler))
         // ── Admin node ────────────────────────────────────────────────────────
         .route("/admin/panel", get(admin_ui_handler))
         .route("/admin/filters", get(admin_filters_handler))

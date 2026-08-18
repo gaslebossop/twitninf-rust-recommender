@@ -146,38 +146,40 @@ pub async fn user_taste_vector(pg: &PgPool, user_id: &str) -> Result<Option<Vec<
             &[&uid],
         )
         .await?;
+    Ok(average_vectors(&rows_to_vectors(&rows)))
+}
 
-    if rows.is_empty() {
-        return Ok(None);
-    }
+fn rows_to_vectors(rows: &[tokio_postgres::Row]) -> Vec<Vec<f32>> {
+    rows.iter()
+        .filter_map(|row| row.try_get::<_, Vector>(0).ok())
+        .map(|v| v.as_slice().to_vec())
+        .collect()
+}
 
+/// Moyenne de plusieurs embeddings — le même calcul sert au vecteur de goût
+/// naturel ci-dessus et à la recalibration explicite (voir `calibration`).
+/// Un vecteur de mauvaise dimension est ignoré plutôt que de fausser la
+/// moyenne ou de faire échouer tout l'appel.
+pub fn average_vectors(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
     let mut sum = vec![0.0f32; EMBEDDING_DIM];
     let mut count = 0usize;
-    for row in &rows {
-        let Ok(v) = row.try_get::<_, Vector>(0) else {
-            continue;
-        };
-        let slice = v.as_slice();
-        if slice.len() != EMBEDDING_DIM {
-            warn!(
-                len = slice.len(),
-                "Embedding de dimension inattendue — ignoré"
-            );
+    for v in vectors {
+        if v.len() != EMBEDDING_DIM {
+            warn!(len = v.len(), "Embedding de dimension inattendue — ignoré");
             continue;
         }
-        for (i, x) in slice.iter().enumerate() {
+        for (i, x) in v.iter().enumerate() {
             sum[i] += x;
         }
         count += 1;
     }
-
     if count == 0 {
-        return Ok(None);
+        return None;
     }
     for x in sum.iter_mut() {
         *x /= count as f32;
     }
-    Ok(Some(sum))
+    Some(sum)
 }
 
 /// Plus proches voisins sémantiques d'un vecteur de goût — nouvelle source de

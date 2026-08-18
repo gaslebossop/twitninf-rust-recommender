@@ -1081,6 +1081,17 @@ impl RecommenderService {
             Ok(v) => profile.taste_vector = v,
             Err(e) => debug!(user_id, error = %e, "Vecteur de goût indisponible"),
         }
+        // Vecteur de goût EXPLICITE (voir `crate::calibration`), distinct du
+        // vecteur naturel ci-dessus : un compte qui vient de recalibrer
+        // volontairement sur 5 tours a dit quelque chose de plus net que
+        // trois mois de likes dispersés dans l'activité normale, donc pèse
+        // plus quand les deux existent (`calibration::blend_taste`).
+        if let Some(calib) = self.cache.calibration_load_taste(user_id).await {
+            profile.taste_vector = Some(match profile.taste_vector.take() {
+                Some(natural) => crate::calibration::blend_taste(&calib, &natural),
+                None => calib,
+            });
+        }
         if !profile.damped_authors.is_empty() {
             debug!(
                 user_id,
