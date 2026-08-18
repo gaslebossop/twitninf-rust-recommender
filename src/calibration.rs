@@ -187,70 +187,109 @@ async fn diverse_candidates(
     let client = pg.get().await?;
     let uid = uuid::Uuid::parse_str(user_id)?;
     let pool_limit = (limit * 10).max(60);
+    // Le vivier est constitué PAR AUTEUR (`ROW_NUMBER` partitionné), pas par
+    // qualité globale : un simple `ORDER BY quality DESC LIMIT 60` sur une
+    // table où un seul compte publie plus que tous les autres réunis ramène
+    // un vivier composé quasi uniquement de lui — le plafond en aval n'a
+    // alors plus rien d'autre à choisir. On prend les meilleurs de CHACUN,
+    // puis on trie.
     let rows = client
         .query(
             r#"
-            SELECT t.id::text, t.user_id::text, COALESCE(ll.theme, 'autre') AS theme
-            FROM tweets t
-            JOIN users u ON u.id = t.user_id
-            LEFT JOIN tweet_llm_labels ll ON ll.tweet_id = t.id
-            WHERE t.deleted_at IS NULL
-              AND t.moderation_status = 'approved'
-              AND t.is_private = false
-              AND COALESCE(t.is_data_test, false) = false
-              AND u.is_active = true
-              AND COALESCE(u.is_suspended, false) = false
-              AND t.user_id != $1
-              AND t.parent_tweet_id IS NULL
-              AND COALESCE(t.is_retweet, false) = false
-              AND COALESCE(t.content, '') != ''
-              AND COALESCE(ll.theme, 'autre') != 'spam_vide'
-            ORDER BY COALESCE(ll.quality_score, 0.5) DESC, t.created_at DESC
+            SELECT id::text, author::text, theme FROM (
+                SELECT t.id, t.user_id AS author, COALESCE(ll.theme, 'autre') AS theme,
+                       COALESCE(ll.quality_score, 0.5) AS q,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.user_id
+                           ORDER BY COALESCE(ll.quality_score, 0.5) DESC, t.created_at DESC
+                       ) AS rn
+                FROM tweets t
+                JOIN users u ON u.id = t.user_id
+                LEFT JOIN tweet_llm_labels ll ON ll.tweet_id = t.id
+                WHERE t.deleted_at IS NULL
+                  AND t.moderation_status = 'approved'
+                  AND t.is_private = false
+                  AND COALESCE(t.is_data_test, false) = false
+                  AND u.is_active = true
+                  AND COALESCE(u.is_suspended, false) = false
+                  AND t.user_id != $1
+                  AND t.parent_tweet_id IS NULL
+                  AND COALESCE(t.is_retweet, false) = false
+                  AND COALESCE(t.content, '') != ''
+                  AND COALESCE(ll.theme, 'autre') != 'spam_vide'
+            ) ranked
+            WHERE rn <= 6
+            ORDER BY rn, q DESC
             LIMIT $2
             "#,
             &[&uid, &pool_limit],
         )
         .await?;
 
+    // Trois passes, dans cet ordre de priorité — c'est la DIVERSITÉ
+    // D'AUTEURS qui compte le plus pour ce que cet écran doit apprendre.
+    //
+    // Une seule passe qui exigeait auteur ET thème inédits était trop
+    // stricte : dès qu'un thème était pris, un auteur encore jamais montré
+    // se faisait écarter à cause de son sujet, et le tour se remplissait
+    // ensuite avec les seconds tweets des mêmes comptes. Résultat mesuré :
+    // 3 auteurs sur un tour de 5, alors que 10 comptes étaient éligibles.
+    let candidates: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .filter(|(id, _, _): &(String, String, String)| !excluded.contains(id))
+        .collect();
+
     let mut author_seen: HashSet<String> = HashSet::new();
     let mut theme_seen: HashSet<String> = HashSet::new();
     let mut per_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut picked: Vec<String> = Vec::new();
-    let mut leftovers: Vec<(String, String)> = Vec::new(); // (id, author)
+    let mut taken: HashSet<String> = HashSet::new();
 
-    for row in &rows {
+    // Passe 1 — auteur ET thème inédits : l'idéal.
+    for (id, author, theme) in &candidates {
         if picked.len() as i64 >= limit {
             break;
         }
-        let id: String = row.get(0);
-        if excluded.contains(&id) {
-            continue;
-        }
-        let author: String = row.get(1);
-        let theme: String = row.get(2);
-        if author_seen.contains(&author) || theme_seen.contains(&theme) {
-            leftovers.push((id, author));
+        if author_seen.contains(author) || theme_seen.contains(theme) {
             continue;
         }
         author_seen.insert(author.clone());
-        theme_seen.insert(theme);
-        *per_author.entry(author).or_insert(0) += 1;
-        picked.push(id);
+        theme_seen.insert(theme.clone());
+        *per_author.entry(author.clone()).or_insert(0) += 1;
+        taken.insert(id.clone());
+        picked.push(id.clone());
     }
-    // Repli : le plafond par auteur reste actif, même ici — sans lui, un
-    // vivier dominé par 2-3 comptes finissait par les répéter jusqu'à
-    // remplir le tour, la diversité stricte ci-dessus n'ayant plus rien à
-    // offrir de nouveau après leurs premiers tweets.
-    for (id, author) in leftovers {
+    // Passe 2 — auteur inédit, quel que soit le thème. Mieux vaut deux
+    // tweets du même thème par deux comptes différents que deux tweets du
+    // même compte.
+    for (id, author, _) in &candidates {
         if picked.len() as i64 >= limit {
             break;
         }
-        let count = per_author.entry(author).or_insert(0);
+        if taken.contains(id) || author_seen.contains(author) {
+            continue;
+        }
+        author_seen.insert(author.clone());
+        *per_author.entry(author.clone()).or_insert(0) += 1;
+        taken.insert(id.clone());
+        picked.push(id.clone());
+    }
+    // Passe 3 — remplissage, plafond par auteur toujours actif.
+    for (id, author, _) in &candidates {
+        if picked.len() as i64 >= limit {
+            break;
+        }
+        if taken.contains(id) {
+            continue;
+        }
+        let count = per_author.entry(author.clone()).or_insert(0);
         if *count >= MAX_PER_AUTHOR_PER_ROUND {
             continue;
         }
         *count += 1;
-        picked.push(id);
+        taken.insert(id.clone());
+        picked.push(id.clone());
     }
     Ok(picked)
 }
