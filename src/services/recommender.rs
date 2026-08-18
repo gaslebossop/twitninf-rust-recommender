@@ -203,6 +203,22 @@ impl RecommenderService {
                     true,
                 );
                 response.threads = threads;
+                // Les publicités sont choisies MÊME sur un service depuis le
+                // cache : le classement des tweets peut être resservi tel
+                // quel, pas le choix publicitaire, qui dépend du plafond de
+                // fréquence et du budget restant — tous deux mouvants à la
+                // minute. Un profil est rechargé pour ça (cache 300 s, donc
+                // sans coût dans le cas courant).
+                if let Ok(profile) = self.build_user_profile(&req.user_id).await {
+                    response.ads = crate::ads::select_for_feed(
+                        &self.pg,
+                        &self.cache,
+                        &req.user_id,
+                        &profile,
+                        response.tweet_ids.len(),
+                    )
+                    .await;
+                }
                 if req.enable_experiments.unwrap_or(false) {
                     response.experiments = experiments::assign_variants(
                         &self.pg,
@@ -514,11 +530,15 @@ impl RecommenderService {
             "NeuralRank recommendations computed"
         );
 
+        let ads =
+            crate::ads::select_for_feed(&self.pg, &self.cache, &req.user_id, &profile, count).await;
+
         Ok(RecommendResponse {
             success: true,
             user_id: req.user_id.clone(),
             tweet_ids: page_ids,
             threads,
+            ads,
             count,
             algorithm: "NeuralRank Fusion",
             algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
@@ -1564,6 +1584,7 @@ impl RecommenderService {
             latency_ms,
             cache_hit,
             experiments: Vec::new(),
+            ads: Vec::new(),
             metadata: RecommendMetadata {
                 candidates_collected: 0,
                 sources: SourceStats::default(),

@@ -516,6 +516,14 @@ pub struct RecommendResponse {
     pub latency_ms: u64,
     pub cache_hit: bool,
     pub experiments: Vec<crate::experiments::ExperimentAssignment>,
+    /// Publicités ciblées à insérer dans CETTE page, avec leur position.
+    ///
+    /// Vide dans l'écrasante majorité des cas (aucune campagne active, aucune
+    /// qui corresponde, plafond de fréquence atteint) — c'est un résultat
+    /// normal, pas une panne. L'API hydrate ces identifiants et facture les
+    /// impressions ; le moteur ne décide que du QUI voit QUOI.
+    #[serde(default)]
+    pub ads: Vec<crate::ads::AdPlacement>,
     pub metadata: RecommendMetadata,
 }
 
