@@ -993,7 +993,32 @@ impl RecommenderService {
         const SQL_TEMPORAL: &str = "SELECT EXTRACT(HOUR FROM created_at)::int AS h, EXTRACT(DOW FROM created_at)::int AS d, COUNT(*) AS cnt FROM tweet_likes WHERE user_id = $1 AND created_at > NOW() - INTERVAL '60 days' GROUP BY h, d ORDER BY h, d";
         const SQL_CONTENT: &str = "SELECT AVG(LENGTH(t.content))::float8 AS avg_len, SUM(CASE WHEN t.media_urls IS NOT NULL AND t.media_urls != '[]'::jsonb THEN 1 ELSE 0 END)::float8 / GREATEST(COUNT(*), 1) AS media_ratio, AVG(COALESCE(jsonb_array_length(t.hashtags), 0))::float8 AS avg_hashtags FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = $1 AND tl.created_at > NOW() - INTERVAL '30 days'";
         const SQL_BEHAVIOR: &str = "SELECT (SELECT COUNT(*) FROM tweet_retweets WHERE user_id = $1) AS rt_count, (SELECT COUNT(*) FROM tweet_likes WHERE user_id = $1) AS like_count, (SELECT COUNT(*) FROM tweets WHERE user_id = $1 AND parent_tweet_id IS NOT NULL) AS reply_count, (SELECT COUNT(*) FROM user_follows WHERE following_id = $1 AND status = 'active') AS followers, (SELECT COUNT(*) FROM user_follows WHERE follower_id = $1 AND status = 'active') AS following";
-        const SQL_AFFINITY: &str = "SELECT t.user_id::text AS author_id, COUNT(*)::float8 AS affinity FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = $1 AND tl.created_at > NOW() - INTERVAL '60 days' GROUP BY t.user_id ORDER BY affinity DESC LIMIT 20";
+        // Affinité par auteur : avant, UNIQUEMENT les likes — un lecteur qui
+        // lit beaucoup et like peu (profil majoritaire) restait invisible
+        // pour ce classement. `user_behavior_data` porte déjà le dwell réel
+        // (`action_type='time_spent'`, écrit par `mirrorDwell` côté API,
+        // voir la passation NeuralRank §3.7b) : unioné ici, ramené en
+        // équivalent-minutes pour rester du même ordre de grandeur qu'un
+        // compte de likes plutôt que de le noyer sous des millisecondes.
+        // `LEAST(...,600000)` : un événement peut remonter jusqu'à ~10h côté
+        // client (app restée ouverte en arrière-plan) — piège déjà payé sur
+        // l'algo Scout, plafonné à la même valeur qu'à l'écriture
+        // (`dwellMirror.js::DWELL_CAP_MS`) en défense contre les lignes
+        // antérieures à ce plafond.
+        const SQL_AFFINITY: &str = "SELECT author_id, SUM(affinity)::float8 AS affinity FROM ( \
+            SELECT t.user_id::text AS author_id, COUNT(*)::float8 AS affinity \
+            FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id \
+            WHERE tl.user_id = $1 AND tl.created_at > NOW() - INTERVAL '60 days' \
+            GROUP BY t.user_id \
+            UNION ALL \
+            SELECT t.user_id::text AS author_id, \
+                   (SUM(LEAST(COALESCE((b.context_data->>'time_spent_ms')::bigint, 0), 600000))::float8 / 60000.0) AS affinity \
+            FROM user_behavior_data b JOIN tweets t ON t.id::text = b.target_id \
+            WHERE b.user_id = $1 AND b.action_type = 'time_spent' AND b.target_type = 'tweet' \
+              AND COALESCE(b.is_data_test, false) = false AND t.user_id <> $1 \
+              AND b.timestamp > NOW() - INTERVAL '60 days' \
+            GROUP BY t.user_id \
+        ) combined GROUP BY author_id ORDER BY affinity DESC LIMIT 20";
         const SQL_SEEN: &str = "SELECT tweet_id::text FROM tweet_likes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 500";
         const SQL_RETWEETED: &str = "SELECT tweet_id::text FROM tweet_retweets WHERE user_id = $1 ORDER BY created_at DESC LIMIT 300";
         // Contenu réellement aimé — sert à reconstruire les centres d'intérêt

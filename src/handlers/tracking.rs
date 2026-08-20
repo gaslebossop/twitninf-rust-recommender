@@ -177,6 +177,21 @@ pub async fn track_handler(
         }
     }
 
+    // ── « Skip » doit aussi marquer vu ────────────────────────────────
+    // Le menu du fil promet « il n'apparaîtra plus » sur ce geste, tenu
+    // côté client par un retrait local de la ligne — mais sans ceci le
+    // moteur ne l'a jamais marqué vu (Skip pèse -0.5, sous le seuil de
+    // `total_weight > 0.0` plus haut) et le tweet revient à la session
+    // suivante. Volontairement SANS mise en sourdine de l'auteur,
+    // contrairement à `NotInterested` juste au-dessus : ignorer UN tweet
+    // ne dit rien de son auteur.
+    if req.interaction_type == crate::models::InteractionType::Skip {
+        state
+            .cache
+            .mark_tweet_seen(&req.user_id, &req.tweet_id)
+            .await;
+    }
+
     // Alimente le modèle CTR avec le vecteur de features réellement
     // utilisé pour classer ce tweet dans le feed de ce lecteur. On ne
     // l'invente plus ici : on le relit depuis l'impression mémorisée.
@@ -224,6 +239,38 @@ pub async fn track_handler(
                 // pensée pour un usage différent (30 min, par lecteur) qui
                 // pourrait changer de forme sans prévenir.
                 state.cache.record_arm_reward(author_id, clicked).await;
+            }
+        }
+    }
+
+    // ── Boucle auteur alimentée par le dwell (VUE, pas de clic) ────────
+    // `ctr_label()` renvoie `None` sur une `View` : le bloc juste au-dessus
+    // ne se déclenche donc JAMAIS pour un tweet longuement lu mais jamais
+    // cliqué — tout le profil de goût restait bâti sur les seuls likes. On
+    // rejoue ici le même geste que `record_author_feedback` ci-dessus, mais
+    // décidé sur `dwell_bonus` plutôt que sur `ctr_label()`, et seulement
+    // quand le signal est FRANC dans un sens ou dans l'autre — la zone
+    // ambiguë (lu partiellement, ni franchement consommé ni franchement
+    // survolé) ne doit rien émettre : un boost/damping mal fondé abîmerait
+    // la page suivante pour rien. Volontairement SANS bandit ni
+    // entraînement CTR ici : effet immédiat sur le fil, sans toucher au
+    // modèle — voir §3.7 de la passation.
+    const FIRM_POSITIVE_DWELL_BONUS: f64 = 0.3; // ~consommation complète ou plus
+    const FIRM_NEGATIVE_DWELL_BONUS: f64 = 0.0; // dwell_weight est déjà dans sa branche « survol »
+    if req.interaction_type == crate::models::InteractionType::View && dwell_context.is_some() {
+        if let Some(author_id) = req.author_id.as_deref() {
+            if uuid::Uuid::parse_str(author_id).is_ok() {
+                if dwell_bonus > FIRM_POSITIVE_DWELL_BONUS {
+                    state
+                        .cache
+                        .record_author_feedback(&req.user_id, author_id, true)
+                        .await;
+                } else if dwell_bonus < FIRM_NEGATIVE_DWELL_BONUS {
+                    state
+                        .cache
+                        .record_author_feedback(&req.user_id, author_id, false)
+                        .await;
+                }
             }
         }
     }
