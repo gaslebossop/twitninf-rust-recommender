@@ -128,20 +128,59 @@ pub async fn embed_and_store(
     Ok(())
 }
 
-/// Vecteur de goût d'un lecteur : moyenne des embeddings de ses tweets likés
-/// récents. `None` si le lecteur n'a encore aucun like sur un tweet embedded
-/// (compte neuf, ou rattrapage pas encore passé sur ses tweets aimés).
+/// Un tweet dont le temps de lecture cumulé dépasse ce plancher compte comme
+/// « fortement consommé », au même titre qu'un like — voir `user_taste_vector`.
+/// Pas de raisonnement en taux de complétion ici (ce module n'a pas accès à
+/// `algorithm::dwell`, et dupliquer sa logique en SQL brut coûterait plus que
+/// ça ne vaudrait) : un plancher absolu généreux suffit à écarter les
+/// simples passages sans prétendre mesurer finement l'intérêt.
+const TASTE_HEAVY_DWELL_FLOOR_MS: i64 = 15_000;
+
+/// Vecteur de goût d'un lecteur : moyenne des embeddings des tweets LIKÉS
+/// récents ∪ FORTEMENT CONSOMMÉS récents (dwell cumulé ≥
+/// `TASTE_HEAVY_DWELL_FLOOR_MS`, voir `user_behavior_data` /
+/// `action_type='time_spent'`, écrit par `mirrorDwell` côté API).
+///
+/// Avant cette union, un lecteur qui lit beaucoup et like peu — le profil
+/// majoritaire — restait invisible pour ce vecteur : son goût réel n'avait
+/// aucune trace ici, quel que soit son temps de lecture. `LEAST(...,600000)`
+/// même plafond qu'ailleurs (`SQL_AFFINITY`, `dwellMirror.js::DWELL_CAP_MS`) :
+/// un événement peut remonter jusqu'à ~10h côté client (app restée ouverte en
+/// arrière-plan).
+///
+/// `None` si le lecteur n'a encore ni like ni lecture significative sur un
+/// tweet embedded (compte neuf, ou rattrapage pas encore passé).
 pub async fn user_taste_vector(pg: &PgPool, user_id: &str) -> Result<Option<Vec<f32>>> {
     let client = pg.get().await?;
     let uid = uuid::Uuid::parse_str(user_id)?;
     let rows = client
         .query(
             &format!(
-                "SELECT t.embedding FROM tweet_likes tl \
-                 JOIN tweets t ON t.id = tl.tweet_id \
-                 WHERE tl.user_id = $1 AND t.embedding IS NOT NULL \
-                   AND tl.created_at > NOW() - INTERVAL '{TASTE_LOOKBACK_DAYS} days' \
-                 ORDER BY tl.created_at DESC LIMIT {TASTE_SAMPLE_LIMIT}"
+                "SELECT embedding FROM ( \
+                     SELECT DISTINCT ON (tweet_id) tweet_id, embedding, recency FROM ( \
+                         SELECT t.id AS tweet_id, t.embedding AS embedding, tl.created_at AS recency \
+                         FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id \
+                         WHERE tl.user_id = $1 AND t.embedding IS NOT NULL \
+                           AND tl.created_at > NOW() - INTERVAL '{TASTE_LOOKBACK_DAYS} days' \
+                         UNION ALL \
+                         SELECT t.id AS tweet_id, t.embedding AS embedding, heavy.last_seen AS recency \
+                         FROM ( \
+                             SELECT b.target_id, \
+                                    MAX(b.timestamp) AS last_seen \
+                             FROM user_behavior_data b \
+                             WHERE b.user_id = $1 AND b.action_type = 'time_spent' AND b.target_type = 'tweet' \
+                               AND COALESCE(b.is_data_test, false) = false \
+                               AND b.timestamp > NOW() - INTERVAL '{TASTE_LOOKBACK_DAYS} days' \
+                             GROUP BY b.target_id \
+                             HAVING SUM(LEAST(COALESCE((b.context_data->>'time_spent_ms')::bigint, 0), 600000)) \
+                                    >= {TASTE_HEAVY_DWELL_FLOOR_MS} \
+                         ) heavy \
+                         JOIN tweets t ON t.id::text = heavy.target_id \
+                         WHERE t.embedding IS NOT NULL AND t.user_id <> $1 \
+                     ) both_sources \
+                     ORDER BY tweet_id, recency DESC \
+                 ) deduped \
+                 ORDER BY recency DESC LIMIT {TASTE_SAMPLE_LIMIT}"
             ),
             &[&uid],
         )
