@@ -269,8 +269,14 @@ impl RecommenderService {
                user_type = ?profile.user_type, "User profile built");
 
         // ── Charger la liste des hard-bannis pour filtrage SQL ───────────────────
-        let banned_set = self.cache.admin_get_hard_banned_set().await;
+        // Unie ici aux comptes que CE lecteur a bloqués (ou qui l'ont bloqué,
+        // voir `UserProfile::blocked_ids`) : un compte bloqué doit disparaître
+        // du vivier exactement comme un compte hard-banni, mais seulement pour
+        // ce lecteur-là — d'où l'union par requête plutôt qu'un ajout au cache
+        // admin, qui est partagé entre tous les utilisateurs.
+        let mut banned_set = self.cache.admin_get_hard_banned_set().await;
         debug!(banned_count = banned_set.len(), "Hard-banned set loaded");
+        banned_set.extend(profile.blocked_ids.iter().cloned());
 
         debug!("Collecting candidates from {} sources...", 8);
         let (mut sources, source_stats) = self
@@ -995,6 +1001,8 @@ impl RecommenderService {
         // vides et que D2 comme D8 lisent pourtant.
         const SQL_LIKED_TEXT: &str = "SELECT COALESCE(t.content, '') FROM tweet_likes tl JOIN tweets t ON t.id = tl.tweet_id WHERE tl.user_id = $1 AND tl.created_at > NOW() - INTERVAL '90 days' ORDER BY tl.created_at DESC LIMIT 200";
         const SQL_SECOND_DEGREE: &str = "SELECT DISTINCT f2.following_id::text FROM user_follows f JOIN user_follows f2 ON f2.follower_id = f.following_id AND f2.status = 'active' WHERE f.follower_id = $1 AND f.status = 'active' AND f2.following_id <> $1 AND f2.following_id NOT IN (SELECT following_id FROM user_follows WHERE follower_id = $1 AND status = 'active') LIMIT 200";
+        // Comptes bloqués dans un sens ou l'autre — voir `UserProfile::blocked_ids`.
+        const SQL_BLOCKED: &str = "SELECT following_id::text FROM user_follows WHERE follower_id = $1 AND status = 'blocked' UNION SELECT follower_id::text FROM user_follows WHERE following_id = $1 AND status = 'blocked'";
 
         // Lié à une variable : `&[&uid]` en argument direct crée un temporaire
         // détruit avant la fin du `join!`.
@@ -1011,6 +1019,7 @@ impl RecommenderService {
             retweeted_res,
             liked_text_res,
             second_degree_res,
+            blocked_res,
         ) = join!(
             client.query(SQL_SOCIAL, &params),
             client.query(SQL_ENGAGEMENT, &params),
@@ -1022,6 +1031,7 @@ impl RecommenderService {
             client.query(SQL_RETWEETED, &params),
             client.query(SQL_LIKED_TEXT, &params),
             client.query(SQL_SECOND_DEGREE, &params),
+            client.query(SQL_BLOCKED, &params),
         );
 
         let mut profile = UserProfile::default();
@@ -1244,6 +1254,14 @@ impl RecommenderService {
                 second_degree_count = profile.second_degree_ids.len(),
                 "Second degree network loaded"
             );
+        }
+
+        if let Ok(rows) = blocked_res {
+            profile.blocked_ids = rows
+                .iter()
+                .filter_map(|r| r.try_get::<_, String>(0).ok())
+                .collect();
+            trace!(blocked_count = profile.blocked_ids.len(), "Blocked accounts loaded");
         }
 
         debug!(

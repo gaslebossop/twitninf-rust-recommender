@@ -150,6 +150,13 @@ pub struct UserProfile {
     pub mutual_follow_ids: Vec<String>,
     pub second_degree_ids: Vec<String>,
 
+    /// Comptes liés à ce lecteur par un blocage `user_follows.status =
+    /// 'blocked'`, dans n'importe quel sens. Union avec le hard-ban admin
+    /// avant `collect_candidates` — un compte bloqué ne doit pas plus
+    /// apparaître dans le vivier qu'un compte hard-banni.
+    #[serde(default)]
+    pub blocked_ids: Vec<String>,
+
     pub liked_tweet_ids: Vec<String>,
     pub retweeted_tweet_ids: Vec<String>,
     pub replied_to_tweet_ids: Vec<String>,
