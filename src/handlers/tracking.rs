@@ -247,6 +247,13 @@ pub async fn track_handler(
             {
                 Some(features) => {
                     state.recommender.record_ctr_event(&features, clicked);
+                    // Mêmes features, autres lectures : les têtes
+                    // multi-objectifs apprennent de CE geste précis, pas du
+                    // booléen « engagé / pas engagé » qui les confondrait
+                    // toutes. Voir `ml::objectives`.
+                    state
+                        .recommender
+                        .record_objective_event(&features, req.interaction_type);
                 }
                 None => {
                     debug!(user_id = %req.user_id, tweet_id = %req.tweet_id,

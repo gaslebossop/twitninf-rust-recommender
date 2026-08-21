@@ -463,6 +463,9 @@ pub async fn admin_algo_stats_handler(
     let ml_active = ctr_samples >= 200;
     let (dwell_samples, dwell_mean_weight) = state.recommender.dwell_stats();
     let dwell_active = dwell_samples >= 200;
+    let ((amplify_samples, amplify_rate), (reject_samples, reject_rate)) =
+        state.recommender.objective_stats();
+    let min_objective = crate::ml::objectives::MIN_SAMPLES;
 
     (
         StatusCode::OK,
@@ -475,7 +478,13 @@ pub async fn admin_algo_stats_handler(
             dwell_samples,
             dwell_mean_weight,
             dwell_active,
-            algorithm_version: "2.2.0 — 8D + ML CTR + dwell predictor + bandit + garbage filter + admin node",
+            amplify_samples,
+            amplify_rate,
+            amplify_active: amplify_samples >= min_objective,
+            reject_samples,
+            reject_rate,
+            reject_active: reject_samples >= min_objective,
+            algorithm_version: "2.3.0 — 9D + multi-objectif (CTR, dwell, amplification, rejet) + bandit + admin node",
         })),
     )
 }

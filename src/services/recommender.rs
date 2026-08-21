@@ -22,6 +22,7 @@ use crate::experiments;
 use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
 use crate::ml::dwell_predictor::DwellPredictor;
+use crate::ml::objectives::ObjectivePredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
 use crate::shadowban::{
@@ -46,6 +47,8 @@ pub struct RecommenderService {
     cache: CacheManager,
     ctr_predictor: CtrPredictor,
     dwell_predictor: DwellPredictor,
+    /// Têtes multi-objectifs (amplification, rejet) — voir `ml::objectives`.
+    objectives: ObjectivePredictor,
     auto_tuner: std::sync::Arc<AutoTuner>,
 }
 
@@ -56,6 +59,7 @@ impl RecommenderService {
             cache,
             ctr_predictor: CtrPredictor::new(),
             dwell_predictor: DwellPredictor::new(),
+            objectives: ObjectivePredictor::new(),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -70,6 +74,7 @@ impl RecommenderService {
             cache,
             ctr_predictor: CtrPredictor::new(),
             dwell_predictor: DwellPredictor::new(),
+            objectives: ObjectivePredictor::new(),
             auto_tuner,
         }
     }
@@ -84,11 +89,13 @@ impl RecommenderService {
     ) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
         let dwell_predictor = DwellPredictor::load_or_default().await;
+        let objectives = ObjectivePredictor::load_or_default().await;
         Self {
             pg,
             cache,
             ctr_predictor,
             dwell_predictor,
+            objectives,
             auto_tuner,
         }
     }
@@ -96,11 +103,13 @@ impl RecommenderService {
     pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
         let dwell_predictor = DwellPredictor::load_or_default().await;
+        let objectives = ObjectivePredictor::load_or_default().await;
         Self {
             pg,
             cache,
             ctr_predictor,
             dwell_predictor,
+            objectives,
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -168,6 +177,44 @@ impl RecommenderService {
 
     pub fn dwell_predictor(&self) -> &DwellPredictor {
         &self.dwell_predictor
+    }
+
+    // ─── Têtes multi-objectifs ───────────────────────────────────────────────
+
+    /// Entraîne les têtes concernées par cette interaction, à partir du même
+    /// vecteur d'impression que le CTR — voir `ml::objectives`. Retourne
+    /// `true` si au moins une tête a appris quelque chose.
+    pub fn record_objective_event(&self, features: &[f64], interaction: InteractionType) -> bool {
+        let Some(vec) = to_feature_array(features) else {
+            warn!(
+                len = features.len(),
+                "Objectifs : vecteur de features de taille invalide, ignoré"
+            );
+            return false;
+        };
+        self.objectives.record_interaction(&vec, interaction)
+    }
+
+    /// Impression expirée sans la moindre réaction : négatif pour les deux
+    /// têtes — voir `ml::ctr_sweeper`.
+    pub fn record_objective_ignored(&self, features: &[f64]) {
+        let Some(vec) = to_feature_array(features) else {
+            return;
+        };
+        self.objectives.record_ignored(&vec);
+    }
+
+    /// ((échantillons, taux) amplification, ((échantillons, taux) rejet)
+    pub fn objective_stats(&self) -> ((u64, f64), (u64, f64)) {
+        self.objectives.stats()
+    }
+
+    pub fn objective_samples(&self) -> u64 {
+        self.objectives.total_samples()
+    }
+
+    pub async fn persist_objective_models(&self) {
+        self.objectives.save().await;
     }
 
     /// Accès direct au pool — réservé au rattrapage hors-ligne
@@ -860,6 +907,10 @@ impl RecommenderService {
                 } else {
                     None
                 },
+                // Chaque tête porte son propre seuil de démarrage à froid en
+                // interne : passer le prédicteur ne suffit pas à le faire
+                // peser, il faut qu'il ait appris.
+                Some(&self.objectives),
                 realtime_boost,
                 weights,
             );

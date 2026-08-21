@@ -185,5 +185,19 @@ pub struct AlgoStatsResponse {
     pub dwell_samples: u64,
     pub dwell_mean_weight: f64,
     pub dwell_active: bool,
+    /// Têtes multi-objectifs (voir `ml::objectives`). Même paire
+    /// (échantillons, taux de base) que le CTR, pour chacune des deux — et le
+    /// drapeau qui dit si elle pèse RÉELLEMENT dans le classement, ce que le
+    /// seul compte d'échantillons ne dit pas.
+    ///
+    /// Le taux de base est la valeur à surveiller : un taux d'amplification
+    /// nul après des milliers d'échantillons signale un étiquetage cassé ou un
+    /// signal qui n'arrive pas, pas un public qui ne relaie jamais.
+    pub amplify_samples: u64,
+    pub amplify_rate: f64,
+    pub amplify_active: bool,
+    pub reject_samples: u64,
+    pub reject_rate: f64,
+    pub reject_active: bool,
     pub algorithm_version: &'static str,
 }

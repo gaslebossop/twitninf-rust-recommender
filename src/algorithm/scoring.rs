@@ -24,6 +24,7 @@ use crate::algorithm::d9_llm_understanding::{
 use crate::algorithm::dwell::{MAX_BONUS as DWELL_MAX, SKIP_PENALTY as DWELL_MIN};
 use crate::ml::ctr_predictor::{extract_features, CtrPredictor, N_FEATURES};
 use crate::ml::dwell_predictor::DwellPredictor;
+use crate::ml::objectives::{ObjectivePredictions, ObjectivePredictor};
 use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
     AuthorTier, ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
@@ -261,14 +262,76 @@ pub fn score_tweet_ml(
     scored
 }
 
+/// Poids de base de chaque terme POSITIF du mélange final.
+///
+/// Ce ne sont pas les poids appliqués : ils sont renormalisés sur les seuls
+/// termes réellement disponibles (voir `blend_positive`). Ils expriment donc
+/// une importance RELATIVE, pas une part.
+///
+/// Les règles gardent le poids dominant à dessein : un signal appris ne doit
+/// pas dominer une dimension qui n'a encore rien appris à côté de lui. Et
+/// l'amplification pèse plus que le temps de lecture — relayer engage sa
+/// propre audience, lire longuement n'engage que soi.
+const W_RULES: f64 = 0.50;
+const W_CTR: f64 = 0.30;
+const W_DWELL: f64 = 0.20;
+const W_AMPLIFY: f64 = 0.25;
+
+/// Part de score qu'un rejet CERTAIN retire.
+///
+/// La tête de rejet est le seul terme NÉGATIF du classement, et c'est ce qui
+/// manquait le plus : jusqu'ici, rétrograder un contenu problématique
+/// supposait de l'avoir déjà repéré APRÈS coup (signalements reçus, étiquette
+/// de toxicité du LLM). Ici on prédit le refus avant de montrer le tweet.
+///
+/// Multiplicatif et non soustractif : le score reste borné, et un tweet par
+/// ailleurs mauvais ne peut pas passer sous zéro puis remonter par un autre
+/// facteur. 0,60 est du même ordre que la pénalité de contenu poubelle
+/// (`garbage_penalty`), qui répond à la même question par un autre chemin.
+const REJECT_PENALTY_MAX: f64 = 0.60;
+
+/// Somme pondérée des termes positifs DISPONIBLES, renormalisée à 1.
+///
+/// Renormaliser plutôt qu'énumérer les combinaisons : la version précédente
+/// portait un `match (ctr, dwell)` à quatre branches, chacune avec ses poids
+/// écrits à la main. Ajouter une troisième tête y aurait demandé huit
+/// branches, une quatrième seize — c'est exactement pour ça qu'aucune tête
+/// n'avait jamais été ajoutée. Ici, une tête absente ne coûte rien à écrire :
+/// elle n'entre simplement pas dans la somme.
+///
+/// ⚠ Écart assumé avec l'ancien barème : quand seul le CTR est disponible, le
+/// mélange passe de 0,60/0,40 à 0,625/0,375 (et 0,70/0,30 → 0,714/0,286 pour
+/// le dwell seul). L'écart va dans le sens prudent — les règles pèsent un
+/// peu PLUS — et la formule unique vaut mieux qu'une table à maintenir.
+fn blend_positive(rules: f64, terms: &[(f64, Option<f64>)]) -> f64 {
+    let mut weighted = rules * W_RULES;
+    let mut total = W_RULES;
+    for (weight, value) in terms {
+        if let Some(v) = value {
+            weighted += v * weight;
+            total += weight;
+        }
+    }
+    (weighted / total).clamp(0.0, 1.0)
+}
+
 /// Variante ML avec poids de dimensions injectés (admin/auto-tuner).
 ///
-/// `ctr` et `dwell` sont chacun gardés par leur PROPRE seuil de démarrage à
-/// froid (voir `use_ml`/`use_dwell` dans `services::recommender`) — un modèle
-/// tout juste réinitialisé ne doit jamais peser dans le mélange. Les poids du
-/// mélange s'ajustent selon ce qui est réellement disponible ; les règles
-/// gardent toujours au moins 50 % : un signal appris ne doit pas dominer une
-/// dimension qui n'a encore rien appris à côté de lui.
+/// ── Multi-objectif ──────────────────────────────────────────────────────────
+/// Quatre prédictions entrent ici, chacune gardée par SON propre seuil de
+/// démarrage à froid — un modèle tout juste réinitialisé ne doit jamais peser :
+///
+///   * le score de règles (les 9 dimensions), toujours présent ;
+///   * `ctr`     — p(engagement), toutes réactions positives confondues ;
+///   * `dwell`   — temps de lecture attendu, reprojeté sur [0,1] ;
+///   * `amplify` — p(relais : retweet, partage, marque-page, commentaire) ;
+///   * `reject`  — p(refus explicite), SOUSTRAIT et non ajouté.
+///
+/// C'est la structure que X et TikTok utilisent : plusieurs probabilités
+/// séparées, combinées par une somme pondérée dont certains termes sont
+/// négatifs. La tête unique d'avant ne pouvait pas distinguer « sera aimé » de
+/// « sera partagé », ni « sera ignoré » de « sera signalé ».
+#[allow(clippy::too_many_arguments)]
 pub fn score_tweet_ml_with_weights(
     tweet: &RawTweet,
     profile: &UserProfile,
@@ -276,6 +339,7 @@ pub fn score_tweet_ml_with_weights(
     feed_tweets_so_far: &[ScoredTweet],
     ctr: Option<&CtrPredictor>,
     dwell: Option<&DwellPredictor>,
+    objectives: Option<&ObjectivePredictor>,
     realtime_boost: f64,
     weights: &AlgoWeights,
 ) -> ScoredTweet {
@@ -290,26 +354,48 @@ pub fn score_tweet_ml_with_weights(
     let features = ctr_feature_vector(tweet, profile, &scored);
     scored.ctr_features = Some(features.to_vec());
 
+    // Prédiction faite ICI et non par l'appelant : les features ne sont
+    // construites qu'à partir du tweet DÉJÀ scoré par les règles, elles
+    // n'existent donc nulle part ailleurs. Un prédicteur absent, ou dont les
+    // deux têtes sont encore froides, donne des `None` — le mélange se
+    // comporte alors exactement comme avant l'ajout des têtes.
+    let objectives: ObjectivePredictions = objectives
+        .map(|o| o.predict(&features))
+        .unwrap_or_default();
+
     let ml_ctr = ctr.map(|m| m.predict_ctr(&features));
     // Le dwell prédit vit sur [SKIP_PENALTY, MAX_BONUS] (voir `algorithm::dwell`),
     // pas [0, 1] comme le CTR et le score de règles — reprojeté pour mélanger
-    // sur la même échelle que les deux autres termes.
+    // sur la même échelle que les autres termes.
     let ml_dwell01 = dwell.map(|m| {
         let predicted = m.predict_dwell(&features);
         ((predicted - DWELL_MIN) / (DWELL_MAX - DWELL_MIN)).clamp(0.0, 1.0)
     });
 
-    scored.score = match (ml_ctr, ml_dwell01) {
-        (Some(c), Some(d)) => (scored.score * 0.50 + c * 0.30 + d * 0.20).clamp(0.0, 1.0),
-        (Some(c), None) => (scored.score * 0.60 + c * 0.40).clamp(0.0, 1.0),
-        (None, Some(d)) => (scored.score * 0.70 + d * 0.30).clamp(0.0, 1.0),
-        (None, None) => scored.score,
-    };
+    scored.score = blend_positive(
+        scored.score,
+        &[
+            (W_CTR, ml_ctr),
+            (W_DWELL, ml_dwell01),
+            (W_AMPLIFY, objectives.amplify),
+        ],
+    );
+
+    // ── Terme négatif ────────────────────────────────────────────────────────
+    // Appliqué APRÈS le mélange positif, sur le score déjà constitué : un tweet
+    // que le modèle s'attend à voir signalé est rétrogradé quelle que soit sa
+    // qualité par ailleurs, exactement comme la pénalité de toxicité.
+    if let Some(p_reject) = objectives.reject {
+        let penalty = 1.0 - REJECT_PENALTY_MAX * p_reject.clamp(0.0, 1.0);
+        scored.score *= penalty;
+        trace!(tweet_id = %tweet.id, p_reject, penalty, "Tête de rejet appliquée");
+    }
 
     if realtime_boost.abs() > 0.001 {
         scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
     }
 
+    scored.score = scored.score.clamp(0.0, 1.0);
     scored.breakdown.final_score = scored.score;
     scored
 }
@@ -1228,6 +1314,76 @@ fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    // ─── Mélange multi-objectifs ─────────────────────────────────────────────
+
+    /// Sans aucune tête disponible, le mélange doit rendre EXACTEMENT le score
+    /// de règles. C'est la garantie de démarrage à froid : tant que rien n'a
+    /// appris, le classement est celui d'avant l'ajout des têtes.
+    #[test]
+    fn sans_aucune_tete_le_melange_rend_le_score_de_regles() {
+        assert_eq!(blend_positive(0.42, &[]), 0.42);
+        assert_eq!(
+            blend_positive(0.42, &[(W_CTR, None), (W_DWELL, None), (W_AMPLIFY, None)]),
+            0.42
+        );
+    }
+
+    /// Le barème historique à trois termes (règles/CTR/dwell = 0,50/0,30/0,20)
+    /// doit être reproduit à l'identique : c'est le cas nominal en production
+    /// une fois les deux modèles mûrs.
+    #[test]
+    fn le_bareme_historique_a_trois_termes_est_reproduit() {
+        let attendu = 0.40 * 0.50 + 0.80 * 0.30 + 0.60 * 0.20;
+        let obtenu = blend_positive(0.40, &[(W_CTR, Some(0.80)), (W_DWELL, Some(0.60))]);
+        assert!((obtenu - attendu).abs() < 1e-12, "{obtenu} vs {attendu}");
+    }
+
+    /// Le mélange reste une moyenne pondérée : il ne peut pas sortir de
+    /// l'enveloppe de ses termes.
+    #[test]
+    fn le_melange_reste_entre_le_min_et_le_max_de_ses_termes() {
+        let out = blend_positive(0.20, &[(W_CTR, Some(0.90)), (W_AMPLIFY, Some(0.50))]);
+        assert!(out > 0.20 && out < 0.90, "{out}");
+        let egaux = blend_positive(0.55, &[(W_CTR, Some(0.55)), (W_AMPLIFY, Some(0.55))]);
+        assert!((egaux - 0.55).abs() < 1e-12);
+    }
+
+    /// Une amplification prédite forte doit remonter le tweet — c'est la tête
+    /// qui vaut le plus cher : relayer engage sa propre audience.
+    #[test]
+    fn une_amplification_predite_remonte_le_tweet() {
+        let sans = blend_positive(0.40, &[(W_CTR, Some(0.40))]);
+        let avec = blend_positive(0.40, &[(W_CTR, Some(0.40)), (W_AMPLIFY, Some(0.95))]);
+        assert!(avec > sans, "sans={sans} avec={avec}");
+    }
+
+    /// Et l'amplification doit peser PLUS que le temps de lecture, à valeur
+    /// prédite égale.
+    #[test]
+    fn l_amplification_pese_plus_que_le_temps_de_lecture() {
+        assert!(W_AMPLIFY > W_DWELL);
+        let par_dwell = blend_positive(0.30, &[(W_DWELL, Some(0.90))]);
+        let par_amplify = blend_positive(0.30, &[(W_AMPLIFY, Some(0.90))]);
+        assert!(par_amplify > par_dwell, "{par_amplify} vs {par_dwell}");
+    }
+
+    /// Le terme négatif : un rejet certain doit retirer `REJECT_PENALTY_MAX`,
+    /// un rejet nul ne doit rien retirer, et le résultat reste borné.
+    #[test]
+    fn la_tete_de_rejet_retrograde_sans_jamais_annuler() {
+        let base = 0.80_f64;
+        let certain = base * (1.0 - REJECT_PENALTY_MAX * 1.0);
+        let nul = base * (1.0 - REJECT_PENALTY_MAX * 0.0);
+        assert!((nul - base).abs() < 1e-12, "un rejet nul ne retire rien");
+        assert!(certain < base);
+        assert!(
+            certain > 0.0,
+            "rétrograder n'est pas retirer : le retrait est une décision de modération"
+        );
+        assert!((certain - 0.32).abs() < 1e-12, "{certain}");
+    }
 
     #[test]
     fn abonnes_devant_gratuits_a_qualite_egale() {
