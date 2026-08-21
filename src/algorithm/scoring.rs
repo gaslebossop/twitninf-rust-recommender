@@ -53,6 +53,47 @@ const IMPRESSION_FATIGUE_START: i64 = 2;
 const SUBSCRIPTION_BOOST_PLUS: f64 = 1.03;
 const SUBSCRIPTION_BOOST_PRO: f64 = 1.06;
 
+
+/// Ce que D6 a besoin de savoir du fil DEJA construit.
+///
+/// Remplace le `&[ScoredTweet]` qui etait passe jusqu'ici. D6 n'en tirait que
+/// deux nombres — combien de tweets, combien avec un media — mais les
+/// recomptait en parcourant tout le fil A CHAQUE candidat. Sur un vivier de
+/// 1700 tweets, ca fait 1,4 million de passages pour deux entiers qui peuvent
+/// etre tenus au fil de l'eau.
+///
+/// Type valeur et non reference : il n'y a rien a emprunter, et le passer par
+/// copie evite au passage que quiconque soit tente d'aller relire le fil
+/// entier depuis D6.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeedShape {
+    pub len: usize,
+    pub media_count: usize,
+}
+
+impl FeedShape {
+    /// Fil vide — premier tweet de la page, ou scoring hors contexte de fil
+    /// (rattrapage hors-ligne du modele CTR).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Un tweet de plus dans le fil.
+    pub fn push(&mut self, has_media: bool) {
+        self.len += 1;
+        if has_media {
+            self.media_count += 1;
+        }
+    }
+
+    fn media_ratio(&self) -> f64 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        self.media_count as f64 / self.len as f64
+    }
+}
+
 /// Score final d'un tweet, toutes dimensions combinées.
 /// `author_feed_count` = combien de fois cet auteur apparaît déjà dans le feed courant.
 /// `ctr_predictor`     = modèle ML optionnel pour blending CTR prédit (Phase 2)
@@ -61,7 +102,7 @@ pub fn score_tweet(
     tweet: &RawTweet,
     profile: &UserProfile,
     author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
+    feed: FeedShape,
 ) -> ScoredTweet {
     // Délègue à la variante pondérée avec les poids par défaut : les deux
     // fonctions calculaient auparavant la même chose en double, et toute
@@ -70,7 +111,7 @@ pub fn score_tweet(
         tweet,
         profile,
         author_feed_count,
-        feed_tweets_so_far,
+        feed,
         &AlgoWeights::default(),
     )
 }
@@ -80,22 +121,27 @@ pub fn score_tweet_with_weights(
     tweet: &RawTweet,
     profile: &UserProfile,
     author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
+    feed: FeedShape,
     weights: &AlgoWeights,
 ) -> ScoredTweet {
     let (d1, ev_raw, ev_accel, viral_vel) = d1_engagement_velocity(tweet);
-    let d2 = d2_content_intelligence(tweet, profile);
+    // Minuscules calculees UNE fois. D2 et D8 cherchent chacun les mots-cles
+    // du lecteur dans le texte du tweet, et chacun refaisait sa propre copie
+    // en minuscules — deux allocations et deux conversions par candidat, pour
+    // exactement la meme chaine.
+    let content_lower = tweet.content.to_lowercase();
+    let d2 = d2_content_intelligence(tweet, profile, &content_lower);
     let (d3, d_follow, d_mutual, d_second) = d3_social_graph(tweet, profile);
     let d4 = d4_temporal_dynamics(tweet, profile);
     let d5 = d5_behavioral_prediction(tweet, profile);
-    let d6 = d6_content_diversity(tweet, profile, feed_tweets_so_far);
+    let d6 = d6_content_diversity(tweet, profile, feed);
     let d7_raw = d7_viral_prediction(tweet);
     let d7 = if tweet.source == TweetSource::Trending {
         (d7_raw * 1.2).clamp(0.0, 1.0)
     } else {
         d7_raw
     };
-    let d8 = d8_personalization_depth(tweet, profile);
+    let d8 = d8_personalization_depth(tweet, profile, &content_lower);
     // D9 juge le texte lui-même via les étiquettes du LLM annotateur. Neutre
     // (0.5) tant qu'un tweet n'est pas annoté, donc sans effet sur le classement
     // existant.
@@ -219,49 +265,6 @@ pub fn score_tweet_with_weights(
     }
 }
 
-/// Version avec ML CTR Predictor (Phase 2) + realtime boost (Phase 3)
-/// `ctr`           = CtrPredictor optionnel (None → score classique)
-/// `realtime_boost`= delta feedback loop Redis, typiquement [-0.20, +0.20]
-pub fn score_tweet_ml(
-    tweet: &RawTweet,
-    profile: &UserProfile,
-    author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
-    ctr: Option<&CtrPredictor>,
-    realtime_boost: f64,
-) -> ScoredTweet {
-    // Score de base (Phase 1 + Phase 2 user weights)
-    let mut scored = score_tweet(tweet, profile, author_feed_count, feed_tweets_so_far);
-
-    // Les features sont extraites systématiquement, même quand le blending ML
-    // est encore désactivé : c'est ce vecteur qu'on mémorise pour entraîner le
-    // modèle. Le gater sur `use_ml` créait un blocage circulaire — pas de
-    // features stockées → pas d'entraînement → jamais assez de samples pour
-    // activer le ML.
-    let features = ctr_feature_vector(tweet, profile, &scored);
-    scored.ctr_features = Some(features.to_vec());
-
-    // Phase 2 : blending ML CTR predictor (40% ML + 60% règles)
-    if let Some(ctr_model) = ctr {
-        let ml_ctr = ctr_model.predict_ctr(&features);
-        let blended = scored.score * 0.60 + ml_ctr * 0.40;
-        debug!(
-            base = scored.score,
-            ml_ctr, blended, "Phase 2: ML CTR blend (60% rules + 40% ML)"
-        );
-        scored.score = blended;
-    }
-
-    // Phase 3 : realtime feedback boost/penalty
-    if realtime_boost.abs() > 0.001 {
-        scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
-        debug!(realtime_boost, final = scored.score, "Phase 3: Realtime feedback applied");
-    }
-
-    scored.breakdown.final_score = scored.score;
-    scored
-}
-
 /// Poids de base de chaque terme POSITIF du mélange final.
 ///
 /// Ce ne sont pas les poids appliqués : ils sont renormalisés sur les seuls
@@ -336,7 +339,7 @@ pub fn score_tweet_ml_with_weights(
     tweet: &RawTweet,
     profile: &UserProfile,
     author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
+    feed: FeedShape,
     ctr: Option<&CtrPredictor>,
     dwell: Option<&DwellPredictor>,
     objectives: Option<&ObjectivePredictor>,
@@ -347,7 +350,7 @@ pub fn score_tweet_ml_with_weights(
         tweet,
         profile,
         author_feed_count,
-        feed_tweets_so_far,
+        feed,
         weights,
     );
 
@@ -531,7 +534,7 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
 // Analyse réelle du contenu : longueur idéale, richesse, format, style,
 // correspondance avec les préférences de l'utilisateur.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
+fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile, content_lower: &str) -> f64 {
     let mut score = 0.0_f64;
     trace!(content_length = t.content_length, personality = ?profile.personality_type, "D2 Start");
 
@@ -634,7 +637,6 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
     score += personality_score;
 
     // ── Correspondance mots-clés préférés ────────────────────────────────────
-    let content_lower = t.content.to_lowercase();
     let keyword_matches: usize = profile
         .top_words
         .iter()
@@ -892,8 +894,8 @@ fn d5_behavioral_prediction(t: &RawTweet, profile: &UserProfile) -> f64 {
 // Maximal Marginal Relevance (MMR) adapté :
 // récompense les tweets qui apportent de la nouveauté au feed.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet]) -> f64 {
-    let feed_size = feed.len();
+fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: FeedShape) -> f64 {
+    let feed_size = feed.len;
     trace!(feed_size, tweet_id = %t.id, "D6 Content diversity analysis");
 
     if feed_size == 0 {
@@ -909,8 +911,8 @@ fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet
 
     // Bonus format : médias vs texte — ratio réel de tweets-média déjà dans le feed.
     // (auparavant un placeholder figé à 1.0 qui désactivait totalement ce bonus)
-    let media_in_feed = feed.iter().filter(|s| s.breakdown.has_media).count();
-    let media_ratio_in_feed = media_in_feed as f64 / feed_size.max(1) as f64;
+    let media_in_feed = feed.media_count;
+    let media_ratio_in_feed = feed.media_ratio();
     // Récompense la nouveauté de format : un tweet média dans un feed pauvre en média
     // (ou inversement, un tweet texte dans un feed saturé de médias).
     let media_bonus = if t.has_media && media_ratio_in_feed < 0.40 {
@@ -1027,7 +1029,7 @@ fn d7_viral_prediction(t: &RawTweet) -> f64 {
 // D8 — PERSONALIZATION DEPTH (5%)
 // Affinité profonde : top auteurs, mots-clés, profil émotionnel.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile) -> f64 {
+fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile, content_lower: &str) -> f64 {
     let mut score = 0.0_f64;
     trace!(author_id = %t.user_id, "D8 Personalization depth start");
 
@@ -1048,7 +1050,6 @@ fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile) -> f64 {
     );
 
     // Correspondance mots avec centres d'intérêt
-    let content_lower = t.content.to_lowercase();
     let mut word_matches = 0;
     let interest_score: f64 = profile
         .top_words

@@ -166,7 +166,16 @@ impl RecommenderService {
                 };
                 let clicked = liked.contains(tweet_id);
                 let scored =
-                    score_tweet_with_weights(tweet, &profile, 0, &[], &AlgoWeights::default());
+                    score_tweet_with_weights(
+                        tweet,
+                        &profile,
+                        0,
+                        // Reconstruction hors ligne d'une interaction passee :
+                        // il n'y a pas de fil autour de ce tweet, D6 le voit
+                        // donc comme une ouverture de page.
+                        crate::algorithm::scoring::FeedShape::empty(),
+                        &AlgoWeights::default(),
+                    );
                 let features = ctr_feature_vector(tweet, &profile, &scored);
                 model.update(&features, clicked);
                 samples_trained += 1;

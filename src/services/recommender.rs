@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::algorithm::scoring::{
     compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights,
-    theme_diversity_multiplier,
+    theme_diversity_multiplier, FeedShape,
 };
 use crate::bandit::bandit_select;
 use crate::constants::{
@@ -844,6 +844,9 @@ impl RecommenderService {
         // repérer deux catégories dégradantes.
         let mut theme_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
+        // Forme du fil tenue au fil de l'eau — voir `FeedShape`. D6 la
+        // recalculait en parcourant tout le fil deja score a chaque candidat.
+        let mut feed_shape = FeedShape::empty();
         let (ctr_samples, _) = self.ctr_predictor.stats();
         // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
         let use_ml = ctr_samples >= 200;
@@ -933,7 +936,7 @@ impl RecommenderService {
                 tweet,
                 profile,
                 ac,
-                &scored_feed,
+                feed_shape,
                 if use_ml {
                     Some(&self.ctr_predictor)
                 } else {
@@ -1078,6 +1081,7 @@ impl RecommenderService {
             }
 
             *author_count.entry(tweet.user_id.clone()).or_insert(0) += 1;
+            feed_shape.push(tweet.has_media);
             scored_feed.push(s);
         }
 
