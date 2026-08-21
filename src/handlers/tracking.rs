@@ -96,6 +96,18 @@ pub async fn track_handler(
         .map(|ms| dwell_weight(ms.min(MAX_DWELL_MS), dwell_context.as_ref()))
         .unwrap_or(0.0);
 
+    // Entraîne le modèle qui PRÉDIT le dwell (ml::dwell_predictor), sur le
+    // poids déjà normalisé ci-dessus — jamais la durée brute, qui porterait
+    // le biais de longueur documenté dans `algorithm::dwell`. `peek_impression`
+    // et non `take_impression` : une vue ne doit pas retirer l'impression de
+    // la file d'attribution CTR, sous peine de priver le balayage
+    // (`ctr_sweeper`) des négatifs qu'il en tire quand rien d'autre ne suit.
+    if req.dwell_ms.is_some() && dwell_context.is_some() {
+        if let Some(features) = state.cache.peek_impression(&req.user_id, &req.tweet_id).await {
+            state.recommender.record_dwell_event(&features, dwell_bonus);
+        }
+    }
+
     let total_weight = weight + dwell_bonus;
 
     // Le suivi A/B est persistant en PostgreSQL et ne dépend pas de Redis.

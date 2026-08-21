@@ -86,7 +86,11 @@ const SKIP_RATIO: f64 = 0.20;
 ///
 /// Volontairement du même ordre que `InteractionType::Skip` (-0.5) : c'est le
 /// même geste, constaté au chronomètre plutôt que déclaré.
-const SKIP_PENALTY: f64 = -0.45;
+///
+/// `pub` : `ml::dwell_predictor` reprojette sa sortie sigmoïde [0,1] sur
+/// cette même échelle — une seule vérité sur la plage du poids de dwell,
+/// jamais une copie qui pourrait diverger de celle-ci.
+pub const SKIP_PENALTY: f64 = -0.45;
 
 /// Bonus maximal d'un contenu longuement consommé.
 ///
@@ -94,7 +98,7 @@ const SKIP_PENALTY: f64 = -0.45;
 /// (`InteractionType::Like` = 1.0) une fois ajouté au poids d'une vue (0.2), et
 /// jamais plus : un temps de lecture reste une préférence DEVINÉE, il ne doit
 /// pas dominer un geste explicite.
-const MAX_BONUS: f64 = 0.85;
+pub const MAX_BONUS: f64 = 0.85;
 
 /// Rapport au-delà duquel le bonus ne bouge plus (relecture, boucle vidéo).
 const RATIO_CAP: f64 = 3.0;

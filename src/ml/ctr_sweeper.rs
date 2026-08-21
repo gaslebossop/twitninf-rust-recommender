@@ -7,8 +7,13 @@
 /// source des exemples négatifs, sans laquelle le modèle n'a que des positifs
 /// et ne peut rien discriminer.
 ///
-/// Ce balayage est aussi le seul endroit qui persiste le modèle sur disque :
-/// sans lui, tout l'apprentissage repartait de zéro à chaque redémarrage.
+/// Ce balayage est aussi le seul endroit qui persiste le modèle CTR sur
+/// disque : sans lui, tout l'apprentissage repartait de zéro à chaque
+/// redémarrage. Le modèle de dwell (`ml::dwell_predictor`) n'a pas besoin de
+/// négatifs (le handler de tracking l'entraîne directement sur le poids déjà
+/// normalisé — voir `handlers::tracking`), mais il n'a pas d'autre boucle de
+/// fond : ce tick lui sert aussi d'horloge de sauvegarde, avec son propre
+/// compteur d'échantillons.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +41,7 @@ pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
         ticker.tick().await;
 
         let mut last_saved_at = recommender.ctr_stats().0;
+        let mut last_dwell_saved_at = recommender.dwell_stats().0;
 
         loop {
             ticker.tick().await;
@@ -59,6 +65,16 @@ pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
                 recommender.persist_ctr_model().await;
                 last_saved_at = samples;
                 info!(samples, global_ctr, "Modèle CTR persisté");
+            }
+
+            let (dwell_samples, mean_weight) = recommender.dwell_stats();
+            if dwell_samples >= last_dwell_saved_at + SAVE_EVERY_SAMPLES {
+                recommender.persist_dwell_model().await;
+                last_dwell_saved_at = dwell_samples;
+                info!(
+                    samples = dwell_samples,
+                    mean_weight, "Modèle de dwell persisté"
+                );
             }
         }
     });

@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::admin::{
-    AdminActionResponse, AlgoStatsResponse, AlgoWeights, AlgoWeightsResponse, BanRequest,
-    FiltersResponse, IssueStrikeRequest, RevokeStrikeRequest, SetShadowbanRequest,
+    AdminActionResponse, AlgoStatsResponse, AlgoWeights, AlgoWeightsResponse, BackfillCtrRequest,
+    BanRequest, FiltersResponse, IssueStrikeRequest, RevokeStrikeRequest, SetShadowbanRequest,
     SetWeightsRequest, UnbanRequest,
 };
 use crate::handlers::AppState;
@@ -461,6 +461,8 @@ pub async fn admin_algo_stats_handler(
     let auto_tuned = state.auto_tuner.is_auto_tuned() && admin_override.is_none();
     let weights = state.auto_tuner.active_weights(admin_override.as_ref());
     let ml_active = ctr_samples >= 200;
+    let (dwell_samples, dwell_mean_weight) = state.recommender.dwell_stats();
+    let dwell_active = dwell_samples >= 200;
 
     (
         StatusCode::OK,
@@ -470,9 +472,46 @@ pub async fn admin_algo_stats_handler(
             weights,
             auto_tuned,
             ml_active,
-            algorithm_version: "2.1.0 — 8D + ML CTR + bandit + garbage filter + admin node",
+            dwell_samples,
+            dwell_mean_weight,
+            dwell_active,
+            algorithm_version: "2.2.0 — 8D + ML CTR + dwell predictor + bandit + garbage filter + admin node",
         })),
     )
+}
+
+// ─── POST /admin/algo/backfill-ctr ─────────────────────────────────────────────
+//
+// Reconstruit le modèle CTR depuis les interactions réelles des N derniers
+// jours (défaut 14) — voir `services::ctr_backfill` pour les approximations
+// assumées. `apply: false` par défaut : ne modifie rien, ne fait que rapporter
+// ce que donnerait la reconstruction. Appeler UNE FOIS en dry-run, vérifier
+// `resulting_global_ctr`/`resulting_weights`, puis seulement avec
+// `apply: true` si le résultat semble sain — celui-là sauvegarde l'ancien
+// modèle avant de l'écraser, mais un redémarrage du service reste nécessaire
+// pour que le nouveau modèle soit effectivement chargé et servi.
+pub async fn admin_backfill_ctr_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<BackfillCtrRequest>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    let since_days = req.since_days.unwrap_or(14).clamp(1, 90);
+    let apply = req.apply.unwrap_or(false);
+
+    info!(since_days, apply, "Backfill CTR demandé");
+
+    match state.recommender.backfill_ctr_model(since_days, apply).await {
+        Ok(report) => (StatusCode::OK, Json(json!({ "success": true, "report": report }))),
+        Err(e) => {
+            warn!(error = %e, "Backfill CTR échoué");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "error": e.to_string() })),
+            )
+        }
+    }
 }
 
 // ─── GET /admin/logs ──────────────────────────────────────────────────────────

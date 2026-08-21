@@ -21,7 +21,9 @@ use crate::admin::AlgoWeights;
 use crate::algorithm::d9_llm_understanding::{
     d9_llm_understanding as calculate_d9, quality_boost, toxicity_penalty,
 };
+use crate::algorithm::dwell::{MAX_BONUS as DWELL_MAX, SKIP_PENALTY as DWELL_MIN};
 use crate::ml::ctr_predictor::{extract_features, CtrPredictor, N_FEATURES};
+use crate::ml::dwell_predictor::DwellPredictor;
 use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
     AuthorTier, ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
@@ -260,12 +262,20 @@ pub fn score_tweet_ml(
 }
 
 /// Variante ML avec poids de dimensions injectés (admin/auto-tuner).
+///
+/// `ctr` et `dwell` sont chacun gardés par leur PROPRE seuil de démarrage à
+/// froid (voir `use_ml`/`use_dwell` dans `services::recommender`) — un modèle
+/// tout juste réinitialisé ne doit jamais peser dans le mélange. Les poids du
+/// mélange s'ajustent selon ce qui est réellement disponible ; les règles
+/// gardent toujours au moins 50 % : un signal appris ne doit pas dominer une
+/// dimension qui n'a encore rien appris à côté de lui.
 pub fn score_tweet_ml_with_weights(
     tweet: &RawTweet,
     profile: &UserProfile,
     author_feed_count: u32,
     feed_tweets_so_far: &[ScoredTweet],
     ctr: Option<&CtrPredictor>,
+    dwell: Option<&DwellPredictor>,
     realtime_boost: f64,
     weights: &AlgoWeights,
 ) -> ScoredTweet {
@@ -280,10 +290,21 @@ pub fn score_tweet_ml_with_weights(
     let features = ctr_feature_vector(tweet, profile, &scored);
     scored.ctr_features = Some(features.to_vec());
 
-    if let Some(ctr_model) = ctr {
-        let ml_ctr = ctr_model.predict_ctr(&features);
-        scored.score = (scored.score * 0.60 + ml_ctr * 0.40).clamp(0.0, 1.0);
-    }
+    let ml_ctr = ctr.map(|m| m.predict_ctr(&features));
+    // Le dwell prédit vit sur [SKIP_PENALTY, MAX_BONUS] (voir `algorithm::dwell`),
+    // pas [0, 1] comme le CTR et le score de règles — reprojeté pour mélanger
+    // sur la même échelle que les deux autres termes.
+    let ml_dwell01 = dwell.map(|m| {
+        let predicted = m.predict_dwell(&features);
+        ((predicted - DWELL_MIN) / (DWELL_MAX - DWELL_MIN)).clamp(0.0, 1.0)
+    });
+
+    scored.score = match (ml_ctr, ml_dwell01) {
+        (Some(c), Some(d)) => (scored.score * 0.50 + c * 0.30 + d * 0.20).clamp(0.0, 1.0),
+        (Some(c), None) => (scored.score * 0.60 + c * 0.40).clamp(0.0, 1.0),
+        (None, Some(d)) => (scored.score * 0.70 + d * 0.30).clamp(0.0, 1.0),
+        (None, None) => scored.score,
+    };
 
     if realtime_boost.abs() > 0.001 {
         scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
@@ -299,7 +320,11 @@ pub fn score_tweet_ml_with_weights(
 /// l'entraînement doivent tous partir d'ici. Deux constructions parallèles du
 /// vecteur, c'était précisément le bug — le modèle s'entraînait sur des
 /// constantes et prédisait sur les vraies dimensions.
-fn ctr_feature_vector(
+// `pub(crate)` : le rattrapage hors-ligne du modèle CTR
+// (`RecommenderService::backfill_ctr_model`) doit reconstruire EXACTEMENT le
+// même vecteur que le chemin de service — une seconde implémentation aurait
+// pu diverger de celle-ci sans qu'aucun test ne le remarque.
+pub(crate) fn ctr_feature_vector(
     tweet: &RawTweet,
     profile: &UserProfile,
     scored: &ScoredTweet,

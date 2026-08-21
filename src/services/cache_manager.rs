@@ -206,6 +206,22 @@ impl CacheManager {
         json.and_then(|j| serde_json::from_str::<Vec<f64>>(&j).ok())
     }
 
+    /// Même lecture que `take_impression`, sans la retirer de la file.
+    ///
+    /// Le dwell (`InteractionType::View`) et le clic peuvent tous deux vouloir
+    /// lire les features de la MÊME impression — un like arrive après avoir
+    /// lu, pas à la place. Si le dwell la consommait comme `take_impression`,
+    /// le balayage (`drain_expired_impressions`) ne la retrouverait plus jamais
+    /// pour produire un négatif CTR quand la vue ne débouche sur rien d'autre :
+    /// la lecture reste en file, seul un clic explicite (ou l'expiration) la
+    /// retire.
+    pub async fn peek_impression(&self, user_id: &str, tweet_id: &str) -> Option<Vec<f64>> {
+        let key = Self::imp_key(user_id, tweet_id);
+        let mut c = self.conn.lock().await;
+        let json: Option<String> = c.get(&key).await.ok()?;
+        json.and_then(|j| serde_json::from_str::<Vec<f64>>(&j).ok())
+    }
+
     /// Retire et retourne les impressions expirées sans engagement : ce sont les
     /// exemples négatifs du modèle CTR.
     pub async fn drain_expired_impressions(&self, limit: usize) -> Vec<(String, String, Vec<f64>)> {

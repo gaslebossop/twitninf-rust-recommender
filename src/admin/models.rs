@@ -53,6 +53,14 @@ pub struct UnbanRequest {
     pub user_id: String,
 }
 
+/// `apply: false` (défaut) — reconstruit et rapporte, n'écrit rien sur disque.
+/// `since_days` par défaut à 14 : la fenêtre convenue pour le rattrapage.
+#[derive(Debug, Deserialize)]
+pub struct BackfillCtrRequest {
+    pub since_days: Option<i32>,
+    pub apply: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetWeightsRequest {
     pub d1: Option<f64>,
@@ -170,5 +178,12 @@ pub struct AlgoStatsResponse {
     pub weights: AlgoWeights,
     pub auto_tuned: bool,
     pub ml_active: bool,
+    /// Échantillons appris par `ml::dwell_predictor` et poids de dwell moyen
+    /// observé sur son échelle d'origine (voir `algorithm::dwell`) — même
+    /// paire (samples, moyenne) que `ctr_samples`/`global_ctr`, pour l'autre
+    /// modèle.
+    pub dwell_samples: u64,
+    pub dwell_mean_weight: f64,
+    pub dwell_active: bool,
     pub algorithm_version: &'static str,
 }
