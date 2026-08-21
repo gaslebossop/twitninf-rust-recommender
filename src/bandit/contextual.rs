@@ -275,7 +275,7 @@ fn is_exploration_candidate(
     // Candidat exploration si :
     let is_new_author = !profile.top_authors.iter().any(|(id, _)| id == &raw.user_id);
     let is_discovery = matches!(raw.source, TweetSource::Discovery | TweetSource::Quality);
-    let is_not_followed = !profile.following_ids.contains(&raw.user_id);
+    let is_not_followed = !profile.follows(&raw.user_id);
     let has_decent_score = scored.score > 0.20; // minimum qualité
 
     has_decent_score && (is_new_author || is_discovery) && is_not_followed

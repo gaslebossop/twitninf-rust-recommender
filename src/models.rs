@@ -204,6 +204,87 @@ pub struct UserProfile {
 
     pub user_type: UserType,
     pub profile_confidence: f64,
+
+    // ── Index d'appartenance ─────────────────────────────────────────────
+    //
+    // Les mêmes ensembles que `following_ids`, `mutual_follow_ids`,
+    // `second_degree_ids` et `seen_tweet_ids`, mais en `HashSet`.
+    //
+    // Ce ne sont pas des données de plus : ce sont les MÊMES, indexées. Le
+    // scoring pose la question « ce lecteur suit-il cet auteur ? » une bonne
+    // dizaine de fois par tweet candidat (D3 trois fois, le filtre de surface,
+    // le boost d'abonnement deux fois, le bandit une fois), et chacune de ces
+    // questions balayait un `Vec<String>` qui monte à 1000 abonnements. À
+    // 1700 candidats, ça fait plusieurs millions de comparaisons de chaînes
+    // par recommandation, pour une information qu'on peut hacher une seule
+    // fois au moment où le profil est construit.
+    //
+    // `#[serde(skip)]` : jamais sérialisés vers Redis — les recalculer coûte
+    // moins cher que de les transporter, et un profil relu du cache passe de
+    // toute façon par `rebuild_indexes()`.
+    #[serde(skip)]
+    pub following_set: std::collections::HashSet<String>,
+    #[serde(skip)]
+    pub mutual_set: std::collections::HashSet<String>,
+    #[serde(skip)]
+    pub second_degree_set: std::collections::HashSet<String>,
+    #[serde(skip)]
+    pub seen_set: std::collections::HashSet<String>,
+}
+
+impl UserProfile {
+    /// (Re)construit les index d'appartenance depuis les vecteurs.
+    ///
+    /// À appeler à CHAQUE endroit où un profil devient utilisable : à la
+    /// sortie de la base, et à la sortie du cache Redis (où `serde(skip)` les
+    /// a laissés vides). Un index vide alors que le vecteur ne l'est pas
+    /// donnerait des réponses fausses — c'est le seul risque de ce montage,
+    /// et il est cantonné à ces deux points.
+    pub fn rebuild_indexes(&mut self) {
+        self.following_set = self.following_ids.iter().cloned().collect();
+        self.mutual_set = self.mutual_follow_ids.iter().cloned().collect();
+        self.second_degree_set = self.second_degree_ids.iter().cloned().collect();
+        self.seen_set = self.seen_tweet_ids.iter().cloned().collect();
+    }
+
+    /// Appartenance, en préférant l'index quand il existe.
+    ///
+    /// Le repli sur le vecteur n'est pas une coquetterie défensive : un index
+    /// vide face à un vecteur plein est INDISCERNABLE d'un « ce lecteur ne
+    /// suit personne ». Sans repli, oublier un `rebuild_indexes()` sur un
+    /// chemin (celui du cache, une désérialisation ajoutée plus tard, un test)
+    /// ne produirait ni erreur ni log — juste un fil où le boost d'abonnement
+    /// et D3 valent zéro pour tout le monde. On paie une comparaison
+    /// d'entier pour rendre cette panne impossible ; le chemin nominal, lui,
+    /// reste bien en O(1).
+    #[inline]
+    fn member(set: &std::collections::HashSet<String>, list: &[String], needle: &str) -> bool {
+        if set.is_empty() && !list.is_empty() {
+            return list.iter().any(|id| id == needle);
+        }
+        set.contains(needle)
+    }
+
+    /// Ce lecteur suit-il ce compte ?
+    #[inline]
+    pub fn follows(&self, author_id: &str) -> bool {
+        Self::member(&self.following_set, &self.following_ids, author_id)
+    }
+
+    #[inline]
+    pub fn is_mutual(&self, author_id: &str) -> bool {
+        Self::member(&self.mutual_set, &self.mutual_follow_ids, author_id)
+    }
+
+    #[inline]
+    pub fn is_second_degree(&self, author_id: &str) -> bool {
+        Self::member(&self.second_degree_set, &self.second_degree_ids, author_id)
+    }
+
+    #[inline]
+    pub fn has_seen(&self, tweet_id: &str) -> bool {
+        Self::member(&self.seen_set, &self.seen_tweet_ids, tweet_id)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -601,4 +682,56 @@ pub struct HealthResponse {
     pub redis: String,
     pub uptime_secs: u64,
     pub algorithm: &'static str,
+}
+
+#[cfg(test)]
+mod profile_index_tests {
+    use super::*;
+
+    fn profile() -> UserProfile {
+        let mut p = UserProfile {
+            following_ids: vec!["a".into(), "b".into()],
+            mutual_follow_ids: vec!["b".into()],
+            second_degree_ids: vec!["c".into()],
+            seen_tweet_ids: vec!["t1".into()],
+            ..Default::default()
+        };
+        p.rebuild_indexes();
+        p
+    }
+
+    #[test]
+    fn les_index_repondent_comme_les_vecteurs() {
+        let p = profile();
+        assert!(p.follows("a") && p.follows("b") && !p.follows("z"));
+        assert!(p.is_mutual("b") && !p.is_mutual("a"));
+        assert!(p.is_second_degree("c") && !p.is_second_degree("a"));
+        assert!(p.has_seen("t1") && !p.has_seen("t2"));
+    }
+
+    /// Le seul vrai risque de l'indexation : les ensembles ne sont pas
+    /// sérialisés, donc un profil relu du cache Redis arrive avec des index
+    /// VIDES. Sans reconstruction, `follows()` répondrait « non » pour tout le
+    /// monde et le boost d'abonnement disparaîtrait silencieusement — sans
+    /// erreur, sans log, pour tous les lecteurs dont le profil est en cache.
+    #[test]
+    fn un_profil_relu_du_cache_doit_etre_reindexe() {
+        let json = serde_json::to_string(&profile()).unwrap();
+        let mut relu: UserProfile = serde_json::from_str(&json).unwrap();
+
+        // État tel qu'il sort du cache : les vecteurs sont là, pas les index.
+        assert_eq!(relu.following_ids.len(), 2);
+        assert!(relu.following_set.is_empty(), "l'index ne doit pas être sérialisé");
+
+        // Le repli doit déjà donner la BONNE réponse, index absent — c'est ce
+        // qui rend un `rebuild_indexes()` oublié inoffensif plutôt que
+        // silencieusement destructeur.
+        assert!(relu.follows("a") && relu.is_mutual("b") && relu.has_seen("t1"));
+        assert!(!relu.follows("z"));
+
+        relu.rebuild_indexes();
+        assert!(!relu.following_set.is_empty());
+        assert!(relu.follows("a") && relu.is_mutual("b") && relu.has_seen("t1"));
+        assert!(!relu.follows("z"));
+    }
 }

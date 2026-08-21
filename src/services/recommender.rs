@@ -792,7 +792,7 @@ impl RecommenderService {
             //   part : un compte `Ghosted` n'était que rétrogradé (×0,05), donc
             //   toujours capable d'atteindre les Tendances avec un pic
             //   d'engagement suffisant.
-            let follows_author = profile.following_ids.contains(&tweet.user_id);
+            let follows_author = profile.follows(&tweet.user_id);
             let surface = ShadowbanEnforcer::effective_surface(tweet, mode, follows_author);
             let signals = detector.detect(tweet);
             let eligibility = content_eligibility(tweet, &signals);
@@ -907,7 +907,7 @@ impl RecommenderService {
                 }
                 RecommendMode::Discover => {
                     let mut multiplier = 1.0;
-                    if profile.following_ids.contains(&tweet.user_id) {
+                    if profile.follows(&tweet.user_id) {
                         multiplier *= 0.65;
                         trace!(tweet_id = %tweet.id, "Discover: user follows author, reducing score by 35%");
                     }
@@ -1069,8 +1069,16 @@ impl RecommenderService {
     // méthode — celle qui alimente déjà chaque recommandation servie.
     pub(crate) async fn build_user_profile(&self, user_id: &str) -> Result<UserProfile> {
         let cache_key = format!("twitninf:profile:{}", user_id);
-        if let Some(cached) = self.cache.get_profile(&cache_key).await {
+        if let Some(mut cached) = self.cache.get_profile(&cache_key).await {
             debug!(user_id, "Profile loaded from cache");
+            // Les index d'appartenance ne sont pas sérialisés (`serde(skip)`) :
+            // un profil relu du cache arrive avec des ensembles VIDES, et
+            // `follows()` répondrait alors « non » pour tout le monde — le
+            // boost d'abonnement et D3 tomberaient silencieusement à zéro pour
+            // tous les lecteurs dont le profil est en cache, c'est-à-dire la
+            // quasi-totalité. Reconstruire ici n'est pas une optimisation,
+            // c'est la condition de justesse du montage.
+            cached.rebuild_indexes();
             return Ok(cached);
         }
 
@@ -1390,8 +1398,14 @@ impl RecommenderService {
             trace!(blocked_count = profile.blocked_ids.len(), "Blocked accounts loaded");
         }
 
+        // Index d'appartenance : construits une fois ici, relus des milliers de
+        // fois pendant le scoring. Voir `UserProfile::rebuild_indexes`.
+        profile.rebuild_indexes();
+
         debug!(
             profile_confidence = profile.profile_confidence,
+            following_indexed = profile.following_set.len(),
+            seen_indexed = profile.seen_set.len(),
             "User profile built and cached"
         );
         self.cache.set_profile(&cache_key, &profile).await;
@@ -2252,13 +2266,13 @@ fn cold_start_follow_multiplier(profile: &UserProfile) -> f64 {
 fn apply_follow_boost(score: f64, tweet: &RawTweet, profile: &UserProfile, mode: &str) -> f64 {
     let mut boost = 1.0;
 
-    if profile.following_ids.contains(&tweet.user_id) {
+    if profile.follows(&tweet.user_id) {
         boost *= FOLLOW_FEED_BOOST;
         let cold = cold_start_follow_multiplier(profile);
         boost *= cold;
         trace!(tweet_id = %tweet.id, mode, cold_start = cold, "Follow boost applied");
     }
-    if profile.mutual_follow_ids.contains(&tweet.user_id) {
+    if profile.is_mutual(&tweet.user_id) {
         boost *= FOLLOW_MUTUAL_BOOST;
         trace!(tweet_id = %tweet.id, mode, "Mutual follow boost applied");
     }
@@ -3030,11 +3044,14 @@ mod tests {
     // ─── Poids des abonnements ───────────────────────────────────────────────
 
     fn profile_following(author: &str, interactions: usize) -> UserProfile {
-        UserProfile {
+        let mut p = UserProfile {
             following_ids: vec![author.to_string()],
             liked_tweet_ids: (0..interactions).map(|i| format!("t{i}")).collect(),
             ..Default::default()
-        }
+        };
+        // Comme en production : un profil n'est utilisable qu'index construit.
+        p.rebuild_indexes();
+        p
     }
 
     fn tweet_by(author: &str) -> RawTweet {

@@ -575,7 +575,7 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     trace!(author_id = %t.user_id, "D3 Social graph analysis");
 
     // Degré 1 : l'utilisateur suit directement l'auteur
-    let direct = if profile.following_ids.contains(&t.user_id) {
+    let direct = if profile.follows(&t.user_id) {
         0.55
     } else {
         0.0
@@ -583,12 +583,12 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     score += direct;
     trace!(
         direct,
-        is_following = profile.following_ids.contains(&t.user_id),
+        is_following = profile.follows(&t.user_id),
         "D3 Degree 1: Direct follow"
     );
 
     // Degré 1.5 : follow mutuel (plus fort signal d'engagement)
-    let mutual = if profile.mutual_follow_ids.contains(&t.user_id) {
+    let mutual = if profile.is_mutual(&t.user_id) {
         0.25
     } else {
         0.0
@@ -596,12 +596,12 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     score += mutual;
     trace!(
         mutual,
-        is_mutual = profile.mutual_follow_ids.contains(&t.user_id),
+        is_mutual = profile.is_mutual(&t.user_id),
         "D3 Degree 1.5: Mutual follow"
     );
 
     // Degré 2 : ami d'ami (signal de découverte sociale)
-    let second = if profile.second_degree_ids.contains(&t.user_id) {
+    let second = if profile.is_second_degree(&t.user_id) {
         0.12
     } else {
         0.0
@@ -609,7 +609,7 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     score += second;
     trace!(
         second,
-        is_second_degree = profile.second_degree_ids.contains(&t.user_id),
+        is_second_degree = profile.is_second_degree(&t.user_id),
         "D3 Degree 2: Second degree"
     );
 
@@ -852,7 +852,7 @@ fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet
     );
 
     // Contenu pas encore vu
-    let novelty_bonus = if !profile.seen_tweet_ids.contains(&t.id) {
+    let novelty_bonus = if !profile.has_seen(&t.id) {
         0.05
     } else {
         0.0
@@ -860,7 +860,7 @@ fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet
     score += novelty_bonus;
     trace!(
         novelty_bonus,
-        already_seen = profile.seen_tweet_ids.contains(&t.id),
+        already_seen = profile.has_seen(&t.id),
         "D6 Content novelty"
     );
 

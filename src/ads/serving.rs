@@ -341,7 +341,7 @@ fn match_score(ad: &AdRow, profile: &UserProfile, hour_now: u32) -> f64 {
         && !t
             .follows_any_of
             .iter()
-            .any(|a| profile.following_ids.contains(a))
+            .any(|a| profile.follows(a))
     {
         return 0.0;
     }
