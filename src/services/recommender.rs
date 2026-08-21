@@ -341,6 +341,7 @@ impl RecommenderService {
                 // l'écartent comme orpheline — un tweet perdu par page, contre
                 // une pagination qui reste alignée sur des bornes fixes.
                 let threads = thread_links(&page);
+                let scores = page_scores(&page);
                 let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
                 let mut response = self.build_empty_response(
                     &req.user_id,
@@ -351,6 +352,7 @@ impl RecommenderService {
                     true,
                 );
                 response.threads = threads;
+                response.scores = scores;
                 // Les publicités sont choisies MÊME sur un service depuis le
                 // cache : le classement des tweets peut être resservi tel
                 // quel, pas le choix publicitaire, qui dépend du plafond de
@@ -658,7 +660,9 @@ impl RecommenderService {
 
         // Le lien de fil est figé ICI, tant qu'on a encore les tweets complets :
         // après la mise en cache il ne reste que des identifiants.
-        let all_entries = as_feed_entries(&all_ids, &tweet_map);
+        let score_by_id: HashMap<&str, f64> =
+            scored.iter().map(|s| (s.tweet_id.as_str(), s.score)).collect();
+        let all_entries = as_feed_entries(&all_ids, &tweet_map, &score_by_id, &profile);
 
         let adaptive_ttl = adaptive_ttl(&profile, &mode);
         debug!(ttl_seconds = adaptive_ttl, "Setting cache TTL");
@@ -669,6 +673,7 @@ impl RecommenderService {
         let total_available = self.count_available(&req.user_id).await.unwrap_or(1000);
         let page: Vec<FeedEntry> = all_entries.into_iter().skip(offset).take(limit).collect();
         let threads = thread_links(&page);
+        let page_scores = page_scores(&page);
         let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
         let count = page_ids.len();
         debug!(
@@ -717,6 +722,7 @@ impl RecommenderService {
             user_id: req.user_id.clone(),
             tweet_ids: page_ids,
             threads,
+            scores: page_scores,
             ads,
             count,
             algorithm: "NeuralRank Fusion",
@@ -1906,6 +1912,7 @@ impl RecommenderService {
             user_id: user_id.to_string(),
             tweet_ids,
             threads: Vec::new(),
+            scores: Vec::new(),
             count,
             algorithm: "NeuralRank Fusion",
             algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
@@ -2866,19 +2873,48 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
 /// présent ailleurs dans la liste ne compte pas : ce champ décrit ce que
 /// l'écran montre — « le tweet juste au-dessus est celui auquel je réponds » —
 /// et pas la généalogie du tweet, que la base connaît déjà.
-fn as_feed_entries(ids: &[String], tweets: &HashMap<&str, &RawTweet>) -> Vec<FeedEntry> {
+fn as_feed_entries(
+    ids: &[String],
+    tweets: &HashMap<&str, &RawTweet>,
+    scores: &HashMap<&str, f64>,
+    profile: &UserProfile,
+) -> Vec<FeedEntry> {
     ids.iter()
         .enumerate()
         .map(|(i, id)| {
-            let parent_id = tweets
-                .get(id.as_str())
+            let tweet = tweets.get(id.as_str());
+            let parent_id = tweet
                 .and_then(|t| t.parent_tweet_id.as_deref())
                 .filter(|parent| i > 0 && ids[i - 1] == *parent)
                 .map(String::from);
             FeedEntry {
                 id: id.clone(),
                 parent_id,
+                score: scores.get(id.as_str()).copied().unwrap_or(0.0),
+                // Calculée ICI, au même endroit et pour la même raison que le
+                // lien de fil : c'est le dernier instant où l'on dispose
+                // encore du tweet complet ET du profil. Après la mise en
+                // cache il ne reste que des identifiants.
+                confidence: tweet
+                    .map(|t| crate::algorithm::scoring::ranking_confidence(t, profile))
+                    .unwrap_or(0.0),
             }
+        })
+        .collect()
+}
+
+/// Traduit les entrées d'une page en scores exposables.
+///
+/// Séparé de `thread_links` bien que les deux parcourent la même page : l'un
+/// décrit la structure du fil, l'autre ce que le moteur a pensé de chaque
+/// tweet. Les fusionner obligerait tout client qui veut l'un à comprendre
+/// l'autre.
+fn page_scores(page: &[FeedEntry]) -> Vec<TweetScore> {
+    page.iter()
+        .map(|entry| TweetScore {
+            tweet_id: entry.id.clone(),
+            score: entry.score,
+            confidence: entry.confidence,
         })
         .collect()
 }
@@ -3218,6 +3254,17 @@ mod tests {
     // ─── Étalement par auteur ────────────────────────────────────────────────
 
     /// Construit la table `id -> tweet` attendue par `spread_by_author`.
+
+    /// Les deux tests de lien de fil ne s'intéressent qu'à l'adjacence
+    /// parent/réponse. Score et confiance n'entrent pas dans ce calcul :
+    /// ce raccourci évite de les fabriquer pour rien.
+    fn entries_for_test<'a>(
+        ids: &[String],
+        tweets: &HashMap<&'a str, &'a RawTweet>,
+    ) -> Vec<FeedEntry> {
+        as_feed_entries(ids, tweets, &HashMap::new(), &UserProfile::default())
+    }
+
     fn index<'a>(raw: &'a [RawTweet]) -> HashMap<&'a str, &'a RawTweet> {
         raw.iter().map(|t| (t.id.as_str(), t)).collect()
     }
@@ -3404,7 +3451,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
 
-        let links = thread_links(&as_feed_entries(&ids, &index(&raw)));
+        let links = thread_links(&entries_for_test(&ids, &index(&raw)));
 
         assert_eq!(links.len(), 2, "deux reponses, deux liens : {links:?}");
         assert_eq!(links[0].tweet_id, "mid");
@@ -3428,7 +3475,7 @@ mod tests {
         let raw = vec![reply("rep", "parent_hors_page"), tweet("autre")];
         let ids: Vec<String> = ["rep", "autre"].iter().map(|s| s.to_string()).collect();
 
-        let entries = as_feed_entries(&ids, &index(&raw));
+        let entries = entries_for_test(&ids, &index(&raw));
         assert_eq!(
             entries[0].parent_id, None,
             "aucun parent adjacent : {entries:?}"

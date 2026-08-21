@@ -68,6 +68,14 @@ pub enum InteractionType {
     View,
     Bookmark,
     ProfileView,
+    /// Ouverture du tweet en pleine page.
+    ///
+    /// C'est le clic le PLUS net qu'un fil produise — le lecteur quitte le
+    /// défilement pour aller lire — et il n'existait pas. L'app émettait bien
+    /// `profile_view` quand on tape l'AUTEUR, mais rien quand on tape le tweet
+    /// lui-même : le geste le plus informatif de l'écran ne remontait nulle
+    /// part.
+    Open,
     Skip,
     Report,
     Block,
@@ -93,6 +101,10 @@ impl InteractionType {
             InteractionType::Bookmark => 2.5,
             InteractionType::View => 0.2,
             InteractionType::ProfileView => 1.5,
+            // Entre la visite de profil (1,5) et le commentaire (3,5) :
+            // ouvrir demande un geste délibéré et un changement d'écran, mais
+            // ne produit rien de public.
+            InteractionType::Open => 2.0,
             InteractionType::Skip => -0.5,
             InteractionType::Report => -12.0,
             InteractionType::Block => -20.0,
@@ -147,6 +159,7 @@ impl InteractionType {
             | InteractionType::Share
             | InteractionType::Bookmark
             | InteractionType::Interested
+            | InteractionType::Open
             | InteractionType::ProfileView => Some(true),
 
             InteractionType::Skip
@@ -595,6 +608,22 @@ pub struct FeedEntry {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// Score final de classement, et confiance du moteur dans cette décision
+    /// (voir `algorithm::scoring::ranking_confidence`).
+    ///
+    /// Mis en cache avec le reste de l'entrée, pour la même raison que
+    /// `parent_id` : ce sont les seuls instants où l'on connaît encore le
+    /// tweet complet. Les recalculer à la lecture du cache exigerait de tout
+    /// recharger depuis la base à chaque page servie.
+    ///
+    /// `#[serde(default)]` : les clés déjà écrites par la version précédente
+    /// n'en portent pas et doivent rester lisibles pendant leur TTL — sans ça,
+    /// tout lecteur ayant un fil en cache le verrait recalculé intégralement
+    /// au déploiement.
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default)]
+    pub confidence: f64,
 }
 
 /// Lien de conversation exposé au client : « ce tweet répond à celui-là, et le
@@ -604,6 +633,22 @@ pub struct FeedEntry {
 /// et c'est voulu : l'ordre est une convention fragile qu'un intermédiaire peut
 /// casser sans s'en rendre compte, ce champ est une affirmation explicite. Un
 /// client qui reçoit les deux peut vérifier qu'ils concordent.
+/// Ce que le moteur a pensé d'un tweet de CETTE page.
+///
+/// Exposé parce que le client en a besoin pour décider quand DEMANDER : la
+/// question explicite (« ça t'intéresse ? ») n'a de sens que là où le moteur
+/// hésite, et jusqu'ici l'app n'avait aucun moyen de le savoir — elle
+/// retombait sur une heuristique de silence.
+#[derive(Debug, Clone, Serialize)]
+pub struct TweetScore {
+    pub tweet_id: String,
+    /// Score final de classement, dans [0,1].
+    pub score: f64,
+    /// Sur quoi cette décision s'appuie, dans [0,1]. BAS = le moteur devine.
+    /// Ce n'est pas « ce tweet est mauvais » — voir `ranking_confidence`.
+    pub confidence: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadLink {
     pub tweet_id: String,
@@ -621,6 +666,9 @@ pub struct RecommendResponse {
     /// Liens de fil entre les `tweet_ids` de CETTE page. Vide quand la page ne
     /// contient aucune réponse.
     pub threads: Vec<ThreadLink>,
+    /// Score et confiance de chaque tweet de CETTE page, dans le même ordre
+    /// que `tweet_ids`.
+    pub scores: Vec<TweetScore>,
     pub count: usize,
     pub algorithm: &'static str,
     pub algorithm_version: &'static str,

@@ -100,7 +100,10 @@ pub fn label_for(interaction: InteractionType, objective: Objective) -> Option<b
         // contre-exemple le plus utile : vu, apprécié, PAS relayé.
         Objective::Amplify => match interaction {
             I::Retweet | I::Share | I::Bookmark | I::Comment => Some(true),
-            I::Like
+            // Ouvrir, c'est consommer — pas relayer. Comme le like, c'est un
+            // contre-exemple utile : engagement avéré SANS amplification.
+            I::Open
+            | I::Like
             | I::Interested
             | I::ProfileView
             | I::Skip
@@ -120,7 +123,8 @@ pub fn label_for(interaction: InteractionType, objective: Objective) -> Option<b
         // qu'on cherche à remplacer.
         Objective::Reject => match interaction {
             I::Report | I::Block | I::NotInterested => Some(true),
-            I::Like
+            I::Open
+            | I::Like
             | I::Comment
             | I::Retweet
             | I::Share

@@ -57,6 +57,12 @@ impl CacheManager {
                 .map(|id| FeedEntry {
                     id,
                     parent_id: None,
+                    // Format d'avant : ni lien de fil ni score. Zéro est la
+                    // valeur honnête — « on ne sait pas » — et le client la
+                    // lit comme une confiance nulle, donc ne s'appuie pas
+                    // dessus. Ces clés disparaissent en une durée de TTL.
+                    score: 0.0,
+                    confidence: 0.0,
                 })
                 .collect()
         })

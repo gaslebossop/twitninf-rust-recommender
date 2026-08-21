@@ -1145,6 +1145,64 @@ pub fn subscription_boost(tier: AuthorTier) -> f64 {
     }
 }
 
+
+/// Confiance du moteur dans le classement de CE tweet pour CE lecteur.
+///
+/// ── Ce que ce nombre dit, et ce qu'il ne dit pas ────────────────────────────
+/// Ce n'est PAS « ce tweet est bon » — c'est le score qui répond à ça. C'est
+/// « sur quoi le moteur s'est-il appuyé pour le classer ». Une confiance basse
+/// veut dire que la décision repose sur peu de choses : un lecteur dont on ne
+/// sait presque rien, un tweet que personne n'a encore lu, un auteur inconnu,
+/// un texte pas encore annoté. Le score peut être élevé quand même — il est
+/// simplement moins fondé.
+///
+/// C'est exactement la question que l'app pose quand elle demande au lecteur
+/// « ça t'intéresse ? » : la peine ne vaut d'être prise que là où le moteur ne
+/// sait pas trancher tout seul.
+///
+/// ── Pourquoi un produit et pas une moyenne ─────────────────────────────────
+/// Les deux facteurs ne se compensent pas. Tout savoir d'un tweet ne sert à
+/// rien si on ne sait rien du lecteur, et l'inverse est tout aussi vrai : une
+/// moyenne laisserait un compte tout neuf afficher une confiance moyenne sur
+/// un tweet très observé, alors qu'on n'a aucune idée de ce qu'IL en pensera.
+pub fn ranking_confidence(tweet: &RawTweet, profile: &UserProfile) -> f64 {
+    // Ce qu'on sait du LECTEUR — déjà calculé au montage du profil : part de
+    // 0,3 pour un compte neuf et monte vers 1,0 avec l'historique.
+    let reader = profile.profile_confidence.clamp(0.0, 1.0);
+
+    // Ce qu'on sait de ce TWEET, en trois preuves indépendantes.
+    //
+    // Engagement observé : dix réactions suffisent à dire quelque chose, et
+    // au-delà l'information supplémentaire est marginale.
+    let observed = tweet.like_count + tweet.comment_count + tweet.retweet_count;
+    let engagement_evidence = (observed as f64 / 10.0).clamp(0.0, 1.0);
+
+    // Annotation du contenu : la seule preuve qui n'a besoin d'aucun
+    // engagement préalable, donc la seule disponible sur un tweet qui vient
+    // d'être publié. Pondérée par la confiance de l'annotateur lui-même.
+    let annotation_evidence = tweet
+        .llm
+        .as_ref()
+        .map(|l| l.confidence.clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+
+    // Auteur connu de ce lecteur : suivi, ou déjà engagé par le passé.
+    let author_evidence = if profile.follows(&tweet.user_id)
+        || profile
+            .top_authors
+            .iter()
+            .any(|(id, affinity)| id == &tweet.user_id && *affinity > 0.0)
+    {
+        1.0
+    } else {
+        0.0
+    };
+
+    let item = engagement_evidence * 0.45 + annotation_evidence * 0.30 + author_evidence * 0.25;
+
+    (reader * item).clamp(0.0, 1.0)
+}
+
 /// Anti-bulle de filtre : pénalise progressivement les auteurs sur-représentés.
 pub fn diversity_multiplier(author_count_in_feed: u32) -> f64 {
     // Décroissance rendue plus franche : au-delà de trois tweets, un auteur ne
@@ -1315,6 +1373,86 @@ fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
 mod tests {
     use super::*;
 
+
+
+    // ─── Confiance de classement ─────────────────────────────────────────────
+
+    fn lecteur(confiance: f64) -> UserProfile {
+        UserProfile {
+            profile_confidence: confiance,
+            ..Default::default()
+        }
+    }
+
+    fn tweet_observe() -> RawTweet {
+        RawTweet {
+            user_id: "auteur".into(),
+            like_count: 20,
+            comment_count: 5,
+            retweet_count: 3,
+            llm: Some(crate::models::LlmLabels {
+                theme: "actualite".into(),
+                toxicity_score: 0.0,
+                toxicity_category: "aucune".into(),
+                quality_score: 0.7,
+                tone: "neutre".into(),
+                confidence: 0.9,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Le cas qui compte : un tweet tout neuf, d'un auteur inconnu, montre a un
+    /// compte tout neuf. Le moteur devine — et doit le dire.
+    #[test]
+    fn tout_neuf_des_deux_cotes_donne_une_confiance_tres_basse() {
+        let c = ranking_confidence(&RawTweet::default(), &lecteur(0.3));
+        assert!(c < 0.05, "confiance={c}");
+    }
+
+    #[test]
+    fn tout_connu_des_deux_cotes_donne_une_confiance_haute() {
+        let mut p = lecteur(1.0);
+        p.following_ids = vec!["auteur".into()];
+        p.rebuild_indexes();
+        let c = ranking_confidence(&tweet_observe(), &p);
+        assert!(c > 0.8, "confiance={c}");
+    }
+
+    /// Le point de la MULTIPLICATION plutot que d'une moyenne : tout savoir du
+    /// tweet ne sert a rien si on ne sait rien du lecteur. Une moyenne
+    /// laisserait un compte neuf afficher une confiance moyenne sur un tweet
+    /// tres observe, alors qu'on n'a aucune idee de ce qu'IL en pensera.
+    #[test]
+    fn ne_rien_savoir_du_lecteur_ecrase_tout_ce_qu_on_sait_du_tweet() {
+        let tweet = tweet_observe();
+        let inconnu = ranking_confidence(&tweet, &lecteur(0.0));
+        let connu = ranking_confidence(&tweet, &lecteur(1.0));
+        assert_eq!(inconnu, 0.0, "aucune connaissance du lecteur = aucune confiance");
+        assert!(connu > 0.5);
+    }
+
+    /// L'annotation est la seule preuve disponible sur un tweet qui vient
+    /// d'etre publie : elle doit suffire a sortir de la confiance nulle, meme
+    /// sans le moindre engagement.
+    #[test]
+    fn un_tweet_annote_sans_engagement_n_est_pas_a_confiance_nulle() {
+        let mut tweet = RawTweet::default();
+        tweet.llm = tweet_observe().llm;
+        let c = ranking_confidence(&tweet, &lecteur(1.0));
+        assert!(c > 0.0 && c < 0.5, "confiance={c}");
+    }
+
+    #[test]
+    fn la_confiance_reste_bornee() {
+        let mut p = lecteur(5.0); // valeur aberrante volontaire
+        p.following_ids = vec!["auteur".into()];
+        p.rebuild_indexes();
+        let mut tweet = tweet_observe();
+        tweet.like_count = 1_000_000;
+        let c = ranking_confidence(&tweet, &p);
+        assert!((0.0..=1.0).contains(&c), "confiance={c}");
+    }
 
     // ─── Mélange multi-objectifs ─────────────────────────────────────────────
 
