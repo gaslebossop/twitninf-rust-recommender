@@ -11,7 +11,6 @@ use crate::algorithm::scoring::{
     compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights,
     theme_diversity_multiplier,
 };
-use crate::algorithm::trending::trending_score;
 use crate::bandit::bandit_select;
 use crate::constants::{
     COLD_START_FOLLOW_BOOST_MAX, COLD_START_INTERACTION_FLOOR, EXCLUDE_SEEN_MIN_REMAINING,
@@ -22,6 +21,7 @@ use crate::constants::{
 use crate::experiments;
 use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
+use crate::ml::dwell_predictor::DwellPredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
 use crate::shadowban::{
@@ -45,6 +45,7 @@ pub struct RecommenderService {
     pg: PgPool,
     cache: CacheManager,
     ctr_predictor: CtrPredictor,
+    dwell_predictor: DwellPredictor,
     auto_tuner: std::sync::Arc<AutoTuner>,
 }
 
@@ -54,6 +55,7 @@ impl RecommenderService {
             pg,
             cache,
             ctr_predictor: CtrPredictor::new(),
+            dwell_predictor: DwellPredictor::new(),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -67,11 +69,12 @@ impl RecommenderService {
             pg,
             cache,
             ctr_predictor: CtrPredictor::new(),
+            dwell_predictor: DwellPredictor::new(),
             auto_tuner,
         }
     }
 
-    /// Variante de production : recharge le modèle CTR persisté au lieu de
+    /// Variante de production : recharge les modèles persistés au lieu de
     /// repartir des poids par défaut. Sans ça, chaque redémarrage jetait
     /// l'intégralité de l'apprentissage accumulé.
     pub async fn new_with_tuner_and_ml(
@@ -80,20 +83,24 @@ impl RecommenderService {
         auto_tuner: std::sync::Arc<AutoTuner>,
     ) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
+        let dwell_predictor = DwellPredictor::load_or_default().await;
         Self {
             pg,
             cache,
             ctr_predictor,
+            dwell_predictor,
             auto_tuner,
         }
     }
 
     pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
+        let dwell_predictor = DwellPredictor::load_or_default().await;
         Self {
             pg,
             cache,
             ctr_predictor,
+            dwell_predictor,
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -130,6 +137,69 @@ impl RecommenderService {
 
     pub fn ctr_predictor(&self) -> &CtrPredictor {
         &self.ctr_predictor
+    }
+
+    /// Enregistre un poids de dwell RÉELLEMENT observé (`algorithm::dwell::dwell_weight`,
+    /// jamais la durée brute). `features` provient de la même impression mémorisée
+    /// que le CTR, lue sans la consommer — voir `CacheManager::peek_impression`.
+    pub fn record_dwell_event(&self, features: &[f64], observed_weight: f64) {
+        let Some(vec) = to_feature_array(features) else {
+            warn!(
+                len = features.len(),
+                "Dwell: vecteur de features de taille invalide, ignoré"
+            );
+            return;
+        };
+        self.dwell_predictor.record_interaction(vec, observed_weight);
+        let (samples, mean_weight) = self.dwell_predictor.stats();
+        if samples % 100 == 0 {
+            info!(samples, mean_weight, "Dwell model checkpoint — 100 new samples");
+        }
+    }
+
+    pub fn dwell_stats(&self) -> (u64, f64) {
+        self.dwell_predictor.stats()
+    }
+
+    /// Persiste le modèle de dwell sur disque.
+    pub async fn persist_dwell_model(&self) {
+        self.dwell_predictor.save().await;
+    }
+
+    pub fn dwell_predictor(&self) -> &DwellPredictor {
+        &self.dwell_predictor
+    }
+
+    /// Accès direct au pool — réservé au rattrapage hors-ligne
+    /// (`services::ctr_backfill`), qui interroge `tweet_likes`/`tweet_retweets`
+    /// pour lister les interactions passées avant de les reconstruire en
+    /// features via `hydrate_tweets_for_user` ci-dessous.
+    pub(crate) fn pg(&self) -> &PgPool {
+        &self.pg
+    }
+
+    /// Hydrate un lot de tweets PRÉCIS (pas une sélection de candidats) pour
+    /// UN lecteur donné — voir `BY_IDS_SQL`. Les doublons de `tweet_ids` ne
+    /// posent pas de problème : `WHERE id = ANY($2)` les déduplique de fait.
+    pub(crate) async fn hydrate_tweets_for_user(
+        &self,
+        user_id: &str,
+        tweet_ids: &[String],
+    ) -> Result<Vec<RawTweet>> {
+        if tweet_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uid = uuid::Uuid::parse_str(user_id)?;
+        let ids: Vec<uuid::Uuid> = tweet_ids
+            .iter()
+            .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pg.get().await?;
+        let rows = client.query(BY_IDS_SQL.as_str(), &[&uid, &ids]).await?;
+        Ok(map_rows(rows))
     }
 
     /// Mémorise le vecteur de features de chaque tweet servi, pour pouvoir
@@ -631,10 +701,14 @@ impl RecommenderService {
         let (ctr_samples, _) = self.ctr_predictor.stats();
         // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
         let use_ml = ctr_samples >= 200;
+        let (dwell_samples, _) = self.dwell_predictor.stats();
+        // Même garde-fou que le CTR, seuil identique : les deux modèles partagent
+        // le même vecteur de features et démarrent d'un prior tout aussi vide.
+        let use_dwell = dwell_samples >= 200;
         let detector = GarbageContentDetector::new();
         let enforcer = ShadowbanEnforcer::new();
         let mut dropped_garbage = 0usize;
-        trace!(mode = ?mode, use_ml, ctr_samples, "Scoring all tweets with mode adjustments");
+        trace!(mode = ?mode, use_ml, ctr_samples, use_dwell, dwell_samples, "Scoring all tweets with mode adjustments");
 
         for (idx, tweet) in tweets.iter().enumerate() {
             // ── Admission par surface ────────────────────────────────────────────
@@ -692,7 +766,15 @@ impl RecommenderService {
                 continue;
             }
 
-            let ac = *author_count.get(&tweet.user_id).unwrap_or(&0);
+            // Explorer (Trending) n'applique jamais la pénalité de répétition
+            // d'auteur : demande explicite du 2026-08-21, « aucune pénalité
+            // dans explore » — voir le bloc `RecommendMode::Trending`
+            // ci-dessous pour le reste du traitement dédié à ce mode.
+            let ac = if *mode == RecommendMode::Trending {
+                0
+            } else {
+                *author_count.get(&tweet.user_id).unwrap_or(&0)
+            };
             // Boost temps réel (30 min, voir `services::feedback_loop`) : réagit
             // à un like/skip de CETTE session, pas seulement au profil rechargé
             // toutes les 300s ou au prochain TTL de cache de feed.
@@ -711,6 +793,11 @@ impl RecommenderService {
                 } else {
                     None
                 },
+                if use_dwell {
+                    Some(&self.dwell_predictor)
+                } else {
+                    None
+                },
                 realtime_boost,
                 weights,
             );
@@ -718,30 +805,33 @@ impl RecommenderService {
 
             match mode {
                 RecommendMode::Trending => {
-                    let ts = trending_score(tweet);
-                    let mut blended = s.score * 0.40 + ts * 0.60;
+                    // Explorer, 100% personnalisé : demande explicite du
+                    // 2026-08-21 (« aucune pénalité dans explore »). Fini le
+                    // mélange 40% base / 60% vélocité impersonnelle — le score
+                    // de base (déjà calculé plus haut avec `ac` forcé à 0, donc
+                    // sans pénalité de répétition d'auteur) porte seul le
+                    // classement. La pénalité anti-répétition thématique,
+                    // appliquée plus bas pour les autres modes, est également
+                    // sautée pour Trending — voir le test sur `*mode` à cet
+                    // endroit.
+                    //
+                    // Fatigue d'exposition et bonus média restent : ce ne sont
+                    // pas des mécanismes anti-bulle, juste du confort de
+                    // grille (ne pas rabâcher le même tweet, mettre en valeur
+                    // les médias qu'une grille sait le mieux montrer).
+                    let mut score = s.score;
 
-                    // ── Fatigue d'exposition, appliquée APRÈS le mélange ──────
-                    // `impression_fatigue` est déjà comptée dans le score de
-                    // base, mais elle ne pesait donc que sur ses 40 % : les
-                    // 60 % de vélocité ignoraient totalement le fait que CE
-                    // lecteur a déjà vu ce tweet passer. Un tweet très partagé
-                    // restait donc en tête de la grille visite après visite,
-                    // alors que le premier rôle d'une page de découverte est de
-                    // montrer autre chose que la dernière fois.
                     let fatigue = impression_fatigue(tweet.viewer_impressions);
-                    blended *= fatigue;
+                    score *= fatigue;
 
-                    // Un tweet illustré est ce qu'une grille sait le mieux
-                    // montrer — voir `TRENDING_MEDIA_BOOST`.
                     if tweet.has_media {
-                        blended *= TRENDING_MEDIA_BOOST;
+                        score *= TRENDING_MEDIA_BOOST;
                     }
 
-                    s.score = blended.clamp(0.0, 1.0);
-                    trace!(tweet_id = %tweet.id, base_score, trending_score = ts, fatigue,
+                    s.score = score.clamp(0.0, 1.0);
+                    trace!(tweet_id = %tweet.id, base_score, fatigue,
                            has_media = tweet.has_media, final_score = s.score,
-                           "Trending mode: 40% base + 60% trending, fatigue et média appliqués");
+                           "Trending/Explorer: 100% personnalisé, aucune pénalité anti-bulle");
                 }
                 RecommendMode::Discover => {
                     let mut multiplier = 1.0;
@@ -799,22 +889,28 @@ impl RecommenderService {
             }
 
             // ── Anti-répétition thématique ───────────────────────────────────
+            // Sautée pour Trending/Explorer (« aucune pénalité dans explore »,
+            // 2026-08-21) : ce mode ne doit plus jamais être freiné par un
+            // thème trop présent dans le fil.
+            //
             // Uniquement sur un tweet ANNOTÉ : un thème vide/inconnu partagé
             // par tout le non-annoté formerait un faux « sujet » géant et
             // pénaliserait des tweets qui n'ont rien en commun.
-            if let Some(theme) = tweet
-                .llm
-                .as_ref()
-                .map(|l| l.theme.as_str())
-                .filter(|t| !t.is_empty())
-            {
-                let tc = *theme_count.get(theme).unwrap_or(&0);
-                if tc > 0 {
-                    let theme_mult = theme_diversity_multiplier(tc);
-                    s.score *= theme_mult;
-                    trace!(tweet_id = %tweet.id, theme, tc, theme_mult, "Theme diversity applied");
+            if *mode != RecommendMode::Trending {
+                if let Some(theme) = tweet
+                    .llm
+                    .as_ref()
+                    .map(|l| l.theme.as_str())
+                    .filter(|t| !t.is_empty())
+                {
+                    let tc = *theme_count.get(theme).unwrap_or(&0);
+                    if tc > 0 {
+                        let theme_mult = theme_diversity_multiplier(tc);
+                        s.score *= theme_mult;
+                        trace!(tweet_id = %tweet.id, theme, tc, theme_mult, "Theme diversity applied");
+                    }
+                    *theme_count.entry(theme.to_string()).or_insert(0) += 1;
                 }
-                *theme_count.entry(theme.to_string()).or_insert(0) += 1;
             }
 
             if idx < 3 {
@@ -896,7 +992,10 @@ impl RecommenderService {
         scored_feed
     }
 
-    async fn build_user_profile(&self, user_id: &str) -> Result<UserProfile> {
+    // `pub(crate)` : le rattrapage hors-ligne du CTR (`services::ctr_backfill`)
+    // reconstruit un profil pour chaque lecteur historique avec cette même
+    // méthode — celle qui alimente déjà chaque recommandation servie.
+    pub(crate) async fn build_user_profile(&self, user_id: &str) -> Result<UserProfile> {
         let cache_key = format!("twitninf:profile:{}", user_id);
         if let Some(cached) = self.cache.get_profile(&cache_key).await {
             debug!(user_id, "Profile loaded from cache");
@@ -2033,6 +2132,24 @@ static SEMANTIC_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{SEMANTIC_CTE}{PROJECTION_SQL}"));
 static COOCCUR_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{COOCCUR_CTE}{PROJECTION_SQL}"));
+
+/// Hydratation par identifiants explicites — pour le rattrapage hors-ligne du
+/// CTR (`services::ctr_backfill`), qui a besoin de tweets PRÉCIS (ceux d'une
+/// interaction passée), pas d'une sélection de candidats.
+///
+/// `$1` reste le lecteur (lu par la jointure `impressions` de `PROJECTION_SQL`),
+/// `$2` la liste d'identifiants. `src = 4` : valeur qui retombe sur
+/// `TweetSource::Discovery` dans `map_rows` — neutre, aucune des huit sources
+/// n'a de sens pour un tweet reconstruit après coup.
+const BY_IDS_CTE: &str = r#"
+WITH picked AS (
+    SELECT id, 4 AS src, 0.05::float8 AS w
+    FROM tweets
+    WHERE id = ANY($2)
+)
+"#;
+static BY_IDS_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{BY_IDS_CTE}{PROJECTION_SQL}"));
 
 // ─── Mapping rows → RawTweet ──────────────────────────────────────────────────
 
