@@ -221,6 +221,59 @@ pub fn average_vectors(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
     Some(sum)
 }
 
+/// Similarité au goût du lecteur, pour un ensemble de tweets DÉJÀ retenus.
+///
+/// À ne pas confondre avec `nearest_tweets`, qui SÉLECTIONNE des candidats :
+/// ici les candidats sont connus, on ne fait que les mesurer. C'est ce qui
+/// permet de noter tout le vivier, et pas seulement les quarante plus proches.
+///
+/// `1 - (embedding <=> $1)` : `<=>` est la DISTANCE cosinus de pgvector (0 =
+/// identique), donc son complément est la similarité (1 = identique). Les
+/// tweets sans embedding sont simplement absents du résultat — ils ne
+/// recevront aucun renfort, ce qui est le comportement voulu : on ne pénalise
+/// rien, on ne renforce que ce qu'on sait mesurer.
+///
+/// Une seule requête, sur clé primaire. Erreur → map vide : le renfort est un
+/// complément, jamais un prérequis.
+pub async fn taste_similarities(
+    pg: &PgPool,
+    taste: &[f32],
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, f64>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let uuids: Vec<uuid::Uuid> = ids
+        .iter()
+        .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+        .collect();
+    if uuids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let client = pg.get().await?;
+    let vector = Vector::from(taste.to_vec());
+    let rows = client
+        .query(
+            r#"
+            SELECT id::text, 1 - (embedding <=> $1) AS similarity
+            FROM tweets
+            WHERE id = ANY($2) AND embedding IS NOT NULL
+            "#,
+            &[&vector, &uuids],
+        )
+        .await?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.try_get::<_, String>(0).ok()?;
+            let sim = r.try_get::<_, f64>(1).ok()?;
+            Some((id, sim))
+        })
+        .collect())
+}
+
 /// Plus proches voisins sémantiques d'un vecteur de goût — nouvelle source de
 /// candidats, complémentaire aux 8 sources SQL existantes (aucune ne compare
 /// du contenu, seulement récence/popularité/follow).
