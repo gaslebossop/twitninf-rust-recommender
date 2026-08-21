@@ -81,20 +81,18 @@ CTR, dwell ferme, co-occurrence passent par `author_id_for_account = None`).
 
 ## 6. Ce qui reste à faire — par impact décroissant
 
-### 🔴 Bloquant : l'API Node ne relaie pas `scores`
-`de1f0ac` expose `scores` sur `/recommendations`, et l'app sait déjà le consommer
-(`withRecommendationScores`, commit app `f93c648`). **Le maillon du milieu manque.**
+### ✅ ~~Bloquant : l'API Node ne relaie pas `scores`~~ — **posé le 2026-08-21**
+Le maillon manquait dans le dépôt `api`, hors du périmètre des deux agents. Il est écrit sur
+`api` branche **`feat/relais-scores-reco`**, commit `26b4ae7` (non poussé, non déployé).
 
-- `api/src/services/rustRecommenderClient.js` → `getRecommendations()` (~l. 219) construit son objet
-  de retour **sans** `result.scores`.
-- `api/src/routes/neuralRankRoutes.js` → le `producer` (~l. 552‑600) hydrate les tweets puis
-  renvoie `data: { recommendations, count, ... }` **sans** `scores`.
+Les scores y sont restreints aux tweets **réellement servis** (l'hydratation en perd, l'injection
+publicitaire en ajoute qui n'en ont pas) et attachés **dans le `producer`, donc avant
+`withFeedCache`** — sinon une charge cachée sortirait sans eux et la question resterait muette pour
+tout lecteur tombant sur un cache chaud.
 
-Tant que ce relais n'existe pas, `_recommendation_confidence` vaut 0 côté app, et le déclencheur de
-la question explicite (`HESITATION_CEILING = 0.45`) **ne peut jamais s'armer** — l'écran retombe sur
-son heuristique de silence. Deux fonctionnalités livrées des deux côtés pour rien.
-
-⚠️ Attacher les scores **avant** `withFeedCache`, sinon une charge cachée sortira sans eux.
+⚠️ **Vérifié statiquement seulement** : syntaxe, lint, et la correspondance des trois contrats
+(Rust → API → app) par relecture. Le chemin n'a **jamais été exécuté** — il demande Postgres, Redis
+et le moteur Rust vivants. À confirmer sur un environnement réel avant de conclure quoi que ce soit.
 
 ### 🟠 Décider du sort de `src/algorithm/dimensions/`
 `d1_*`..`d8_*` — **toujours du code mort, jamais compilé** : `src/algorithm/mod.rs` n'expose que
