@@ -72,6 +72,11 @@ impl Default for DwellModel {
                 0.0,  // is_recent
                 0.02, // engagement_acceleration
                 0.03, // activité du LECTEUR
+                0.0, // escompte de position — voir `ctr_predictor::POSITION_FEATURE`.
+                     // Prior NUL ici, contrairement au CTR : rien ne dit qu'on
+                     // lit plus longuement en haut de page qu'en bas, alors
+                     // qu'on y clique certainement plus. Le modèle
+                     // l'apprendra s'il y a quelque chose à apprendre.
             ],
             bias: logit(NEUTRAL01),
             learning_rate: 0.01,
@@ -122,11 +127,30 @@ impl DwellModel {
 }
 
 #[derive(Clone)]
-pub struct DwellPredictor(Arc<RwLock<DwellModel>>);
+pub struct DwellPredictor(Arc<RwLock<DwellModel>>, crate::eval::OnlineEval);
 
 impl DwellPredictor {
     pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(DwellModel::default())))
+        Self(
+            Arc::new(RwLock::new(DwellModel::default())),
+            crate::eval::OnlineEval::new(),
+        )
+    }
+
+    /// Qualité mesurée sur la fenêtre glissante récente — voir `crate::eval`.
+    ///
+    /// La cible est CONTINUE ici : le rapport porte une RMSE, pas une AUC.
+    /// Sortir une AUC d'un temps de lecture reviendrait à inventer un seuil, et
+    /// le seuil choisi déciderait du résultat.
+    pub fn eval_report(&self) -> crate::eval::EvalReport {
+        self.1.report()
+    }
+
+    /// Ce qu'une recalibration rattraperait. `None` ici dans le cas courant :
+    /// la cible est le temps de lecture, une valeur continue, et recalibrer une
+    /// probabilite suppose qu'il y en ait une.
+    pub fn calibration_gain(&self) -> Option<crate::ml::CalibrationGain> {
+        self.1.calibration_gain()
     }
 
     pub async fn load_or_default() -> Self {
@@ -139,9 +163,31 @@ impl DwellPredictor {
                             mean_weight = model.running_mean_weight,
                             "Dwell model loaded from disk"
                         );
-                        return Self(Arc::new(RwLock::new(model)));
+                        return Self(
+                            Arc::new(RwLock::new(model)),
+                            crate::eval::OnlineEval::new(),
+                        );
                     }
-                    Err(e) => warn!("Failed to parse dwell model: {e}, using default"),
+                    // Même migration que le modèle CTR : un vecteur de poids
+                    // plus COURT que `N_FEATURES` vient d'un schéma enrichi
+                    // depuis la sauvegarde, pas d'un fichier corrompu. Sans
+                    // ça, chaque ajout de feature remettait l'apprentissage du
+                    // dwell à zéro en silence — le CTR avait déjà sa migration,
+                    // celui-ci ne l'avait jamais eue.
+                    Err(e) => match migrate_legacy_dwell(&json) {
+                        Some(model) => {
+                            info!(
+                                samples = model.samples_seen,
+                                "Modèle de dwell migré depuis un vecteur plus court — \
+                                 poids appris conservés, nouvelles features au défaut"
+                            );
+                            return Self(
+                                Arc::new(RwLock::new(model)),
+                                crate::eval::OnlineEval::new(),
+                            );
+                        }
+                        None => warn!("Failed to parse dwell model: {e}, using default"),
+                    },
                 },
                 Err(e) => warn!("Failed to read dwell model: {e}, using default"),
             }
@@ -156,10 +202,17 @@ impl DwellPredictor {
 
     pub fn record_interaction(&self, features: [f64; N_FEATURES], observed_weight: f64) {
         let mut model = self.0.write().unwrap();
+        // Validation progressive — voir `crate::eval`. Les deux valeurs sont
+        // enregistrées sur l'échelle [0,1] interne au modèle, pas sur celle du
+        // poids de dwell : une RMSE n'a de sens que si prédiction et vérité
+        // vivent sur la même échelle.
+        let prior_prediction01 = model.predict01(&features);
+        let truth01 = ((observed_weight.clamp(SKIP_PENALTY, MAX_BONUS)) - SKIP_PENALTY) / RANGE;
         model.update(&features, observed_weight);
         let samples = model.samples_seen;
         let mean_weight = model.running_mean_weight;
         drop(model);
+        self.1.record(prior_prediction01, truth01);
         debug!(samples, mean_weight, observed_weight, "Dwell model updated");
     }
 
@@ -197,6 +250,26 @@ fn sigmoid(x: f64) -> f64 {
 #[inline]
 fn logit(p: f64) -> f64 {
     (p / (1.0 - p)).ln()
+}
+
+/// Complète un modèle persisté dont le vecteur `weights` est plus court que
+/// `N_FEATURES`. Voir `ctr_predictor::migrate_legacy_weights` — même besoin,
+/// même règle : un tableau plus LONG reste un modèle neuf, il n'y a pas de
+/// façon honnête de deviner quelle feature a disparu.
+fn migrate_legacy_dwell(json: &str) -> Option<DwellModel> {
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let obj = value.as_object_mut()?;
+    let old = obj.get("weights")?.as_array()?.clone();
+    if old.is_empty() || old.len() >= N_FEATURES {
+        return None;
+    }
+    let defaults = DwellModel::default().weights;
+    let mut padded = old;
+    for w in defaults.iter().skip(padded.len()) {
+        padded.push(serde_json::json!(w));
+    }
+    obj.insert("weights".to_string(), serde_json::Value::Array(padded));
+    serde_json::from_value(value).ok()
 }
 
 #[cfg(test)]

@@ -42,6 +42,7 @@ pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
 
         let mut last_saved_at = recommender.ctr_stats().0;
         let mut last_dwell_saved_at = recommender.dwell_stats().0;
+        let mut last_objectives_saved_at = recommender.objective_samples();
 
         loop {
             ticker.tick().await;
@@ -50,6 +51,11 @@ pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
             let n = expired.len();
             for (_user_id, _tweet_id, features) in expired {
                 recommender.record_ctr_event(&features, false);
+                // Un tweet montré que personne n'a relayé n'a pas été relayé,
+                // et qu'aucun lecteur n'a signalé n'a pas été signalé : le
+                // balayage est la source principale de négatifs des DEUX
+                // têtes multi-objectifs, exactement comme pour le CTR.
+                recommender.record_objective_ignored(&features);
             }
 
             let (samples, global_ctr) = recommender.ctr_stats();
@@ -65,6 +71,18 @@ pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
                 recommender.persist_ctr_model().await;
                 last_saved_at = samples;
                 info!(samples, global_ctr, "Modèle CTR persisté");
+            }
+
+            let objective_samples = recommender.objective_samples();
+            if objective_samples >= last_objectives_saved_at + SAVE_EVERY_SAMPLES {
+                recommender.persist_objective_models().await;
+                last_objectives_saved_at = objective_samples;
+                let ((amplify_n, amplify_rate), (reject_n, reject_rate)) =
+                    recommender.objective_stats();
+                info!(
+                    amplify_n,
+                    amplify_rate, reject_n, reject_rate, "Têtes multi-objectifs persistées"
+                );
             }
 
             let (dwell_samples, mean_weight) = recommender.dwell_stats();

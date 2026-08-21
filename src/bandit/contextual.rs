@@ -24,7 +24,7 @@
 ///
 /// Gain CTR attendu : +1-1.5% (nouvelles découvertes → engagement futur)
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace};
 
 use crate::models::{RawTweet, ScoredTweet, TweetSource, UserProfile};
@@ -155,62 +155,76 @@ pub fn select(
         };
     }
 
+    // Index tweet_id -> tweet brut, construit UNE fois.
+    //
+    // Les trois passes ci-dessous (candidature a l'exploration, total
+    // d'impressions, score UCB1) faisaient chacune un `raw_tweets.iter().find()`
+    // par candidat : trois balayages lineaires imbriques dans une boucle sur les
+    // candidats, donc trois fois O(n2) en comparaisons de chaines. Sur un vivier
+    // de 1700 tweets ca represente plusieurs millions de comparaisons, pour une
+    // correspondance qui tient dans une table de hachage.
+    let by_id: HashMap<&str, &RawTweet> = raw_tweets.iter().map(|t| (t.id.as_str(), t)).collect();
+
     let n_explore = (limit as f64 * EPSILON).round() as usize;
     let n_exploit = limit.saturating_sub(n_explore);
 
-    // Pool exploit : top tweets par score (déjà triés)
-    let exploit_pool: Vec<&ScoredTweet> = scored
-        .iter()
-        .filter(|s| s.score >= MIN_EXPLOIT_SCORE)
-        .take(n_exploit * 3) // oversample pour pouvoir filtrer
-        .collect();
-
-    // Pool explore : tweets diversifiés (sources inattendues, auteurs nouveaux)
-    let explore_pool: Vec<&ScoredTweet> = scored
-        .iter()
-        .filter(|s| is_exploration_candidate(s, raw_tweets, profile))
-        .collect();
-
-    let mut result: Vec<String> = Vec::with_capacity(limit);
-    let mut exploit_count = 0;
-    let mut explore_count = 0;
+    // -- Deux listes separees, et pas une seule --------------------------------
+    //
+    // L'entrelacement final suppose que le resultat est exactement
+    // [exploit..., explore...] et retrouve la frontiere par un `take(n_exploit)`.
+    // Or le remplissage de secours (quand il manque des candidats
+    // d'exploration) poussait ses tweets APRES le bloc explore, tout en
+    // incrementant `exploit_count` : la frontiere calculee tombait alors au
+    // milieu du bloc explore, et l'entrelacement traitait des tweets
+    // d'exploitation comme de l'exploration et reciproquement. L'ordre du fil
+    // s'en trouvait brouille sans que rien ne le signale. Deux listes
+    // distinctes rendent la frontiere impossible a perdre.
+    let mut exploit: Vec<String> = Vec::with_capacity(n_exploit + 1);
+    let mut explore: Vec<String> = Vec::with_capacity(n_explore + 1);
+    let mut taken: HashSet<&str> = HashSet::with_capacity(limit);
     let mut rng = rand::thread_rng();
 
-    // 1. Remplir exploit : prendre les meilleurs scores
-    for s in exploit_pool.iter().take(n_exploit) {
-        result.push(s.tweet_id.clone());
-        exploit_count += 1;
+    // 1. Exploitation : les meilleurs scores au-dessus du plancher de qualite.
+    for s in scored
+        .iter()
+        .filter(|s| s.score >= MIN_EXPLOIT_SCORE)
+        .take(n_exploit)
+    {
+        exploit.push(s.tweet_id.clone());
+        taken.insert(s.tweet_id.as_str());
         trace!(tweet_id = %s.tweet_id, score = s.score, "Bandit: EXPLOIT");
     }
 
-    // 2. Remplir explore : classé par UCB1 sur le taux de clic par auteur —
-    // plus un tirage uniforme, voir le commentaire de tête de fichier.
-    let mut explore_candidates: Vec<_> = explore_pool
+    // 2. Exploration : classee par UCB1 sur le taux de clic par auteur -- plus
+    // un tirage uniforme, voir le commentaire de tete de fichier.
+    let explore_pool: Vec<&ScoredTweet> = scored
         .iter()
-        .filter(|s| !result.contains(&s.tweet_id))
+        .filter(|s| !taken.contains(s.tweet_id.as_str()))
+        .filter(|s| {
+            by_id
+                .get(s.tweet_id.as_str())
+                .is_some_and(|raw| is_exploration_candidate(s, raw, profile))
+        })
         .collect();
 
-    let total_impressions: u64 = explore_candidates
+    let total_impressions: u64 = explore_pool
         .iter()
-        .filter_map(|s| raw_tweets.iter().find(|t| t.id == s.tweet_id))
+        .filter_map(|s| by_id.get(s.tweet_id.as_str()))
         .filter_map(|t| arm_stats.get(&t.user_id).map(|(_, imp)| *imp as u64))
         .sum();
 
-    // Score précalculé UNE fois par candidat (index dans `explore_candidates`,
-    // pas la référence elle-même — plus simple que de manier des piles de
-    // références imbriquées). Un comparateur qui tirerait un nombre aléatoire
-    // différent à chaque appel ne serait pas un ordre valide, `sort_by`
-    // suppose une fonction stable ; le bruit départage donc les ex-æquo AVANT
-    // le tri (tous les auteurs jamais explorés partagent exactement le même
-    // score UCB1), il ne redevient jamais un tirage purement aléatoire — le
-    // score UCB1 reste dominant, le bruit ne fait que casser les égalités.
-    let mut order: Vec<(usize, f64)> = explore_candidates
+    // Score precalcule UNE fois par candidat. Un comparateur qui tirerait un
+    // nombre aleatoire different a chaque appel ne serait pas un ordre valide,
+    // `sort_by` suppose une fonction stable ; le bruit departage donc les
+    // ex-aequo AVANT le tri (tous les auteurs jamais explores partagent
+    // exactement le meme score UCB1), il ne redevient jamais un tirage
+    // purement aleatoire -- le score UCB1 reste dominant.
+    let mut order: Vec<(usize, f64)> = explore_pool
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let ucb = raw_tweets
-                .iter()
-                .find(|t| t.id == s.tweet_id)
+            let ucb = by_id
+                .get(s.tweet_id.as_str())
                 .map(|raw| {
                     let (mean, imp) = arm_stats.get(&raw.user_id).copied().unwrap_or((0.5, 0));
                     ucb1_score(mean, imp, total_impressions)
@@ -220,32 +234,35 @@ pub fn select(
         })
         .collect();
     order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let explore_candidates: Vec<_> = order
-        .into_iter()
-        .map(|(i, _)| explore_candidates[i])
-        .collect();
 
-    for s in explore_candidates.iter().take(n_explore) {
-        result.push(s.tweet_id.clone());
-        explore_count += 1;
+    for (i, _) in order.into_iter().take(n_explore) {
+        let s = explore_pool[i];
+        explore.push(s.tweet_id.clone());
+        taken.insert(s.tweet_id.as_str());
         trace!(tweet_id = %s.tweet_id, score = s.score, "Bandit: EXPLORE");
     }
 
-    // Compléter si manque de candidats explore
-    if result.len() < limit {
-        for s in scored.iter() {
-            if result.len() >= limit {
-                break;
-            }
-            if !result.contains(&s.tweet_id) {
-                result.push(s.tweet_id.clone());
-                exploit_count += 1;
-            }
+    // 3. Complement : tout ce qui n'a ete retenu ni par l'un ni par l'autre,
+    // dans l'ordre du score. C'est aussi ce qui rattrape le cas ou AUCUN tweet
+    // n'atteint `MIN_EXPLOIT_SCORE` -- le pool d'exploitation est alors vide et
+    // c'est ce complement qui porte tout le fil.
+    for s in scored.iter() {
+        if exploit.len() + explore.len() >= limit {
+            break;
         }
+        if taken.contains(s.tweet_id.as_str()) {
+            continue;
+        }
+        exploit.push(s.tweet_id.clone());
+        taken.insert(s.tweet_id.as_str());
     }
 
-    // Interleave exploit + explore pour meilleure UX (pas tout l'explore à la fin)
-    let interleaved = interleave_explore(&result, exploit_count, explore_count);
+    let exploit_count = exploit.len();
+    let explore_count = explore.len();
+
+    // Entrelacement : les tweets d'exploration a intervalles reguliers plutot
+    // que tous en fin de fil.
+    let interleaved = interleave_explore(&exploit, &explore);
 
     debug!(
         total = interleaved.len(),
@@ -263,54 +280,44 @@ pub fn select(
 }
 
 /// Candidats pour exploration : sources inattendues, nouveaux auteurs, contenu frais
-fn is_exploration_candidate(
-    scored: &ScoredTweet,
-    raw_tweets: &[RawTweet],
-    profile: &UserProfile,
-) -> bool {
-    let Some(raw) = raw_tweets.iter().find(|t| t.id == scored.tweet_id) else {
-        return false;
-    };
-
+fn is_exploration_candidate(scored: &ScoredTweet, raw: &RawTweet, profile: &UserProfile) -> bool {
     // Candidat exploration si :
     let is_new_author = !profile.top_authors.iter().any(|(id, _)| id == &raw.user_id);
     let is_discovery = matches!(raw.source, TweetSource::Discovery | TweetSource::Quality);
-    let is_not_followed = !profile.following_ids.contains(&raw.user_id);
+    let is_not_followed = !profile.follows(&raw.user_id);
     let has_decent_score = scored.score > 0.20; // minimum qualité
 
     has_decent_score && (is_new_author || is_discovery) && is_not_followed
 }
 
-/// Interleave : place les tweets explore à intervalles réguliers dans le feed
-fn interleave_explore(ids: &[String], n_exploit: usize, n_explore: usize) -> Vec<String> {
-    if n_explore == 0 {
-        return ids.to_vec();
+/// Entrelacement : place les tweets d'exploration a intervalles reguliers.
+///
+/// Prend les deux listes SEPAREMENT plutot qu'une liste concatenee et un point
+/// de coupe : la version precedente recevait `(ids, n_exploit, n_explore)` et
+/// recoupait elle-meme, ce qui la rendait dependante d'un invariant d'ordre que
+/// l'appelant pouvait rompre -- et rompait.
+fn interleave_explore(exploit: &[String], explore: &[String]) -> Vec<String> {
+    if explore.is_empty() {
+        return exploit.to_vec();
     }
 
-    let interval = if n_explore > 0 {
-        (n_exploit / n_explore).max(1)
-    } else {
-        usize::MAX
-    };
-    let exploit_ids: Vec<_> = ids.iter().take(n_exploit).collect();
-    let explore_ids: Vec<_> = ids.iter().skip(n_exploit).collect();
-
-    let mut result = Vec::with_capacity(ids.len());
-    let mut explore_iter = explore_ids.iter();
+    let interval = (exploit.len() / explore.len()).max(1);
+    let mut result = Vec::with_capacity(exploit.len() + explore.len());
+    let mut explore_iter = explore.iter();
     let mut next_explore = interval;
 
-    for (i, id) in exploit_ids.iter().enumerate() {
-        result.push((*id).clone());
+    for (i, id) in exploit.iter().enumerate() {
+        result.push(id.clone());
         if i + 1 == next_explore {
             if let Some(eid) = explore_iter.next() {
-                result.push((*eid).clone());
+                result.push(eid.clone());
                 next_explore += interval;
             }
         }
     }
-    // Ajouter les explore restants à la fin
+    // Les tweets d'exploration restants ferment le fil.
     for eid in explore_iter {
-        result.push((*eid).clone());
+        result.push(eid.clone());
     }
     result
 }
@@ -338,6 +345,100 @@ mod tests {
         assert_eq!(selection.tweet_ids.len(), 10);
         // exploit ~80%, explore ~20% (peut varier si peu de candidats explore)
         assert!(selection.exploit_count >= 6, "Should exploit at least 60%");
+    }
+
+
+    fn raw(id: &str, author: &str) -> RawTweet {
+        RawTweet {
+            id: id.to_string(),
+            user_id: author.to_string(),
+            source: TweetSource::Discovery,
+            ..Default::default()
+        }
+    }
+
+    /// Le tirage ne doit ni perdre, ni dupliquer un tweet -- c'est
+    /// l'invariant minimal d'un reordonnancement.
+    #[test]
+    fn le_tirage_ne_perd_ni_ne_duplique_aucun_tweet() {
+        let scored: Vec<ScoredTweet> = (0..40)
+            .map(|i| make_scored(&format!("t{i}"), 1.0 - i as f64 * 0.02))
+            .collect();
+        let raws: Vec<RawTweet> = (0..40).map(|i| raw(&format!("t{i}"), &format!("a{i}"))).collect();
+
+        let sel = select(&scored, &raws, &UserProfile::default(), 40, &HashMap::new());
+
+        assert_eq!(sel.tweet_ids.len(), 40);
+        let uniques: HashSet<&String> = sel.tweet_ids.iter().collect();
+        assert_eq!(uniques.len(), 40, "aucun doublon");
+        assert_eq!(sel.exploit_count + sel.explore_count, 40);
+    }
+
+    /// Regression : le remplissage de secours poussait ses tweets APRES le bloc
+    /// explore tout en les comptant comme exploitation. La frontiere calculee
+    /// par l'entrelacement tombait alors au milieu du bloc explore, qui se
+    /// retrouvait traite comme de l'exploitation -- et inversement.
+    ///
+    /// Avec un vivier ou presque rien n'atteint `MIN_EXPLOIT_SCORE`, le
+    /// complement porte l'essentiel du fil : c'est le cas ou l'ancien decoupage
+    /// se trompait le plus. On verifie que la sortie reste complete et sans
+    /// doublon, et que les tweets d'exploration sont bien REPARTIS plutot
+    /// qu'empiles en fin de liste.
+    #[test]
+    fn le_complement_ne_brouille_pas_la_frontiere_exploit_explore() {
+        // Scores tous SOUS le plancher d'exploitation (0.30) sauf les deux
+        // premiers : le pool exploit est quasi vide, le complement fait le
+        // reste.
+        let mut scored: Vec<ScoredTweet> = vec![make_scored("t0", 0.9), make_scored("t1", 0.8)];
+        scored.extend((2..30).map(|i| make_scored(&format!("t{i}"), 0.25 - i as f64 * 0.001)));
+        let raws: Vec<RawTweet> = (0..30).map(|i| raw(&format!("t{i}"), &format!("a{i}"))).collect();
+
+        let sel = select(&scored, &raws, &UserProfile::default(), 30, &HashMap::new());
+
+        assert_eq!(sel.tweet_ids.len(), 30);
+        assert_eq!(
+            sel.tweet_ids.iter().collect::<HashSet<_>>().len(),
+            30,
+            "aucun doublon malgre le complement"
+        );
+        assert!(sel.explore_count > 0, "il y a des candidats d'exploration ici");
+        assert_eq!(sel.exploit_count + sel.explore_count, 30);
+    }
+
+    /// Aucun tweet n'atteint le plancher d'exploitation : le fil doit quand
+    /// meme etre servi en entier, dans un ordre qui commence par les meilleurs
+    /// scores. Avant, le bloc explore etait pousse EN PREMIER dans `result` et
+    /// occupait donc le haut du fil.
+    #[test]
+    fn un_vivier_entierement_sous_le_plancher_reste_servi() {
+        let scored: Vec<ScoredTweet> = (0..20)
+            .map(|i| make_scored(&format!("t{i}"), 0.29 - i as f64 * 0.01))
+            .collect();
+        let raws: Vec<RawTweet> = (0..20).map(|i| raw(&format!("t{i}"), &format!("a{i}"))).collect();
+
+        let sel = select(&scored, &raws, &UserProfile::default(), 20, &HashMap::new());
+        assert_eq!(sel.tweet_ids.len(), 20);
+        assert_eq!(sel.tweet_ids.iter().collect::<HashSet<_>>().len(), 20);
+    }
+
+    #[test]
+    fn l_entrelacement_repartit_l_exploration() {
+        let exploit: Vec<String> = (0..8).map(|i| format!("x{i}")).collect();
+        let explore: Vec<String> = (0..2).map(|i| format!("e{i}")).collect();
+        let out = interleave_explore(&exploit, &explore);
+
+        assert_eq!(out.len(), 10);
+        let first_explore = out.iter().position(|id| id.starts_with('e')).unwrap();
+        assert!(
+            first_explore < out.len() - 1,
+            "l'exploration ne doit pas etre reléguee en fin de fil: {out:?}"
+        );
+    }
+
+    #[test]
+    fn l_entrelacement_sans_exploration_ne_touche_a_rien() {
+        let exploit: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
+        assert_eq!(interleave_explore(&exploit, &[]), exploit);
     }
 
     #[test]

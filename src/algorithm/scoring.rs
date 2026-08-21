@@ -24,6 +24,7 @@ use crate::algorithm::d9_llm_understanding::{
 use crate::algorithm::dwell::{MAX_BONUS as DWELL_MAX, SKIP_PENALTY as DWELL_MIN};
 use crate::ml::ctr_predictor::{extract_features, CtrPredictor, N_FEATURES};
 use crate::ml::dwell_predictor::DwellPredictor;
+use crate::ml::objectives::{ObjectivePredictions, ObjectivePredictor};
 use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
     AuthorTier, ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
@@ -52,6 +53,47 @@ const IMPRESSION_FATIGUE_START: i64 = 2;
 const SUBSCRIPTION_BOOST_PLUS: f64 = 1.03;
 const SUBSCRIPTION_BOOST_PRO: f64 = 1.06;
 
+
+/// Ce que D6 a besoin de savoir du fil DEJA construit.
+///
+/// Remplace le `&[ScoredTweet]` qui etait passe jusqu'ici. D6 n'en tirait que
+/// deux nombres — combien de tweets, combien avec un media — mais les
+/// recomptait en parcourant tout le fil A CHAQUE candidat. Sur un vivier de
+/// 1700 tweets, ca fait 1,4 million de passages pour deux entiers qui peuvent
+/// etre tenus au fil de l'eau.
+///
+/// Type valeur et non reference : il n'y a rien a emprunter, et le passer par
+/// copie evite au passage que quiconque soit tente d'aller relire le fil
+/// entier depuis D6.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeedShape {
+    pub len: usize,
+    pub media_count: usize,
+}
+
+impl FeedShape {
+    /// Fil vide — premier tweet de la page, ou scoring hors contexte de fil
+    /// (rattrapage hors-ligne du modele CTR).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Un tweet de plus dans le fil.
+    pub fn push(&mut self, has_media: bool) {
+        self.len += 1;
+        if has_media {
+            self.media_count += 1;
+        }
+    }
+
+    fn media_ratio(&self) -> f64 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        self.media_count as f64 / self.len as f64
+    }
+}
+
 /// Score final d'un tweet, toutes dimensions combinées.
 /// `author_feed_count` = combien de fois cet auteur apparaît déjà dans le feed courant.
 /// `ctr_predictor`     = modèle ML optionnel pour blending CTR prédit (Phase 2)
@@ -60,7 +102,7 @@ pub fn score_tweet(
     tweet: &RawTweet,
     profile: &UserProfile,
     author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
+    feed: FeedShape,
 ) -> ScoredTweet {
     // Délègue à la variante pondérée avec les poids par défaut : les deux
     // fonctions calculaient auparavant la même chose en double, et toute
@@ -69,7 +111,7 @@ pub fn score_tweet(
         tweet,
         profile,
         author_feed_count,
-        feed_tweets_so_far,
+        feed,
         &AlgoWeights::default(),
     )
 }
@@ -79,22 +121,27 @@ pub fn score_tweet_with_weights(
     tweet: &RawTweet,
     profile: &UserProfile,
     author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
+    feed: FeedShape,
     weights: &AlgoWeights,
 ) -> ScoredTweet {
     let (d1, ev_raw, ev_accel, viral_vel) = d1_engagement_velocity(tweet);
-    let d2 = d2_content_intelligence(tweet, profile);
+    // Minuscules calculees UNE fois. D2 et D8 cherchent chacun les mots-cles
+    // du lecteur dans le texte du tweet, et chacun refaisait sa propre copie
+    // en minuscules — deux allocations et deux conversions par candidat, pour
+    // exactement la meme chaine.
+    let content_lower = tweet.content.to_lowercase();
+    let d2 = d2_content_intelligence(tweet, profile, &content_lower);
     let (d3, d_follow, d_mutual, d_second) = d3_social_graph(tweet, profile);
     let d4 = d4_temporal_dynamics(tweet, profile);
     let d5 = d5_behavioral_prediction(tweet, profile);
-    let d6 = d6_content_diversity(tweet, profile, feed_tweets_so_far);
+    let d6 = d6_content_diversity(tweet, profile, feed);
     let d7_raw = d7_viral_prediction(tweet);
     let d7 = if tweet.source == TweetSource::Trending {
         (d7_raw * 1.2).clamp(0.0, 1.0)
     } else {
         d7_raw
     };
-    let d8 = d8_personalization_depth(tweet, profile);
+    let d8 = d8_personalization_depth(tweet, profile, &content_lower);
     // D9 juge le texte lui-même via les étiquettes du LLM annotateur. Neutre
     // (0.5) tant qu'un tweet n'est pas annoté, donc sans effet sur le classement
     // existant.
@@ -218,64 +265,84 @@ pub fn score_tweet_with_weights(
     }
 }
 
-/// Version avec ML CTR Predictor (Phase 2) + realtime boost (Phase 3)
-/// `ctr`           = CtrPredictor optionnel (None → score classique)
-/// `realtime_boost`= delta feedback loop Redis, typiquement [-0.20, +0.20]
-pub fn score_tweet_ml(
-    tweet: &RawTweet,
-    profile: &UserProfile,
-    author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
-    ctr: Option<&CtrPredictor>,
-    realtime_boost: f64,
-) -> ScoredTweet {
-    // Score de base (Phase 1 + Phase 2 user weights)
-    let mut scored = score_tweet(tweet, profile, author_feed_count, feed_tweets_so_far);
+/// Poids de base de chaque terme POSITIF du mélange final.
+///
+/// Ce ne sont pas les poids appliqués : ils sont renormalisés sur les seuls
+/// termes réellement disponibles (voir `blend_positive`). Ils expriment donc
+/// une importance RELATIVE, pas une part.
+///
+/// Les règles gardent le poids dominant à dessein : un signal appris ne doit
+/// pas dominer une dimension qui n'a encore rien appris à côté de lui. Et
+/// l'amplification pèse plus que le temps de lecture — relayer engage sa
+/// propre audience, lire longuement n'engage que soi.
+const W_RULES: f64 = 0.50;
+const W_CTR: f64 = 0.30;
+const W_DWELL: f64 = 0.20;
+const W_AMPLIFY: f64 = 0.25;
 
-    // Les features sont extraites systématiquement, même quand le blending ML
-    // est encore désactivé : c'est ce vecteur qu'on mémorise pour entraîner le
-    // modèle. Le gater sur `use_ml` créait un blocage circulaire — pas de
-    // features stockées → pas d'entraînement → jamais assez de samples pour
-    // activer le ML.
-    let features = ctr_feature_vector(tweet, profile, &scored);
-    scored.ctr_features = Some(features.to_vec());
+/// Part de score qu'un rejet CERTAIN retire.
+///
+/// La tête de rejet est le seul terme NÉGATIF du classement, et c'est ce qui
+/// manquait le plus : jusqu'ici, rétrograder un contenu problématique
+/// supposait de l'avoir déjà repéré APRÈS coup (signalements reçus, étiquette
+/// de toxicité du LLM). Ici on prédit le refus avant de montrer le tweet.
+///
+/// Multiplicatif et non soustractif : le score reste borné, et un tweet par
+/// ailleurs mauvais ne peut pas passer sous zéro puis remonter par un autre
+/// facteur. 0,60 est du même ordre que la pénalité de contenu poubelle
+/// (`garbage_penalty`), qui répond à la même question par un autre chemin.
+const REJECT_PENALTY_MAX: f64 = 0.60;
 
-    // Phase 2 : blending ML CTR predictor (40% ML + 60% règles)
-    if let Some(ctr_model) = ctr {
-        let ml_ctr = ctr_model.predict_ctr(&features);
-        let blended = scored.score * 0.60 + ml_ctr * 0.40;
-        debug!(
-            base = scored.score,
-            ml_ctr, blended, "Phase 2: ML CTR blend (60% rules + 40% ML)"
-        );
-        scored.score = blended;
+/// Somme pondérée des termes positifs DISPONIBLES, renormalisée à 1.
+///
+/// Renormaliser plutôt qu'énumérer les combinaisons : la version précédente
+/// portait un `match (ctr, dwell)` à quatre branches, chacune avec ses poids
+/// écrits à la main. Ajouter une troisième tête y aurait demandé huit
+/// branches, une quatrième seize — c'est exactement pour ça qu'aucune tête
+/// n'avait jamais été ajoutée. Ici, une tête absente ne coûte rien à écrire :
+/// elle n'entre simplement pas dans la somme.
+///
+/// ⚠ Écart assumé avec l'ancien barème : quand seul le CTR est disponible, le
+/// mélange passe de 0,60/0,40 à 0,625/0,375 (et 0,70/0,30 → 0,714/0,286 pour
+/// le dwell seul). L'écart va dans le sens prudent — les règles pèsent un
+/// peu PLUS — et la formule unique vaut mieux qu'une table à maintenir.
+fn blend_positive(rules: f64, terms: &[(f64, Option<f64>)]) -> f64 {
+    let mut weighted = rules * W_RULES;
+    let mut total = W_RULES;
+    for (weight, value) in terms {
+        if let Some(v) = value {
+            weighted += v * weight;
+            total += weight;
+        }
     }
-
-    // Phase 3 : realtime feedback boost/penalty
-    if realtime_boost.abs() > 0.001 {
-        scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
-        debug!(realtime_boost, final = scored.score, "Phase 3: Realtime feedback applied");
-    }
-
-    scored.breakdown.final_score = scored.score;
-    scored
+    (weighted / total).clamp(0.0, 1.0)
 }
 
 /// Variante ML avec poids de dimensions injectés (admin/auto-tuner).
 ///
-/// `ctr` et `dwell` sont chacun gardés par leur PROPRE seuil de démarrage à
-/// froid (voir `use_ml`/`use_dwell` dans `services::recommender`) — un modèle
-/// tout juste réinitialisé ne doit jamais peser dans le mélange. Les poids du
-/// mélange s'ajustent selon ce qui est réellement disponible ; les règles
-/// gardent toujours au moins 50 % : un signal appris ne doit pas dominer une
-/// dimension qui n'a encore rien appris à côté de lui.
+/// ── Multi-objectif ──────────────────────────────────────────────────────────
+/// Quatre prédictions entrent ici, chacune gardée par SON propre seuil de
+/// démarrage à froid — un modèle tout juste réinitialisé ne doit jamais peser :
+///
+///   * le score de règles (les 9 dimensions), toujours présent ;
+///   * `ctr`     — p(engagement), toutes réactions positives confondues ;
+///   * `dwell`   — temps de lecture attendu, reprojeté sur [0,1] ;
+///   * `amplify` — p(relais : retweet, partage, marque-page, commentaire) ;
+///   * `reject`  — p(refus explicite), SOUSTRAIT et non ajouté.
+///
+/// C'est la structure que X et TikTok utilisent : plusieurs probabilités
+/// séparées, combinées par une somme pondérée dont certains termes sont
+/// négatifs. La tête unique d'avant ne pouvait pas distinguer « sera aimé » de
+/// « sera partagé », ni « sera ignoré » de « sera signalé ».
+#[allow(clippy::too_many_arguments)]
 pub fn score_tweet_ml_with_weights(
     tweet: &RawTweet,
     profile: &UserProfile,
     author_feed_count: u32,
-    feed_tweets_so_far: &[ScoredTweet],
+    feed: FeedShape,
     ctr: Option<&CtrPredictor>,
     dwell: Option<&DwellPredictor>,
+    objectives: Option<&ObjectivePredictor>,
     realtime_boost: f64,
     weights: &AlgoWeights,
 ) -> ScoredTweet {
@@ -283,33 +350,55 @@ pub fn score_tweet_ml_with_weights(
         tweet,
         profile,
         author_feed_count,
-        feed_tweets_so_far,
+        feed,
         weights,
     );
 
     let features = ctr_feature_vector(tweet, profile, &scored);
     scored.ctr_features = Some(features.to_vec());
 
+    // Prédiction faite ICI et non par l'appelant : les features ne sont
+    // construites qu'à partir du tweet DÉJÀ scoré par les règles, elles
+    // n'existent donc nulle part ailleurs. Un prédicteur absent, ou dont les
+    // deux têtes sont encore froides, donne des `None` — le mélange se
+    // comporte alors exactement comme avant l'ajout des têtes.
+    let objectives: ObjectivePredictions = objectives
+        .map(|o| o.predict(&features))
+        .unwrap_or_default();
+
     let ml_ctr = ctr.map(|m| m.predict_ctr(&features));
     // Le dwell prédit vit sur [SKIP_PENALTY, MAX_BONUS] (voir `algorithm::dwell`),
     // pas [0, 1] comme le CTR et le score de règles — reprojeté pour mélanger
-    // sur la même échelle que les deux autres termes.
+    // sur la même échelle que les autres termes.
     let ml_dwell01 = dwell.map(|m| {
         let predicted = m.predict_dwell(&features);
         ((predicted - DWELL_MIN) / (DWELL_MAX - DWELL_MIN)).clamp(0.0, 1.0)
     });
 
-    scored.score = match (ml_ctr, ml_dwell01) {
-        (Some(c), Some(d)) => (scored.score * 0.50 + c * 0.30 + d * 0.20).clamp(0.0, 1.0),
-        (Some(c), None) => (scored.score * 0.60 + c * 0.40).clamp(0.0, 1.0),
-        (None, Some(d)) => (scored.score * 0.70 + d * 0.30).clamp(0.0, 1.0),
-        (None, None) => scored.score,
-    };
+    scored.score = blend_positive(
+        scored.score,
+        &[
+            (W_CTR, ml_ctr),
+            (W_DWELL, ml_dwell01),
+            (W_AMPLIFY, objectives.amplify),
+        ],
+    );
+
+    // ── Terme négatif ────────────────────────────────────────────────────────
+    // Appliqué APRÈS le mélange positif, sur le score déjà constitué : un tweet
+    // que le modèle s'attend à voir signalé est rétrogradé quelle que soit sa
+    // qualité par ailleurs, exactement comme la pénalité de toxicité.
+    if let Some(p_reject) = objectives.reject {
+        let penalty = 1.0 - REJECT_PENALTY_MAX * p_reject.clamp(0.0, 1.0);
+        scored.score *= penalty;
+        trace!(tweet_id = %tweet.id, p_reject, penalty, "Tête de rejet appliquée");
+    }
 
     if realtime_boost.abs() > 0.001 {
         scored.score = (scored.score + realtime_boost).clamp(0.0, 1.0);
     }
 
+    scored.score = scored.score.clamp(0.0, 1.0);
     scored.breakdown.final_score = scored.score;
     scored
 }
@@ -445,7 +534,7 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
 // Analyse réelle du contenu : longueur idéale, richesse, format, style,
 // correspondance avec les préférences de l'utilisateur.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
+fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile, content_lower: &str) -> f64 {
     let mut score = 0.0_f64;
     trace!(content_length = t.content_length, personality = ?profile.personality_type, "D2 Start");
 
@@ -548,7 +637,6 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile) -> f64 {
     score += personality_score;
 
     // ── Correspondance mots-clés préférés ────────────────────────────────────
-    let content_lower = t.content.to_lowercase();
     let keyword_matches: usize = profile
         .top_words
         .iter()
@@ -575,7 +663,7 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     trace!(author_id = %t.user_id, "D3 Social graph analysis");
 
     // Degré 1 : l'utilisateur suit directement l'auteur
-    let direct = if profile.following_ids.contains(&t.user_id) {
+    let direct = if profile.follows(&t.user_id) {
         0.55
     } else {
         0.0
@@ -583,12 +671,12 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     score += direct;
     trace!(
         direct,
-        is_following = profile.following_ids.contains(&t.user_id),
+        is_following = profile.follows(&t.user_id),
         "D3 Degree 1: Direct follow"
     );
 
     // Degré 1.5 : follow mutuel (plus fort signal d'engagement)
-    let mutual = if profile.mutual_follow_ids.contains(&t.user_id) {
+    let mutual = if profile.is_mutual(&t.user_id) {
         0.25
     } else {
         0.0
@@ -596,12 +684,12 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     score += mutual;
     trace!(
         mutual,
-        is_mutual = profile.mutual_follow_ids.contains(&t.user_id),
+        is_mutual = profile.is_mutual(&t.user_id),
         "D3 Degree 1.5: Mutual follow"
     );
 
     // Degré 2 : ami d'ami (signal de découverte sociale)
-    let second = if profile.second_degree_ids.contains(&t.user_id) {
+    let second = if profile.is_second_degree(&t.user_id) {
         0.12
     } else {
         0.0
@@ -609,7 +697,7 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     score += second;
     trace!(
         second,
-        is_second_degree = profile.second_degree_ids.contains(&t.user_id),
+        is_second_degree = profile.is_second_degree(&t.user_id),
         "D3 Degree 2: Second degree"
     );
 
@@ -806,8 +894,8 @@ fn d5_behavioral_prediction(t: &RawTweet, profile: &UserProfile) -> f64 {
 // Maximal Marginal Relevance (MMR) adapté :
 // récompense les tweets qui apportent de la nouveauté au feed.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet]) -> f64 {
-    let feed_size = feed.len();
+fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: FeedShape) -> f64 {
+    let feed_size = feed.len;
     trace!(feed_size, tweet_id = %t.id, "D6 Content diversity analysis");
 
     if feed_size == 0 {
@@ -823,8 +911,8 @@ fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet
 
     // Bonus format : médias vs texte — ratio réel de tweets-média déjà dans le feed.
     // (auparavant un placeholder figé à 1.0 qui désactivait totalement ce bonus)
-    let media_in_feed = feed.iter().filter(|s| s.breakdown.has_media).count();
-    let media_ratio_in_feed = media_in_feed as f64 / feed_size.max(1) as f64;
+    let media_in_feed = feed.media_count;
+    let media_ratio_in_feed = feed.media_ratio();
     // Récompense la nouveauté de format : un tweet média dans un feed pauvre en média
     // (ou inversement, un tweet texte dans un feed saturé de médias).
     let media_bonus = if t.has_media && media_ratio_in_feed < 0.40 {
@@ -852,7 +940,7 @@ fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet
     );
 
     // Contenu pas encore vu
-    let novelty_bonus = if !profile.seen_tweet_ids.contains(&t.id) {
+    let novelty_bonus = if !profile.has_seen(&t.id) {
         0.05
     } else {
         0.0
@@ -860,7 +948,7 @@ fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: &[ScoredTweet
     score += novelty_bonus;
     trace!(
         novelty_bonus,
-        already_seen = profile.seen_tweet_ids.contains(&t.id),
+        already_seen = profile.has_seen(&t.id),
         "D6 Content novelty"
     );
 
@@ -941,7 +1029,7 @@ fn d7_viral_prediction(t: &RawTweet) -> f64 {
 // D8 — PERSONALIZATION DEPTH (5%)
 // Affinité profonde : top auteurs, mots-clés, profil émotionnel.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile) -> f64 {
+fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile, content_lower: &str) -> f64 {
     let mut score = 0.0_f64;
     trace!(author_id = %t.user_id, "D8 Personalization depth start");
 
@@ -962,7 +1050,6 @@ fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile) -> f64 {
     );
 
     // Correspondance mots avec centres d'intérêt
-    let content_lower = t.content.to_lowercase();
     let mut word_matches = 0;
     let interest_score: f64 = profile
         .top_words
@@ -1057,6 +1144,64 @@ pub fn subscription_boost(tier: AuthorTier) -> f64 {
         AuthorTier::Plus => SUBSCRIPTION_BOOST_PLUS,
         AuthorTier::Pro => SUBSCRIPTION_BOOST_PRO,
     }
+}
+
+
+/// Confiance du moteur dans le classement de CE tweet pour CE lecteur.
+///
+/// ── Ce que ce nombre dit, et ce qu'il ne dit pas ────────────────────────────
+/// Ce n'est PAS « ce tweet est bon » — c'est le score qui répond à ça. C'est
+/// « sur quoi le moteur s'est-il appuyé pour le classer ». Une confiance basse
+/// veut dire que la décision repose sur peu de choses : un lecteur dont on ne
+/// sait presque rien, un tweet que personne n'a encore lu, un auteur inconnu,
+/// un texte pas encore annoté. Le score peut être élevé quand même — il est
+/// simplement moins fondé.
+///
+/// C'est exactement la question que l'app pose quand elle demande au lecteur
+/// « ça t'intéresse ? » : la peine ne vaut d'être prise que là où le moteur ne
+/// sait pas trancher tout seul.
+///
+/// ── Pourquoi un produit et pas une moyenne ─────────────────────────────────
+/// Les deux facteurs ne se compensent pas. Tout savoir d'un tweet ne sert à
+/// rien si on ne sait rien du lecteur, et l'inverse est tout aussi vrai : une
+/// moyenne laisserait un compte tout neuf afficher une confiance moyenne sur
+/// un tweet très observé, alors qu'on n'a aucune idée de ce qu'IL en pensera.
+pub fn ranking_confidence(tweet: &RawTweet, profile: &UserProfile) -> f64 {
+    // Ce qu'on sait du LECTEUR — déjà calculé au montage du profil : part de
+    // 0,3 pour un compte neuf et monte vers 1,0 avec l'historique.
+    let reader = profile.profile_confidence.clamp(0.0, 1.0);
+
+    // Ce qu'on sait de ce TWEET, en trois preuves indépendantes.
+    //
+    // Engagement observé : dix réactions suffisent à dire quelque chose, et
+    // au-delà l'information supplémentaire est marginale.
+    let observed = tweet.like_count + tweet.comment_count + tweet.retweet_count;
+    let engagement_evidence = (observed as f64 / 10.0).clamp(0.0, 1.0);
+
+    // Annotation du contenu : la seule preuve qui n'a besoin d'aucun
+    // engagement préalable, donc la seule disponible sur un tweet qui vient
+    // d'être publié. Pondérée par la confiance de l'annotateur lui-même.
+    let annotation_evidence = tweet
+        .llm
+        .as_ref()
+        .map(|l| l.confidence.clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+
+    // Auteur connu de ce lecteur : suivi, ou déjà engagé par le passé.
+    let author_evidence = if profile.follows(&tweet.user_id)
+        || profile
+            .top_authors
+            .iter()
+            .any(|(id, affinity)| id == &tweet.user_id && *affinity > 0.0)
+    {
+        1.0
+    } else {
+        0.0
+    };
+
+    let item = engagement_evidence * 0.45 + annotation_evidence * 0.30 + author_evidence * 0.25;
+
+    (reader * item).clamp(0.0, 1.0)
 }
 
 /// Anti-bulle de filtre : pénalise progressivement les auteurs sur-représentés.
@@ -1228,6 +1373,156 @@ fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+
+    // ─── Confiance de classement ─────────────────────────────────────────────
+
+    fn lecteur(confiance: f64) -> UserProfile {
+        UserProfile {
+            profile_confidence: confiance,
+            ..Default::default()
+        }
+    }
+
+    fn tweet_observe() -> RawTweet {
+        RawTweet {
+            user_id: "auteur".into(),
+            like_count: 20,
+            comment_count: 5,
+            retweet_count: 3,
+            llm: Some(crate::models::LlmLabels {
+                theme: "actualite".into(),
+                toxicity_score: 0.0,
+                toxicity_category: "aucune".into(),
+                quality_score: 0.7,
+                tone: "neutre".into(),
+                confidence: 0.9,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Le cas qui compte : un tweet tout neuf, d'un auteur inconnu, montre a un
+    /// compte tout neuf. Le moteur devine — et doit le dire.
+    #[test]
+    fn tout_neuf_des_deux_cotes_donne_une_confiance_tres_basse() {
+        let c = ranking_confidence(&RawTweet::default(), &lecteur(0.3));
+        assert!(c < 0.05, "confiance={c}");
+    }
+
+    #[test]
+    fn tout_connu_des_deux_cotes_donne_une_confiance_haute() {
+        let mut p = lecteur(1.0);
+        p.following_ids = vec!["auteur".into()];
+        p.rebuild_indexes();
+        let c = ranking_confidence(&tweet_observe(), &p);
+        assert!(c > 0.8, "confiance={c}");
+    }
+
+    /// Le point de la MULTIPLICATION plutot que d'une moyenne : tout savoir du
+    /// tweet ne sert a rien si on ne sait rien du lecteur. Une moyenne
+    /// laisserait un compte neuf afficher une confiance moyenne sur un tweet
+    /// tres observe, alors qu'on n'a aucune idee de ce qu'IL en pensera.
+    #[test]
+    fn ne_rien_savoir_du_lecteur_ecrase_tout_ce_qu_on_sait_du_tweet() {
+        let tweet = tweet_observe();
+        let inconnu = ranking_confidence(&tweet, &lecteur(0.0));
+        let connu = ranking_confidence(&tweet, &lecteur(1.0));
+        assert_eq!(inconnu, 0.0, "aucune connaissance du lecteur = aucune confiance");
+        assert!(connu > 0.5);
+    }
+
+    /// L'annotation est la seule preuve disponible sur un tweet qui vient
+    /// d'etre publie : elle doit suffire a sortir de la confiance nulle, meme
+    /// sans le moindre engagement.
+    #[test]
+    fn un_tweet_annote_sans_engagement_n_est_pas_a_confiance_nulle() {
+        let mut tweet = RawTweet::default();
+        tweet.llm = tweet_observe().llm;
+        let c = ranking_confidence(&tweet, &lecteur(1.0));
+        assert!(c > 0.0 && c < 0.5, "confiance={c}");
+    }
+
+    #[test]
+    fn la_confiance_reste_bornee() {
+        let mut p = lecteur(5.0); // valeur aberrante volontaire
+        p.following_ids = vec!["auteur".into()];
+        p.rebuild_indexes();
+        let mut tweet = tweet_observe();
+        tweet.like_count = 1_000_000;
+        let c = ranking_confidence(&tweet, &p);
+        assert!((0.0..=1.0).contains(&c), "confiance={c}");
+    }
+
+    // ─── Mélange multi-objectifs ─────────────────────────────────────────────
+
+    /// Sans aucune tête disponible, le mélange doit rendre EXACTEMENT le score
+    /// de règles. C'est la garantie de démarrage à froid : tant que rien n'a
+    /// appris, le classement est celui d'avant l'ajout des têtes.
+    #[test]
+    fn sans_aucune_tete_le_melange_rend_le_score_de_regles() {
+        assert_eq!(blend_positive(0.42, &[]), 0.42);
+        assert_eq!(
+            blend_positive(0.42, &[(W_CTR, None), (W_DWELL, None), (W_AMPLIFY, None)]),
+            0.42
+        );
+    }
+
+    /// Le barème historique à trois termes (règles/CTR/dwell = 0,50/0,30/0,20)
+    /// doit être reproduit à l'identique : c'est le cas nominal en production
+    /// une fois les deux modèles mûrs.
+    #[test]
+    fn le_bareme_historique_a_trois_termes_est_reproduit() {
+        let attendu = 0.40 * 0.50 + 0.80 * 0.30 + 0.60 * 0.20;
+        let obtenu = blend_positive(0.40, &[(W_CTR, Some(0.80)), (W_DWELL, Some(0.60))]);
+        assert!((obtenu - attendu).abs() < 1e-12, "{obtenu} vs {attendu}");
+    }
+
+    /// Le mélange reste une moyenne pondérée : il ne peut pas sortir de
+    /// l'enveloppe de ses termes.
+    #[test]
+    fn le_melange_reste_entre_le_min_et_le_max_de_ses_termes() {
+        let out = blend_positive(0.20, &[(W_CTR, Some(0.90)), (W_AMPLIFY, Some(0.50))]);
+        assert!(out > 0.20 && out < 0.90, "{out}");
+        let egaux = blend_positive(0.55, &[(W_CTR, Some(0.55)), (W_AMPLIFY, Some(0.55))]);
+        assert!((egaux - 0.55).abs() < 1e-12);
+    }
+
+    /// Une amplification prédite forte doit remonter le tweet — c'est la tête
+    /// qui vaut le plus cher : relayer engage sa propre audience.
+    #[test]
+    fn une_amplification_predite_remonte_le_tweet() {
+        let sans = blend_positive(0.40, &[(W_CTR, Some(0.40))]);
+        let avec = blend_positive(0.40, &[(W_CTR, Some(0.40)), (W_AMPLIFY, Some(0.95))]);
+        assert!(avec > sans, "sans={sans} avec={avec}");
+    }
+
+    /// Et l'amplification doit peser PLUS que le temps de lecture, à valeur
+    /// prédite égale.
+    #[test]
+    fn l_amplification_pese_plus_que_le_temps_de_lecture() {
+        assert!(W_AMPLIFY > W_DWELL);
+        let par_dwell = blend_positive(0.30, &[(W_DWELL, Some(0.90))]);
+        let par_amplify = blend_positive(0.30, &[(W_AMPLIFY, Some(0.90))]);
+        assert!(par_amplify > par_dwell, "{par_amplify} vs {par_dwell}");
+    }
+
+    /// Le terme négatif : un rejet certain doit retirer `REJECT_PENALTY_MAX`,
+    /// un rejet nul ne doit rien retirer, et le résultat reste borné.
+    #[test]
+    fn la_tete_de_rejet_retrograde_sans_jamais_annuler() {
+        let base = 0.80_f64;
+        let certain = base * (1.0 - REJECT_PENALTY_MAX * 1.0);
+        let nul = base * (1.0 - REJECT_PENALTY_MAX * 0.0);
+        assert!((nul - base).abs() < 1e-12, "un rejet nul ne retire rien");
+        assert!(certain < base);
+        assert!(
+            certain > 0.0,
+            "rétrograder n'est pas retirer : le retrait est une décision de modération"
+        );
+        assert!((certain - 0.32).abs() < 1e-12, "{certain}");
+    }
 
     #[test]
     fn abonnes_devant_gratuits_a_qualite_egale() {

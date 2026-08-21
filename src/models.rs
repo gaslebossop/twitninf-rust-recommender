@@ -68,6 +68,14 @@ pub enum InteractionType {
     View,
     Bookmark,
     ProfileView,
+    /// Ouverture du tweet en pleine page.
+    ///
+    /// C'est le clic le PLUS net qu'un fil produise — le lecteur quitte le
+    /// défilement pour aller lire — et il n'existait pas. L'app émettait bien
+    /// `profile_view` quand on tape l'AUTEUR, mais rien quand on tape le tweet
+    /// lui-même : le geste le plus informatif de l'écran ne remontait nulle
+    /// part.
+    Open,
     Skip,
     Report,
     Block,
@@ -93,6 +101,10 @@ impl InteractionType {
             InteractionType::Bookmark => 2.5,
             InteractionType::View => 0.2,
             InteractionType::ProfileView => 1.5,
+            // Entre la visite de profil (1,5) et le commentaire (3,5) :
+            // ouvrir demande un geste délibéré et un changement d'écran, mais
+            // ne produit rien de public.
+            InteractionType::Open => 2.0,
             InteractionType::Skip => -0.5,
             InteractionType::Report => -12.0,
             InteractionType::Block => -20.0,
@@ -101,6 +113,30 @@ impl InteractionType {
             // contenu lui-même, pas le goût du lecteur).
             InteractionType::Interested => 3.0,
             InteractionType::NotInterested => -8.0,
+        }
+    }
+
+    /// Poids de mise en sourdine de l'AUTEUR déclenché par ce geste.
+    ///
+    /// `None` = ce geste ne dit rien du compte, seulement du tweet.
+    ///
+    /// Tous les refus ne se valent pas, et c'est exactement ce que le moteur
+    /// ignorait : « ça ne m'intéresse pas » était le SEUL geste à porter sur
+    /// l'auteur, alors que c'est le plus faible des trois. Un signalement dit
+    /// que le contenu n'aurait pas dû être montré ; un blocage dit qu'on ne
+    /// veut plus rien voir de ce compte.
+    ///
+    /// L'échelle est celle de `author_damping` (0,32^n) : 1 point divise la
+    /// visibilité par ~3, 2 points par ~10, 5 points la posent au plancher.
+    ///
+    /// `Skip` reste volontairement à `None` : ignorer UN tweet ne dit rien de
+    /// son auteur.
+    pub fn refusal_strikes(self) -> Option<f64> {
+        match self {
+            InteractionType::NotInterested => Some(1.0),
+            InteractionType::Report => Some(2.0),
+            InteractionType::Block => Some(5.0),
+            _ => None,
         }
     }
 
@@ -123,6 +159,7 @@ impl InteractionType {
             | InteractionType::Share
             | InteractionType::Bookmark
             | InteractionType::Interested
+            | InteractionType::Open
             | InteractionType::ProfileView => Some(true),
 
             InteractionType::Skip
@@ -204,6 +241,87 @@ pub struct UserProfile {
 
     pub user_type: UserType,
     pub profile_confidence: f64,
+
+    // ── Index d'appartenance ─────────────────────────────────────────────
+    //
+    // Les mêmes ensembles que `following_ids`, `mutual_follow_ids`,
+    // `second_degree_ids` et `seen_tweet_ids`, mais en `HashSet`.
+    //
+    // Ce ne sont pas des données de plus : ce sont les MÊMES, indexées. Le
+    // scoring pose la question « ce lecteur suit-il cet auteur ? » une bonne
+    // dizaine de fois par tweet candidat (D3 trois fois, le filtre de surface,
+    // le boost d'abonnement deux fois, le bandit une fois), et chacune de ces
+    // questions balayait un `Vec<String>` qui monte à 1000 abonnements. À
+    // 1700 candidats, ça fait plusieurs millions de comparaisons de chaînes
+    // par recommandation, pour une information qu'on peut hacher une seule
+    // fois au moment où le profil est construit.
+    //
+    // `#[serde(skip)]` : jamais sérialisés vers Redis — les recalculer coûte
+    // moins cher que de les transporter, et un profil relu du cache passe de
+    // toute façon par `rebuild_indexes()`.
+    #[serde(skip)]
+    pub following_set: std::collections::HashSet<String>,
+    #[serde(skip)]
+    pub mutual_set: std::collections::HashSet<String>,
+    #[serde(skip)]
+    pub second_degree_set: std::collections::HashSet<String>,
+    #[serde(skip)]
+    pub seen_set: std::collections::HashSet<String>,
+}
+
+impl UserProfile {
+    /// (Re)construit les index d'appartenance depuis les vecteurs.
+    ///
+    /// À appeler à CHAQUE endroit où un profil devient utilisable : à la
+    /// sortie de la base, et à la sortie du cache Redis (où `serde(skip)` les
+    /// a laissés vides). Un index vide alors que le vecteur ne l'est pas
+    /// donnerait des réponses fausses — c'est le seul risque de ce montage,
+    /// et il est cantonné à ces deux points.
+    pub fn rebuild_indexes(&mut self) {
+        self.following_set = self.following_ids.iter().cloned().collect();
+        self.mutual_set = self.mutual_follow_ids.iter().cloned().collect();
+        self.second_degree_set = self.second_degree_ids.iter().cloned().collect();
+        self.seen_set = self.seen_tweet_ids.iter().cloned().collect();
+    }
+
+    /// Appartenance, en préférant l'index quand il existe.
+    ///
+    /// Le repli sur le vecteur n'est pas une coquetterie défensive : un index
+    /// vide face à un vecteur plein est INDISCERNABLE d'un « ce lecteur ne
+    /// suit personne ». Sans repli, oublier un `rebuild_indexes()` sur un
+    /// chemin (celui du cache, une désérialisation ajoutée plus tard, un test)
+    /// ne produirait ni erreur ni log — juste un fil où le boost d'abonnement
+    /// et D3 valent zéro pour tout le monde. On paie une comparaison
+    /// d'entier pour rendre cette panne impossible ; le chemin nominal, lui,
+    /// reste bien en O(1).
+    #[inline]
+    fn member(set: &std::collections::HashSet<String>, list: &[String], needle: &str) -> bool {
+        if set.is_empty() && !list.is_empty() {
+            return list.iter().any(|id| id == needle);
+        }
+        set.contains(needle)
+    }
+
+    /// Ce lecteur suit-il ce compte ?
+    #[inline]
+    pub fn follows(&self, author_id: &str) -> bool {
+        Self::member(&self.following_set, &self.following_ids, author_id)
+    }
+
+    #[inline]
+    pub fn is_mutual(&self, author_id: &str) -> bool {
+        Self::member(&self.mutual_set, &self.mutual_follow_ids, author_id)
+    }
+
+    #[inline]
+    pub fn is_second_degree(&self, author_id: &str) -> bool {
+        Self::member(&self.second_degree_set, &self.second_degree_ids, author_id)
+    }
+
+    #[inline]
+    pub fn has_seen(&self, tweet_id: &str) -> bool {
+        Self::member(&self.seen_set, &self.seen_tweet_ids, tweet_id)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -490,6 +608,22 @@ pub struct FeedEntry {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// Score final de classement, et confiance du moteur dans cette décision
+    /// (voir `algorithm::scoring::ranking_confidence`).
+    ///
+    /// Mis en cache avec le reste de l'entrée, pour la même raison que
+    /// `parent_id` : ce sont les seuls instants où l'on connaît encore le
+    /// tweet complet. Les recalculer à la lecture du cache exigerait de tout
+    /// recharger depuis la base à chaque page servie.
+    ///
+    /// `#[serde(default)]` : les clés déjà écrites par la version précédente
+    /// n'en portent pas et doivent rester lisibles pendant leur TTL — sans ça,
+    /// tout lecteur ayant un fil en cache le verrait recalculé intégralement
+    /// au déploiement.
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default)]
+    pub confidence: f64,
 }
 
 /// Lien de conversation exposé au client : « ce tweet répond à celui-là, et le
@@ -499,6 +633,22 @@ pub struct FeedEntry {
 /// et c'est voulu : l'ordre est une convention fragile qu'un intermédiaire peut
 /// casser sans s'en rendre compte, ce champ est une affirmation explicite. Un
 /// client qui reçoit les deux peut vérifier qu'ils concordent.
+/// Ce que le moteur a pensé d'un tweet de CETTE page.
+///
+/// Exposé parce que le client en a besoin pour décider quand DEMANDER : la
+/// question explicite (« ça t'intéresse ? ») n'a de sens que là où le moteur
+/// hésite, et jusqu'ici l'app n'avait aucun moyen de le savoir — elle
+/// retombait sur une heuristique de silence.
+#[derive(Debug, Clone, Serialize)]
+pub struct TweetScore {
+    pub tweet_id: String,
+    /// Score final de classement, dans [0,1].
+    pub score: f64,
+    /// Sur quoi cette décision s'appuie, dans [0,1]. BAS = le moteur devine.
+    /// Ce n'est pas « ce tweet est mauvais » — voir `ranking_confidence`.
+    pub confidence: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadLink {
     pub tweet_id: String,
@@ -516,6 +666,9 @@ pub struct RecommendResponse {
     /// Liens de fil entre les `tweet_ids` de CETTE page. Vide quand la page ne
     /// contient aucune réponse.
     pub threads: Vec<ThreadLink>,
+    /// Score et confiance de chaque tweet de CETTE page, dans le même ordre
+    /// que `tweet_ids`.
+    pub scores: Vec<TweetScore>,
     pub count: usize,
     pub algorithm: &'static str,
     pub algorithm_version: &'static str,
@@ -601,4 +754,106 @@ pub struct HealthResponse {
     pub redis: String,
     pub uptime_secs: u64,
     pub algorithm: &'static str,
+}
+
+#[cfg(test)]
+mod profile_index_tests {
+    use super::*;
+
+    fn profile() -> UserProfile {
+        let mut p = UserProfile {
+            following_ids: vec!["a".into(), "b".into()],
+            mutual_follow_ids: vec!["b".into()],
+            second_degree_ids: vec!["c".into()],
+            seen_tweet_ids: vec!["t1".into()],
+            ..Default::default()
+        };
+        p.rebuild_indexes();
+        p
+    }
+
+    #[test]
+    fn les_index_repondent_comme_les_vecteurs() {
+        let p = profile();
+        assert!(p.follows("a") && p.follows("b") && !p.follows("z"));
+        assert!(p.is_mutual("b") && !p.is_mutual("a"));
+        assert!(p.is_second_degree("c") && !p.is_second_degree("a"));
+        assert!(p.has_seen("t1") && !p.has_seen("t2"));
+    }
+
+    /// Le seul vrai risque de l'indexation : les ensembles ne sont pas
+    /// sérialisés, donc un profil relu du cache Redis arrive avec des index
+    /// VIDES. Sans reconstruction, `follows()` répondrait « non » pour tout le
+    /// monde et le boost d'abonnement disparaîtrait silencieusement — sans
+    /// erreur, sans log, pour tous les lecteurs dont le profil est en cache.
+    #[test]
+    fn un_profil_relu_du_cache_doit_etre_reindexe() {
+        let json = serde_json::to_string(&profile()).unwrap();
+        let mut relu: UserProfile = serde_json::from_str(&json).unwrap();
+
+        // État tel qu'il sort du cache : les vecteurs sont là, pas les index.
+        assert_eq!(relu.following_ids.len(), 2);
+        assert!(relu.following_set.is_empty(), "l'index ne doit pas être sérialisé");
+
+        // Le repli doit déjà donner la BONNE réponse, index absent — c'est ce
+        // qui rend un `rebuild_indexes()` oublié inoffensif plutôt que
+        // silencieusement destructeur.
+        assert!(relu.follows("a") && relu.is_mutual("b") && relu.has_seen("t1"));
+        assert!(!relu.follows("z"));
+
+        relu.rebuild_indexes();
+        assert!(!relu.following_set.is_empty());
+        assert!(relu.follows("a") && relu.is_mutual("b") && relu.has_seen("t1"));
+        assert!(!relu.follows("z"));
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    /// Le classement des trois refus doit être strict et dans cet ordre :
+    /// bloquer > signaler > ne pas être intéressé. C'est l'inversion de cet
+    /// ordre qui était le bug — seul le plus faible des trois agissait.
+    #[test]
+    fn les_refus_sont_ordonnes_du_plus_faible_au_plus_fort() {
+        let pas_interesse = InteractionType::NotInterested.refusal_strikes().unwrap();
+        let signalement = InteractionType::Report.refusal_strikes().unwrap();
+        let blocage = InteractionType::Block.refusal_strikes().unwrap();
+        assert!(pas_interesse < signalement, "{pas_interesse} < {signalement}");
+        assert!(signalement < blocage, "{signalement} < {blocage}");
+    }
+
+    /// Ignorer un tweet ne dit rien de son auteur, ni un geste positif.
+    #[test]
+    fn seuls_les_refus_explicites_mettent_un_auteur_en_sourdine() {
+        for muet in [
+            InteractionType::Skip,
+            InteractionType::Like,
+            InteractionType::View,
+            InteractionType::Unlike,
+            InteractionType::Interested,
+        ] {
+            assert!(
+                muet.refusal_strikes().is_none(),
+                "{muet:?} ne doit pas viser l'auteur"
+            );
+        }
+    }
+
+    /// Les trois gestes qui mettent un auteur en sourdine doivent aussi être
+    /// étiquetés négatifs pour le modèle CTR : sourdine et apprentissage ne
+    /// doivent pas se contredire.
+    #[test]
+    fn un_refus_est_toujours_un_negatif_pour_le_modele() {
+        for refus in [
+            InteractionType::NotInterested,
+            InteractionType::Report,
+            InteractionType::Block,
+        ] {
+            assert!(refus.refusal_strikes().is_some());
+            assert_eq!(refus.ctr_label(), Some(false), "{refus:?}");
+            assert!(refus.weight() < 0.0, "{refus:?}");
+        }
+    }
 }

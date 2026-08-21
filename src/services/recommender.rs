@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::algorithm::scoring::{
     compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights,
-    theme_diversity_multiplier,
+    theme_diversity_multiplier, FeedShape,
 };
 use crate::bandit::bandit_select;
 use crate::constants::{
@@ -22,6 +22,7 @@ use crate::experiments;
 use crate::ml::auto_tuner::AutoTuner;
 use crate::ml::ctr_predictor::CtrPredictor;
 use crate::ml::dwell_predictor::DwellPredictor;
+use crate::ml::objectives::ObjectivePredictor;
 use crate::models::*;
 use crate::services::cache_manager::CacheManager;
 use crate::shadowban::{
@@ -46,6 +47,8 @@ pub struct RecommenderService {
     cache: CacheManager,
     ctr_predictor: CtrPredictor,
     dwell_predictor: DwellPredictor,
+    /// Têtes multi-objectifs (amplification, rejet) — voir `ml::objectives`.
+    objectives: ObjectivePredictor,
     auto_tuner: std::sync::Arc<AutoTuner>,
 }
 
@@ -56,6 +59,7 @@ impl RecommenderService {
             cache,
             ctr_predictor: CtrPredictor::new(),
             dwell_predictor: DwellPredictor::new(),
+            objectives: ObjectivePredictor::new(),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -70,6 +74,7 @@ impl RecommenderService {
             cache,
             ctr_predictor: CtrPredictor::new(),
             dwell_predictor: DwellPredictor::new(),
+            objectives: ObjectivePredictor::new(),
             auto_tuner,
         }
     }
@@ -84,11 +89,13 @@ impl RecommenderService {
     ) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
         let dwell_predictor = DwellPredictor::load_or_default().await;
+        let objectives = ObjectivePredictor::load_or_default().await;
         Self {
             pg,
             cache,
             ctr_predictor,
             dwell_predictor,
+            objectives,
             auto_tuner,
         }
     }
@@ -96,11 +103,13 @@ impl RecommenderService {
     pub async fn new_with_ml(pg: PgPool, cache: CacheManager) -> Self {
         let ctr_predictor = CtrPredictor::load_or_default().await;
         let dwell_predictor = DwellPredictor::load_or_default().await;
+        let objectives = ObjectivePredictor::load_or_default().await;
         Self {
             pg,
             cache,
             ctr_predictor,
             dwell_predictor,
+            objectives,
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -170,6 +179,48 @@ impl RecommenderService {
         &self.dwell_predictor
     }
 
+    // ─── Têtes multi-objectifs ───────────────────────────────────────────────
+
+    /// Entraîne les têtes concernées par cette interaction, à partir du même
+    /// vecteur d'impression que le CTR — voir `ml::objectives`. Retourne
+    /// `true` si au moins une tête a appris quelque chose.
+    pub fn record_objective_event(&self, features: &[f64], interaction: InteractionType) -> bool {
+        let Some(vec) = to_feature_array(features) else {
+            warn!(
+                len = features.len(),
+                "Objectifs : vecteur de features de taille invalide, ignoré"
+            );
+            return false;
+        };
+        self.objectives.record_interaction(&vec, interaction)
+    }
+
+    /// Impression expirée sans la moindre réaction : négatif pour les deux
+    /// têtes — voir `ml::ctr_sweeper`.
+    pub fn record_objective_ignored(&self, features: &[f64]) {
+        let Some(vec) = to_feature_array(features) else {
+            return;
+        };
+        self.objectives.record_ignored(&vec);
+    }
+
+    /// ((échantillons, taux) amplification, ((échantillons, taux) rejet)
+    pub fn objective_stats(&self) -> ((u64, f64), (u64, f64)) {
+        self.objectives.stats()
+    }
+
+    pub fn objective_samples(&self) -> u64 {
+        self.objectives.total_samples()
+    }
+
+    pub async fn persist_objective_models(&self) {
+        self.objectives.save().await;
+    }
+
+    pub fn objective_predictor(&self) -> &ObjectivePredictor {
+        &self.objectives
+    }
+
     /// Accès direct au pool — réservé au rattrapage hors-ligne
     /// (`services::ctr_backfill`), qui interroge `tweet_likes`/`tweet_retweets`
     /// pour lister les interactions passées avant de les reconstruire en
@@ -204,25 +255,52 @@ impl RecommenderService {
 
     /// Mémorise le vecteur de features de chaque tweet servi, pour pouvoir
     /// entraîner le modèle sur ce qu'il a réellement produit.
-    async fn record_impressions(&self, user_id: &str, page_ids: &[String], scored: &[ScoredTweet]) {
+    async fn record_impressions(
+        &self,
+        user_id: &str,
+        page_ids: &[String],
+        scored: &[ScoredTweet],
+        offset: usize,
+    ) {
         let by_id: HashMap<&str, &ScoredTweet> =
             scored.iter().map(|s| (s.tweet_id.as_str(), s)).collect();
 
         let mut stored = 0usize;
-        for tweet_id in page_ids {
+        for (index, tweet_id) in page_ids.iter().enumerate() {
             let Some(s) = by_id.get(tweet_id.as_str()) else {
                 continue;
             };
             let Some(features) = s.ctr_features.as_ref() else {
                 continue;
             };
+
+            // ── Rang réellement servi ────────────────────────────────────────
+            // Les features ont été construites au SCORING, avant la
+            // pagination : elles portent donc la position neutre de tête de
+            // page, celle qui sert à classer. C'est ici, et seulement ici,
+            // qu'on sait à quelle place ce tweet est effectivement parti.
+            //
+            // C'est ce rang-là qu'il faut mémoriser pour l'entraînement : un
+            // tweet en position 40 cliqué vaut bien plus qu'un tweet en
+            // position 1 cliqué, et sans cette distinction le modèle attribue
+            // au CONTENU ce qui n'est qu'un effet de rang — puis remonte
+            // encore ce qui était déjà en tête. Voir
+            // `ctr_predictor::POSITION_FEATURE`.
+            //
+            // `offset + index` et pas `index` : une deuxième page servie
+            // commence au rang 50, pas au rang 0.
+            let mut features = features.clone();
+            if let Some(slot) = features.get_mut(crate::ml::ctr_predictor::POSITION_FEATURE) {
+                *slot = crate::ml::ctr_predictor::position_discount(offset + index);
+            }
+
             self.cache
-                .record_impression(user_id, tweet_id, features)
+                .record_impression(user_id, tweet_id, &features)
                 .await;
             stored += 1;
         }
         if stored > 0 {
-            debug!(user_id, stored, "Impressions CTR mémorisées");
+            debug!(user_id, stored, offset, "Impressions CTR mémorisées");
         }
     }
 
@@ -263,6 +341,7 @@ impl RecommenderService {
                 // l'écartent comme orpheline — un tweet perdu par page, contre
                 // une pagination qui reste alignée sur des bornes fixes.
                 let threads = thread_links(&page);
+                let scores = page_scores(&page);
                 let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
                 let mut response = self.build_empty_response(
                     &req.user_id,
@@ -273,6 +352,7 @@ impl RecommenderService {
                     true,
                 );
                 response.threads = threads;
+                response.scores = scores;
                 // Les publicités sont choisies MÊME sur un service depuis le
                 // cache : le classement des tweets peut être resservi tel
                 // quel, pas le choix publicitaire, qui dépend du plafond de
@@ -580,7 +660,9 @@ impl RecommenderService {
 
         // Le lien de fil est figé ICI, tant qu'on a encore les tweets complets :
         // après la mise en cache il ne reste que des identifiants.
-        let all_entries = as_feed_entries(&all_ids, &tweet_map);
+        let score_by_id: HashMap<&str, f64> =
+            scored.iter().map(|s| (s.tweet_id.as_str(), s.score)).collect();
+        let all_entries = as_feed_entries(&all_ids, &tweet_map, &score_by_id, &profile);
 
         let adaptive_ttl = adaptive_ttl(&profile, &mode);
         debug!(ttl_seconds = adaptive_ttl, "Setting cache TTL");
@@ -591,6 +673,7 @@ impl RecommenderService {
         let total_available = self.count_available(&req.user_id).await.unwrap_or(1000);
         let page: Vec<FeedEntry> = all_entries.into_iter().skip(offset).take(limit).collect();
         let threads = thread_links(&page);
+        let page_scores = page_scores(&page);
         let page_ids: Vec<String> = page.into_iter().map(|entry| entry.id).collect();
         let count = page_ids.len();
         debug!(
@@ -605,7 +688,7 @@ impl RecommenderService {
         // Uniquement les tweets réellement renvoyés : ceux qui sortent de la
         // pagination n'ont jamais été exposés au lecteur, les compter en
         // négatif fabriquerait des rejets qui n'ont pas eu lieu.
-        self.record_impressions(&req.user_id, &page_ids, &scored)
+        self.record_impressions(&req.user_id, &page_ids, &scored, offset)
             .await;
         let experiment_assignments = if req.enable_experiments.unwrap_or(false) {
             experiments::assign_variants(&self.pg, &req.user_id, &page_ids)
@@ -639,6 +722,7 @@ impl RecommenderService {
             user_id: req.user_id.clone(),
             tweet_ids: page_ids,
             threads,
+            scores: page_scores,
             ads,
             count,
             algorithm: "NeuralRank Fusion",
@@ -760,6 +844,9 @@ impl RecommenderService {
         // repérer deux catégories dégradantes.
         let mut theme_count: HashMap<String, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
+        // Forme du fil tenue au fil de l'eau — voir `FeedShape`. D6 la
+        // recalculait en parcourant tout le fil deja score a chaque candidat.
+        let mut feed_shape = FeedShape::empty();
         let (ctr_samples, _) = self.ctr_predictor.stats();
         // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
         let use_ml = ctr_samples >= 200;
@@ -792,7 +879,7 @@ impl RecommenderService {
             //   part : un compte `Ghosted` n'était que rétrogradé (×0,05), donc
             //   toujours capable d'atteindre les Tendances avec un pic
             //   d'engagement suffisant.
-            let follows_author = profile.following_ids.contains(&tweet.user_id);
+            let follows_author = profile.follows(&tweet.user_id);
             let surface = ShadowbanEnforcer::effective_surface(tweet, mode, follows_author);
             let signals = detector.detect(tweet);
             let eligibility = content_eligibility(tweet, &signals);
@@ -849,7 +936,7 @@ impl RecommenderService {
                 tweet,
                 profile,
                 ac,
-                &scored_feed,
+                feed_shape,
                 if use_ml {
                     Some(&self.ctr_predictor)
                 } else {
@@ -860,6 +947,10 @@ impl RecommenderService {
                 } else {
                     None
                 },
+                // Chaque tête porte son propre seuil de démarrage à froid en
+                // interne : passer le prédicteur ne suffit pas à le faire
+                // peser, il faut qu'il ait appris.
+                Some(&self.objectives),
                 realtime_boost,
                 weights,
             );
@@ -907,7 +998,7 @@ impl RecommenderService {
                 }
                 RecommendMode::Discover => {
                     let mut multiplier = 1.0;
-                    if profile.following_ids.contains(&tweet.user_id) {
+                    if profile.follows(&tweet.user_id) {
                         multiplier *= 0.65;
                         trace!(tweet_id = %tweet.id, "Discover: user follows author, reducing score by 35%");
                     }
@@ -990,6 +1081,7 @@ impl RecommenderService {
             }
 
             *author_count.entry(tweet.user_id.clone()).or_insert(0) += 1;
+            feed_shape.push(tweet.has_media);
             scored_feed.push(s);
         }
 
@@ -1069,8 +1161,16 @@ impl RecommenderService {
     // méthode — celle qui alimente déjà chaque recommandation servie.
     pub(crate) async fn build_user_profile(&self, user_id: &str) -> Result<UserProfile> {
         let cache_key = format!("twitninf:profile:{}", user_id);
-        if let Some(cached) = self.cache.get_profile(&cache_key).await {
+        if let Some(mut cached) = self.cache.get_profile(&cache_key).await {
             debug!(user_id, "Profile loaded from cache");
+            // Les index d'appartenance ne sont pas sérialisés (`serde(skip)`) :
+            // un profil relu du cache arrive avec des ensembles VIDES, et
+            // `follows()` répondrait alors « non » pour tout le monde — le
+            // boost d'abonnement et D3 tomberaient silencieusement à zéro pour
+            // tous les lecteurs dont le profil est en cache, c'est-à-dire la
+            // quasi-totalité. Reconstruire ici n'est pas une optimisation,
+            // c'est la condition de justesse du montage.
+            cached.rebuild_indexes();
             return Ok(cached);
         }
 
@@ -1390,8 +1490,14 @@ impl RecommenderService {
             trace!(blocked_count = profile.blocked_ids.len(), "Blocked accounts loaded");
         }
 
+        // Index d'appartenance : construits une fois ici, relus des milliers de
+        // fois pendant le scoring. Voir `UserProfile::rebuild_indexes`.
+        profile.rebuild_indexes();
+
         debug!(
             profile_confidence = profile.profile_confidence,
+            following_indexed = profile.following_set.len(),
+            seen_indexed = profile.seen_set.len(),
             "User profile built and cached"
         );
         self.cache.set_profile(&cache_key, &profile).await;
@@ -1810,6 +1916,7 @@ impl RecommenderService {
             user_id: user_id.to_string(),
             tweet_ids,
             threads: Vec::new(),
+            scores: Vec::new(),
             count,
             algorithm: "NeuralRank Fusion",
             algorithm_version: "2.2.0 — 8 dimensions + ML CTR + bandit + adaptive A/B",
@@ -2252,13 +2359,13 @@ fn cold_start_follow_multiplier(profile: &UserProfile) -> f64 {
 fn apply_follow_boost(score: f64, tweet: &RawTweet, profile: &UserProfile, mode: &str) -> f64 {
     let mut boost = 1.0;
 
-    if profile.following_ids.contains(&tweet.user_id) {
+    if profile.follows(&tweet.user_id) {
         boost *= FOLLOW_FEED_BOOST;
         let cold = cold_start_follow_multiplier(profile);
         boost *= cold;
         trace!(tweet_id = %tweet.id, mode, cold_start = cold, "Follow boost applied");
     }
-    if profile.mutual_follow_ids.contains(&tweet.user_id) {
+    if profile.is_mutual(&tweet.user_id) {
         boost *= FOLLOW_MUTUAL_BOOST;
         trace!(tweet_id = %tweet.id, mode, "Mutual follow boost applied");
     }
@@ -2770,19 +2877,48 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
 /// présent ailleurs dans la liste ne compte pas : ce champ décrit ce que
 /// l'écran montre — « le tweet juste au-dessus est celui auquel je réponds » —
 /// et pas la généalogie du tweet, que la base connaît déjà.
-fn as_feed_entries(ids: &[String], tweets: &HashMap<&str, &RawTweet>) -> Vec<FeedEntry> {
+fn as_feed_entries(
+    ids: &[String],
+    tweets: &HashMap<&str, &RawTweet>,
+    scores: &HashMap<&str, f64>,
+    profile: &UserProfile,
+) -> Vec<FeedEntry> {
     ids.iter()
         .enumerate()
         .map(|(i, id)| {
-            let parent_id = tweets
-                .get(id.as_str())
+            let tweet = tweets.get(id.as_str());
+            let parent_id = tweet
                 .and_then(|t| t.parent_tweet_id.as_deref())
                 .filter(|parent| i > 0 && ids[i - 1] == *parent)
                 .map(String::from);
             FeedEntry {
                 id: id.clone(),
                 parent_id,
+                score: scores.get(id.as_str()).copied().unwrap_or(0.0),
+                // Calculée ICI, au même endroit et pour la même raison que le
+                // lien de fil : c'est le dernier instant où l'on dispose
+                // encore du tweet complet ET du profil. Après la mise en
+                // cache il ne reste que des identifiants.
+                confidence: tweet
+                    .map(|t| crate::algorithm::scoring::ranking_confidence(t, profile))
+                    .unwrap_or(0.0),
             }
+        })
+        .collect()
+}
+
+/// Traduit les entrées d'une page en scores exposables.
+///
+/// Séparé de `thread_links` bien que les deux parcourent la même page : l'un
+/// décrit la structure du fil, l'autre ce que le moteur a pensé de chaque
+/// tweet. Les fusionner obligerait tout client qui veut l'un à comprendre
+/// l'autre.
+fn page_scores(page: &[FeedEntry]) -> Vec<TweetScore> {
+    page.iter()
+        .map(|entry| TweetScore {
+            tweet_id: entry.id.clone(),
+            score: entry.score,
+            confidence: entry.confidence,
         })
         .collect()
 }
@@ -3030,11 +3166,14 @@ mod tests {
     // ─── Poids des abonnements ───────────────────────────────────────────────
 
     fn profile_following(author: &str, interactions: usize) -> UserProfile {
-        UserProfile {
+        let mut p = UserProfile {
             following_ids: vec![author.to_string()],
             liked_tweet_ids: (0..interactions).map(|i| format!("t{i}")).collect(),
             ..Default::default()
-        }
+        };
+        // Comme en production : un profil n'est utilisable qu'index construit.
+        p.rebuild_indexes();
+        p
     }
 
     fn tweet_by(author: &str) -> RawTweet {
@@ -3119,6 +3258,17 @@ mod tests {
     // ─── Étalement par auteur ────────────────────────────────────────────────
 
     /// Construit la table `id -> tweet` attendue par `spread_by_author`.
+
+    /// Les deux tests de lien de fil ne s'intéressent qu'à l'adjacence
+    /// parent/réponse. Score et confiance n'entrent pas dans ce calcul :
+    /// ce raccourci évite de les fabriquer pour rien.
+    fn entries_for_test<'a>(
+        ids: &[String],
+        tweets: &HashMap<&'a str, &'a RawTweet>,
+    ) -> Vec<FeedEntry> {
+        as_feed_entries(ids, tweets, &HashMap::new(), &UserProfile::default())
+    }
+
     fn index<'a>(raw: &'a [RawTweet]) -> HashMap<&'a str, &'a RawTweet> {
         raw.iter().map(|t| (t.id.as_str(), t)).collect()
     }
@@ -3305,7 +3455,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
 
-        let links = thread_links(&as_feed_entries(&ids, &index(&raw)));
+        let links = thread_links(&entries_for_test(&ids, &index(&raw)));
 
         assert_eq!(links.len(), 2, "deux reponses, deux liens : {links:?}");
         assert_eq!(links[0].tweet_id, "mid");
@@ -3329,7 +3479,7 @@ mod tests {
         let raw = vec![reply("rep", "parent_hors_page"), tweet("autre")];
         let ids: Vec<String> = ["rep", "autre"].iter().map(|s| s.to_string()).collect();
 
-        let entries = as_feed_entries(&ids, &index(&raw));
+        let entries = entries_for_test(&ids, &index(&raw));
         assert_eq!(
             entries[0].parent_id, None,
             "aucun parent adjacent : {entries:?}"

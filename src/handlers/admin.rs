@@ -463,6 +463,9 @@ pub async fn admin_algo_stats_handler(
     let ml_active = ctr_samples >= 200;
     let (dwell_samples, dwell_mean_weight) = state.recommender.dwell_stats();
     let dwell_active = dwell_samples >= 200;
+    let ((amplify_samples, amplify_rate), (reject_samples, reject_rate)) =
+        state.recommender.objective_stats();
+    let min_objective = crate::ml::objectives::MIN_SAMPLES;
 
     (
         StatusCode::OK,
@@ -475,7 +478,89 @@ pub async fn admin_algo_stats_handler(
             dwell_samples,
             dwell_mean_weight,
             dwell_active,
-            algorithm_version: "2.2.0 — 8D + ML CTR + dwell predictor + bandit + garbage filter + admin node",
+            amplify_samples,
+            amplify_rate,
+            amplify_active: amplify_samples >= min_objective,
+            reject_samples,
+            reject_rate,
+            reject_active: reject_samples >= min_objective,
+            algorithm_version: "2.3.0 — 9D + multi-objectif (CTR, dwell, amplification, rejet) + bandit + admin node",
+        })),
+    )
+}
+
+
+// ─── GET /admin/algo/eval ──────────────────────────────────────────────────────
+//
+// Qualité MESURÉE des modèles, et non ce qu'ils ont vu.
+//
+// `/admin/algo/stats` répond « combien d'échantillons » et « quel taux de
+// base ». Aucun des deux ne dit si un modèle prédit quoi que ce soit d'utile :
+// un modèle qui renvoie la même valeur pour tous les tweets affiche exactement
+// les mêmes chiffres qu'un modèle parfait. C'est ce trou que cette route
+// comble.
+//
+// Les métriques viennent d'une validation progressive — chaque prédiction est
+// enregistrée AVANT que le modèle n'apprenne l'échantillon correspondant, donc
+// hors-échantillon par construction. Voir `crate::eval`.
+//
+// Comment lire la réponse :
+//   * `auc` proche de 0,50 → le modèle n'ordonne rien, il ne fait que décaler
+//     tous les scores de la même façon. C'est LE chiffre à regarder en
+//     premier : tant qu'il ne dépasse pas nettement 0,50, aucun réglage de
+//     poids ne peut améliorer le fil.
+//   * `calibration_error` élevée avec une bonne `auc` → le modèle classe bien
+//     mais ses valeurs sont fausses. Il reste utilisable pour ordonner, mais
+//     toute somme pondérée qui le mélange à d'autres signaux — c'est
+//     exactement ce que fait le classement — lui donne un poids faussé.
+//   * `positive_rate` nul après des milliers d'échantillons → étiquetage cassé
+//     ou signal qui n'arrive pas, pas un public sans réaction.
+//   * `null` partout → moins de `MIN_SAMPLES_FOR_METRICS` couples. On ne
+//     publie pas un chiffre qui invite à conclure sur trente observations.
+//
+// `calibration_gain` répond à la suite logique du deuxième point : « et si on
+// recalibrait ? ». Pour chaque tête, l'ECE avant, l'ECE après une mise à
+// l'échelle de Platt, et les deux paramètres ajustés. RIEN N'EST APPLIQUÉ au
+// classement — c'est une mesure, pas un réglage.
+//
+// Deux pièges de lecture :
+//   * le gain est ajusté PUIS mesuré sur la même fenêtre : c'est un PLAFOND,
+//     pas ce qu'on obtiendrait en production. Un plafond faible est en revanche
+//     une réponse ferme — inutile de brancher quoi que ce soit.
+//   * `calibrator: null` avec assez d'échantillons veut dire que l'ajustement a
+//     été REFUSÉ, presque toujours pour une pente négative : sur cette fenêtre,
+//     plus la tête annonce haut, moins l'événement arrive. Ce n'est pas un
+//     problème de calibration, c'est une tête qui n'ordonne rien — regarder
+//     `auc` (elle sera sous 0,50), pas la calibration.
+pub async fn admin_algo_eval_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    let (amplify, reject) = state.recommender.objective_predictor().eval_reports();
+    let (gain_amplify, gain_reject) =
+        state.recommender.objective_predictor().calibration_gains();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "method": "validation progressive (prequential) sur fenetre glissante",
+            "window": crate::eval::WINDOW,
+            "min_samples_for_metrics": crate::eval::MIN_SAMPLES_FOR_METRICS,
+            "models": {
+                "ctr": state.recommender.ctr_predictor().eval_report(),
+                "dwell": state.recommender.dwell_predictor().eval_report(),
+                "amplify": amplify,
+                "reject": reject,
+            },
+            "calibration_gain": {
+                "ctr": state.recommender.ctr_predictor().calibration_gain(),
+                "dwell": state.recommender.dwell_predictor().calibration_gain(),
+                "amplify": gain_amplify,
+                "reject": gain_reject,
+            }
         })),
     )
 }

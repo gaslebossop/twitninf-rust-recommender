@@ -77,6 +77,37 @@ pub async fn track_handler(
         );
     }
 
+    // ── Un lecteur ne se signale pas lui-meme ────────────────────────
+    // L'audit de l'ecran mobile a releve que le menu « ... » du fil
+    // proposait « Signaler », « Ignorer » et « Bloquer » sur les tweets
+    // de l'utilisateur LUI-MEME (il lisait une liste figee). Des
+    // `skip`/`report`/`block` ont donc pu partir avec
+    // `author_id == user_id`.
+    //
+    // Sans cette garde, un tel evenement mettrait le lecteur en sourdine
+    // dans son propre fil (`damp_author_by`) et abimerait le bras de
+    // bandit de son propre compte, pour tout le monde. Le geste est
+    // accepte — il vaut pour ce tweet-la — mais il ne porte jamais sur
+    // le compte.
+    //
+    // La garde vit ici et pas seulement cote client : un correctif
+    // d'ecran ne protege que la version installee, et l'ancienne
+    // continuera d'emettre pendant des semaines.
+    let targets_self = req
+        .author_id
+        .as_deref()
+        .is_some_and(|author_id| author_id == req.user_id);
+    if targets_self {
+        warn!(user_id = %req.user_id, tweet_id = %req.tweet_id,
+              interaction = ?req.interaction_type,
+              "Interaction du lecteur sur son propre compte : ne portera pas sur l'auteur");
+    }
+    let author_id_for_account = if targets_self {
+        None
+    } else {
+        req.author_id.as_deref()
+    };
+
     let weight = req.interaction_type.weight();
 
     // Le temps passé est rapporté au temps que CE contenu demandait, pas jugé
@@ -164,39 +195,67 @@ pub async fn track_handler(
         state.cache.invalidate_recommendations(&req.user_id).await;
     }
 
-    // ── « Ça ne m'intéresse pas » : la réponse doit se voir ──────────
-    // Deux effets, parce qu'un seul ne suffit pas :
-    //   * le tweet est marqué vu, donc il ne peut plus revenir ;
-    //   * l'AUTEUR est mis en sourdine pour ce lecteur (voir
-    //     `author_damping`) — c'est le seul niveau où le refus produit
-    //     un changement perceptible dans le fil, mesures de Mozilla sur
-    //     YouTube à l'appui.
-    // Sans `author_id` (client ancien) seul le premier effet s'applique,
-    // ce qui redonne exactement le bouton décoratif qu'on veut éviter :
-    // à surveiller si le geste paraît sans effet.
-    if req.interaction_type == crate::models::InteractionType::NotInterested {
+    // ── Refus explicites : la réponse doit se VOIR dans le fil ──────
+    //
+    // Trois gestes disent « je n'en veux pas », de plus en plus fort :
+    // « ça ne m'intéresse pas », un signalement, un blocage. Chacun
+    // marque le tweet vu — il ne peut donc plus revenir — et met
+    // l'AUTEUR en sourdine pour ce lecteur, avec un poids qui dépend du
+    // geste (voir `InteractionType::refusal_strikes`).
+    //
+    // Ce qui a changé : seul « ça ne m'intéresse pas » agissait, alors
+    // que c'est le PLUS FAIBLE des trois. Un signalement et un blocage
+    // ne marquaient même pas le tweet vu — leur poids est négatif (-12
+    // et -20), donc ils tombaient sous le `total_weight > 0.0` du
+    // marquage plus haut, et aucune branche explicite ne les
+    // rattrapait. Un tweet signalé pouvait revenir dans le fil de la
+    // personne qui venait de le signaler.
+    //
+    // Le blocage passe par ailleurs par `user_follows.status = 'blocked'`
+    // côté API, ce qui l'exclut du vivier via `UserProfile::blocked_ids`.
+    // Mais cette écriture appartient à une autre couche, sur un autre
+    // chemin : le classement ne doit pas dépendre d'elle pour honorer un
+    // geste que le lecteur vient de faire ici.
+    //
+    // Porter le refus sur l'AUTEUR et pas seulement sur le tweet est le
+    // point décisif — mesuré par Mozilla sur YouTube : le bouton « pas
+    // intéressé » n'évite que ~11 % des recommandations non voulues,
+    // quand « ne plus recommander cette chaîne » en évite 43 %. Écarter
+    // un tweet parmi les mille du même compte ne change rien de
+    // perceptible, et l'utilisateur en conclut — à raison — que le
+    // bouton est décoratif.
+    if let Some(strikes) = req.interaction_type.refusal_strikes() {
         state
             .cache
             .mark_tweet_seen(&req.user_id, &req.tweet_id)
             .await;
-        match req.author_id.as_deref() {
+        match author_id_for_account {
             Some(author_id) if uuid::Uuid::parse_str(author_id).is_ok() => {
-                state.cache.damp_author(&req.user_id, author_id).await;
-                info!(user_id = %req.user_id, author_id, "Author damped by explicit disinterest");
+                state
+                    .cache
+                    .damp_author_by(&req.user_id, author_id, strikes)
+                    .await;
+                info!(user_id = %req.user_id, author_id, strikes,
+                      interaction = ?req.interaction_type,
+                      "Auteur mis en sourdine par un refus explicite");
             }
+            // Sans `author_id` (client ancien) seul le marquage s'applique,
+            // ce qui redonne exactement le bouton décoratif qu'on veut
+            // éviter : à surveiller si le geste paraît sans effet.
             _ => warn!(user_id = %req.user_id, tweet_id = %req.tweet_id,
-                               "NotInterested sans author_id : le refus ne portera que sur ce tweet"),
+                       interaction = ?req.interaction_type,
+                       "Refus sans author_id : il ne portera que sur ce tweet"),
         }
     }
 
-    // ── « Skip » doit aussi marquer vu ────────────────────────────────
+    // ── « Skip » marque vu, sans viser l'auteur ──────────────────────
     // Le menu du fil promet « il n'apparaîtra plus » sur ce geste, tenu
     // côté client par un retrait local de la ligne — mais sans ceci le
     // moteur ne l'a jamais marqué vu (Skip pèse -0.5, sous le seuil de
     // `total_weight > 0.0` plus haut) et le tweet revient à la session
     // suivante. Volontairement SANS mise en sourdine de l'auteur,
-    // contrairement à `NotInterested` juste au-dessus : ignorer UN tweet
-    // ne dit rien de son auteur.
+    // contrairement aux trois refus ci-dessus : ignorer UN tweet ne dit
+    // rien de son auteur.
     if req.interaction_type == crate::models::InteractionType::Skip {
         state
             .cache
@@ -219,6 +278,13 @@ pub async fn track_handler(
             {
                 Some(features) => {
                     state.recommender.record_ctr_event(&features, clicked);
+                    // Mêmes features, autres lectures : les têtes
+                    // multi-objectifs apprennent de CE geste précis, pas du
+                    // booléen « engagé / pas engagé » qui les confondrait
+                    // toutes. Voir `ml::objectives`.
+                    state
+                        .recommender
+                        .record_objective_event(&features, req.interaction_type);
                 }
                 None => {
                     debug!(user_id = %req.user_id, tweet_id = %req.tweet_id,
@@ -239,7 +305,7 @@ pub async fn track_handler(
     // ce lecteur-là, tout de suite, sur sa page suivante — voir
     // `services::feedback_loop`.
     if let Some(clicked) = req.interaction_type.ctr_label() {
-        if let Some(author_id) = req.author_id.as_deref() {
+        if let Some(author_id) = author_id_for_account {
             if uuid::Uuid::parse_str(author_id).is_ok() {
                 state
                     .cache
@@ -270,7 +336,7 @@ pub async fn track_handler(
     const FIRM_POSITIVE_DWELL_BONUS: f64 = 0.3; // ~consommation complète ou plus
     const FIRM_NEGATIVE_DWELL_BONUS: f64 = 0.0; // dwell_weight est déjà dans sa branche « survol »
     if req.interaction_type == crate::models::InteractionType::View && dwell_context.is_some() {
-        if let Some(author_id) = req.author_id.as_deref() {
+        if let Some(author_id) = author_id_for_account {
             if uuid::Uuid::parse_str(author_id).is_ok() {
                 if dwell_bonus > FIRM_POSITIVE_DWELL_BONUS {
                     state
@@ -292,7 +358,7 @@ pub async fn track_handler(
     // le plus intentionnel, celui qui ressemble le moins à un survol. Voir
     // `crate::cooccurrence`.
     if req.interaction_type == crate::models::InteractionType::Like {
-        if let Some(author_id) = req.author_id.as_deref() {
+        if let Some(author_id) = author_id_for_account {
             if uuid::Uuid::parse_str(author_id).is_ok() {
                 state
                     .cache

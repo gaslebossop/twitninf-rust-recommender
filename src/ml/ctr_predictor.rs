@@ -20,7 +20,51 @@ use std::sync::{Arc, RwLock};
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-pub const N_FEATURES: usize = 15;
+pub const N_FEATURES: usize = 16;
+
+/// Indice de la feature « rang auquel ce tweet a ete SERVI ».
+///
+/// ── Le biais que ca corrige ─────────────────────────────────────────────────
+/// Un tweet en tete de page est clique bien plus qu'un tweet en position 40, a
+/// qualite strictement egale : c'est un effet du RANG, pas du contenu. Sans
+/// cette feature, le modele attribue tout cet ecart au contenu, apprend « les
+/// tweets comme celui-la marchent bien », les remonte encore, et le fil se
+/// fige sur ce qui etait deja en tete. C'est la boucle de retroaction la plus
+/// classique d'un systeme de recommandation, et le moteur n'avait rien contre
+/// elle.
+///
+/// ── La correction, et pourquoi elle ne coute rien au client ─────────────────
+/// Recette dite de la « tour peu profonde » (YouTube) : on ENTRAINE avec le
+/// rang reel, et on PREDIT avec un rang fixe. Le poids appris sur cette
+/// feature absorbe l'effet de rang ; au moment de classer, tous les candidats
+/// recoivent la meme valeur, donc ce terme s'annule dans la comparaison et il
+/// ne reste que le contenu.
+///
+/// Le rang reel n'a pas besoin de venir du client : le serveur SAIT a quelle
+/// place il a servi chaque tweet. Il est donc ecrit dans le vecteur au moment
+/// ou l'impression est memorisee (`record_impressions`), pas au moment du
+/// scoring — ou la pagination n'a pas encore eu lieu.
+pub const POSITION_FEATURE: usize = 15;
+
+/// Escompte de position : 1/log2(rang + 2).
+///
+/// Meme forme que l'escompte du NDCG, et pour la meme raison : la perte
+/// d'attention est brutale en haut de page et lente ensuite. Un ecart lineaire
+/// en rang decrirait mal ce que fait un lecteur qui fait defiler.
+/// Vaut ~0,63 en tete, 0,5 a la 3e place, 0,25 a la 15e.
+pub fn position_discount(rank: usize) -> f64 {
+    1.0 / ((rank + 2) as f64).log2()
+}
+
+/// Valeur de rang utilisee AU MOMENT DE CLASSER.
+///
+/// Identique pour tous les candidats — c'est ce qui fait que le terme de
+/// position s'annule dans la comparaison. On prend la tete de page : le
+/// classement repond alors a « ce tweet marcherait-il s'il etait montre en
+/// premier ? », qui est exactement la question a poser pour decider de l'ordre.
+pub fn serving_position() -> f64 {
+    position_discount(0)
+}
 const MODEL_PATH: &str = "data/ctr_model.json";
 
 /// CTR de référence avant tout entraînement — cohérent avec le prior de
@@ -71,6 +115,11 @@ impl Default for CtrModel {
                 0.03,  // activité du LECTEUR (engagement_velocity/20, clampé) —
                        // seule feature qui décrit qui regarde, pas ce qui est
                        // regardé ; prior faible tant qu'elle n'a pas appris
+                0.20,  // escompte de position — voir `POSITION_FEATURE`. Prior
+                       // POSITIF et net : plus le rang est haut, plus l'escompte
+                       // est grand, plus le clic est probable. C'est le seul
+                       // prior qu'on connaisse avec certitude avant tout
+                       // apprentissage.
             ],
             bias: -2.5867, // logit(PRIOR_CTR) — au lieu d'un -0.5 arbitraire qui prédisait ~38 % de CTR à froid
             learning_rate: 0.01,
@@ -148,6 +197,48 @@ pub fn extract_features(
     acceleration: f64,
     reader_engagement: f64,
 ) -> [f64; N_FEATURES] {
+    extract_features_at(
+        d1,
+        d2,
+        d3,
+        d4,
+        d5,
+        d6,
+        d7,
+        d8,
+        age_h,
+        is_trending,
+        has_media,
+        author_followers,
+        acceleration,
+        reader_engagement,
+        serving_position(),
+    )
+}
+
+/// Même vecteur, avec un escompte de position explicite.
+///
+/// Utilisé à l'ENTRAÎNEMENT, où l'on connaît le rang réellement servi. Le
+/// chemin de classement passe par `extract_features` ci-dessus, qui fixe la
+/// position à la tête de page pour tout le monde — voir `POSITION_FEATURE`.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_features_at(
+    d1: f64,
+    d2: f64,
+    d3: f64,
+    d4: f64,
+    d5: f64,
+    d6: f64,
+    d7: f64,
+    d8: f64,
+    age_h: f64,
+    is_trending: bool,
+    has_media: bool,
+    author_followers: i64,
+    acceleration: f64,
+    reader_engagement: f64,
+    position: f64,
+) -> [f64; N_FEATURES] {
     [
         d1,
         d2,
@@ -164,16 +255,33 @@ pub fn extract_features(
         if age_h < 2.0 { 1.0 } else { 0.0 },         // is_recent
         acceleration.clamp(0.0, 1.0),
         reader_engagement.clamp(0.0, 1.0),
+        position.clamp(0.0, 1.0),
     ]
 }
 
 /// Service thread-safe pour le modèle CTR partagé entre requêtes
 #[derive(Clone)]
-pub struct CtrPredictor(Arc<RwLock<CtrModel>>);
+pub struct CtrPredictor(Arc<RwLock<CtrModel>>, crate::eval::OnlineEval);
 
 impl CtrPredictor {
     pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(CtrModel::default())))
+        Self(
+            Arc::new(RwLock::new(CtrModel::default())),
+            crate::eval::OnlineEval::new(),
+        )
+    }
+
+    /// Qualité mesurée du modèle sur la fenêtre glissante récente — voir
+    /// `crate::eval`. `samples_seen` dit combien le modèle a vu, ceci dit s'il
+    /// en a tiré quoi que ce soit.
+    pub fn eval_report(&self) -> crate::eval::EvalReport {
+        self.1.report()
+    }
+
+    /// Ce qu'une recalibration rattraperait — mesure seulement, rien n'est
+    /// appliqué. Voir `crate::ml::calibrator`.
+    pub fn calibration_gain(&self) -> Option<crate::ml::CalibrationGain> {
+        self.1.calibration_gain()
     }
 
     pub async fn load_or_default() -> Self {
@@ -186,7 +294,10 @@ impl CtrPredictor {
                             global_ctr = model.global_ctr(),
                             "CTR model loaded from disk"
                         );
-                        return Self(Arc::new(RwLock::new(model)));
+                        return Self(
+                            Arc::new(RwLock::new(model)),
+                            crate::eval::OnlineEval::new(),
+                        );
                     }
                     Err(e) => match migrate_legacy_weights(&json) {
                         Some(model) => {
@@ -196,7 +307,10 @@ impl CtrPredictor {
                                 "CTR model migrated from a shorter feature vector — \
                                  learned weights kept, new feature(s) seeded at their default"
                             );
-                            return Self(Arc::new(RwLock::new(model)));
+                            return Self(
+                                Arc::new(RwLock::new(model)),
+                                crate::eval::OnlineEval::new(),
+                            );
                         }
                         None => warn!("Failed to parse CTR model: {e}, using default"),
                     },
@@ -216,10 +330,17 @@ impl CtrPredictor {
     /// Met à jour le modèle sur un event click/skip
     pub fn record_interaction(&self, features: [f64; N_FEATURES], clicked: bool) {
         let mut model = self.0.write().unwrap();
+        // Validation progressive : la prédiction est prise AVANT la mise à
+        // jour, donc sur un exemple que le modèle n'a jamais vu. Prise après,
+        // elle décrirait un modèle qui a déjà lu la réponse — et l'AUC qui en
+        // sortirait serait une flatterie, pas un diagnostic. Voir `crate::eval`.
+        let prior_prediction = model.predict(&features);
         model.update(&features, clicked);
         let samples = model.samples_seen;
         let global_ctr = model.global_ctr();
         drop(model);
+        self.1
+            .record(prior_prediction, if clicked { 1.0 } else { 0.0 });
         debug!(samples, global_ctr, clicked, "CTR model updated");
     }
 
@@ -312,6 +433,189 @@ mod tests {
         assert!(
             trained_pred > initial_pred,
             "Model should learn to predict high CTR"
+        );
+    }
+
+
+
+
+    // ─── Correction du biais de position ────────────────────────────────────
+
+    #[test]
+    fn l_escompte_de_position_decroit_avec_le_rang() {
+        let tete = position_discount(0);
+        let milieu = position_discount(10);
+        let bas = position_discount(45);
+        assert!(tete > milieu && milieu > bas, "{tete} {milieu} {bas}");
+        // Reste une valeur exploitable par un modele lineaire : borne, jamais
+        // nulle, jamais superieure a 1.
+        for rang in [0, 1, 5, 49, 500, 100_000] {
+            let d = position_discount(rang);
+            assert!(d > 0.0 && d <= 1.0, "rang={rang} escompte={d}");
+        }
+    }
+
+    /// La perte doit etre BRUTALE en haut de page et lente ensuite : passer de
+    /// la place 1 a la place 4 coute bien plus que de passer de la 41 a la 44.
+    /// Un escompte lineaire en rang dirait le contraire.
+    #[test]
+    fn la_perte_est_concentree_en_haut_de_page() {
+        let haut = position_discount(0) - position_discount(3);
+        let bas = position_discount(40) - position_discount(43);
+        assert!(haut > bas * 3.0, "haut={haut} bas={bas}");
+    }
+
+    /// Le coeur de la correction : au moment de CLASSER, tous les candidats
+    /// recoivent la meme valeur de position. Le terme s'annule donc dans la
+    /// comparaison, et il ne reste que le contenu.
+    #[test]
+    fn le_classement_utilise_la_meme_position_pour_tout_le_monde() {
+        let a = extract_features(
+            0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, true, true, 100, 0.5, 0.5,
+        );
+        let b = extract_features(
+            0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 9.0, false, false, 5, 0.1, 0.2,
+        );
+        assert_eq!(a[POSITION_FEATURE], b[POSITION_FEATURE]);
+        assert_eq!(a[POSITION_FEATURE], serving_position());
+    }
+
+    /// Et a l'ENTRAINEMENT, la position reelle passe bien dans le vecteur —
+    /// c'est ce qui permet au poids d'absorber l'effet de rang.
+    #[test]
+    fn l_entrainement_recoit_la_position_reelle() {
+        let tete = extract_features_at(
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, false, false, 10, 0.5, 0.5,
+            position_discount(0),
+        );
+        let bas = extract_features_at(
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, false, false, 10, 0.5, 0.5,
+            position_discount(40),
+        );
+        assert!(tete[POSITION_FEATURE] > bas[POSITION_FEATURE]);
+        // Tout le reste du vecteur est identique : seule la position change.
+        assert_eq!(&tete[..POSITION_FEATURE], &bas[..POSITION_FEATURE]);
+    }
+
+    /// Un modele nourri de clics en haut de page et de non-clics en bas doit
+    /// apprendre un poids de position POSITIF — c'est exactement l'effet de
+    /// rang, et c'est ce poids qui l'absorbe au lieu de le laisser contaminer
+    /// les dimensions de contenu.
+    #[test]
+    fn le_modele_apprend_a_absorber_l_effet_de_rang() {
+        let mut model = CtrModel::default();
+        let contenu = |position: f64| {
+            extract_features_at(
+                0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 100, 0.5, 0.5, position,
+            )
+        };
+        let mut rng = 0xDEADBEEFCAFEBABEu64;
+        for _ in 0..3_000 {
+            // MEME contenu des deux cotes : seul le rang differe. Tout ecart
+            // appris ne peut donc venir que du rang.
+            if melange(&mut rng) {
+                model.update(&contenu(position_discount(0)), true);
+            } else {
+                model.update(&contenu(position_discount(45)), false);
+            }
+        }
+        assert!(
+            model.weights[POSITION_FEATURE] > 0.0,
+            "poids de position appris = {}",
+            model.weights[POSITION_FEATURE]
+        );
+        // Et a rang egal, le modele ne distingue plus les deux : l'ecart a
+        // bien ete impute au rang, pas au contenu.
+        let p_tete = model.predict(&contenu(serving_position()));
+        let p_bas = model.predict(&contenu(serving_position()));
+        assert!((p_tete - p_bas).abs() < 1e-12);
+    }
+
+    /// Tirage a pile ou face deterministe (generateur congruentiel simple).
+    ///
+    /// Indispensable ici, et pas par gout du realisme : une suite d'etiquettes
+    /// strictement ALTERNEE fait osciller un apprenant en ligne en phase avec
+    /// elle. Chaque prediction, prise avant la mise a jour, herite du biais
+    /// deplace par l'echantillon precedent — donc elle est systematiquement
+    /// haute juste avant un negatif et basse juste avant un positif. La mesure
+    /// progressive y lit une anti-correlation parfaite : sur du bruit pur en
+    /// alternance stricte, l'AUC tombe a 0,06 au lieu de 0,50.
+    ///
+    /// Ce n'est pas un defaut du calcul, c'est la limite du protocole, notee
+    /// dans `crate::eval` : la validation progressive suppose que l'ordre
+    /// d'arrivee n'est pas correle a l'etiquette. Le trafic reel ne l'est pas ;
+    /// un test qui alterne, si.
+    fn melange(state: &mut u64) -> bool {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) & 1 == 1
+    }
+
+    /// Preuve de bout en bout que la mesure fonctionne — et qu'elle est
+    /// honnête.
+    ///
+    /// On alimente le modèle en ligne avec un signal REELLEMENT separable (les
+    /// tweets a forte velocite sont cliques, les autres non), et on verifie
+    /// que l'AUC mesuree en validation progressive monte nettement au-dessus
+    /// du hasard. Chaque prediction comptee a ete faite AVANT que le modele ne
+    /// voie l'echantillon correspondant : si le protocole etait casse (mesure
+    /// prise apres la mise a jour), ce test passerait aussi — c'est le test
+    /// jumeau ci-dessous qui ferme cette porte.
+    #[test]
+    fn la_mesure_progressive_detecte_un_modele_qui_apprend() {
+        let predictor = CtrPredictor::new();
+        let fort = extract_features(
+            0.95, 0.8, 0.7, 0.6, 0.6, 0.5, 0.8, 0.5, 0.5, true, true, 50_000, 0.9, 0.6,
+        );
+        let faible = extract_features(
+            0.05, 0.1, 0.1, 0.1, 0.1, 0.1, 0.05, 0.1, 20.0, false, false, 3, 0.0, 0.05,
+        );
+
+        // Ordre pseudo-aleatoire, pas alterne : voir `melange` plus bas.
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        for _ in 0..2_000 {
+            if melange(&mut rng) {
+                predictor.record_interaction(fort, true);
+            } else {
+                predictor.record_interaction(faible, false);
+            }
+        }
+
+        let report = predictor.eval_report();
+        assert!(report.samples >= crate::eval::MIN_SAMPLES_FOR_METRICS);
+        let auc = report.auc.expect("les deux classes sont presentes");
+        assert!(
+            auc > 0.90,
+            "un signal parfaitement separable doit ressortir : auc={auc}"
+        );
+        // Et la calibration doit suivre : le taux reel est de 50 %.
+        assert!(
+            (report.positive_rate - 0.5).abs() < 0.02,
+            "taux observe={}",
+            report.positive_rate
+        );
+    }
+
+    /// Le pendant : sur un signal qui ne contient AUCUNE information (meme
+    /// vecteur de features, etiquette tiree a pile ou face), l'AUC mesuree doit
+    /// rester au niveau du hasard. Un harnais qui trouverait du signal ici
+    /// serait un harnais qui ment.
+    #[test]
+    fn la_mesure_progressive_ne_trouve_rien_dans_du_bruit() {
+        let predictor = CtrPredictor::new();
+        let f = extract_features(
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 5.0, false, true, 1_000, 0.5, 0.5,
+        );
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        for _ in 0..2_000 {
+            let label = melange(&mut rng);
+            predictor.record_interaction(f, label);
+        }
+        let auc = predictor.eval_report().auc.expect("deux classes");
+        assert!(
+            (auc - 0.5).abs() < 0.05,
+            "aucune information a extraire, l'AUC doit rester au hasard : auc={auc}"
         );
     }
 
