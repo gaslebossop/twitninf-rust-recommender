@@ -17,8 +17,9 @@
 - Branche : `feat/algo-niveau-tiktok`, partant de `main` (`ed721da`).
 - **11 commits** (9 de l'agent + 2 de la session suivante), `+2991 / −218` sur 19 fichiers pour la
   part de l'agent.
-- Arbre **propre**. **Rien n'a été poussé** (la branche n'existe pas sur `origin`), **rien n'a été
-  fusionné dans `main`**, **rien n'a été déployé**.
+- ✅ **Fusionné dans `main`, poussé et DÉPLOYÉ en production le 2026-08-21** (merge `3e43526`).
+  Déploiement via `./deploy-vps.sh` : compilation sur le VPS, redémarrage de `rust-recommender`,
+  `/health` → `db: ok`, `redis: ok`, `NRestarts = 0`.
 
 Le 9ᵉ commit (`457ba2f`) n'est pas de l'agent : sa modification traînait **non commitée** dans
 l'arbre au moment de la coupure. Elle a été relue, vérifiée et commitée telle quelle par la session
@@ -97,9 +98,14 @@ publicitaire en ajoute qui n'en ont pas) et attachés **dans le `producer`, donc
 `withFeedCache`** — sinon une charge cachée sortirait sans eux et la question resterait muette pour
 tout lecteur tombant sur un cache chaud.
 
-⚠️ **Vérifié statiquement seulement** : syntaxe, lint, et la correspondance des trois contrats
-(Rust → API → app) par relecture. Le chemin n'a **jamais été exécuté** — il demande Postgres, Redis
-et le moteur Rust vivants. À confirmer sur un environnement réel avant de conclure quoi que ce soit.
+✅ **Confirmé sur la production le 2026-08-21.** Appel réel à `/recommendations` sur le VPS : le
+champ `scores` sort bien, avec des confiances de **0,215 et 0,083** — donc **sous le seuil de 0,45**
+qui arme la question explicite. Le déclencheur peut réellement se déclencher, ce qu'aucune
+vérification statique ne pouvait établir.
+
+Relevé au passage sur ce même appel : `candidates_collected: 78`, `deduplicated_total: 63`,
+`latency_ms: 82`. **Le vivier réel fait quelques dizaines de candidats, pas des milliers** — voir la
+section pipeline plus bas, ce chiffre la tranche.
 
 ### ✅ ~~Poser un correcteur de calibration (grille #8)~~ — **posé le 2026-08-21** (`be78533`)
 `src/ml/calibrator.rs` — mise à l'échelle de Platt, exposée sur `/admin/algo/eval`
@@ -134,10 +140,24 @@ issue de deux rafales scriptées, un quota 50/50 servirait surtout des pages cou
 À faire **après** avoir mesuré la part in/out réellement servie aujourd'hui — le harnais d'éval
 existe maintenant pour ça.
 
-### 🟡 Pipeline multi-étages (grille #1)
-Le plus gros morceau, et le moins urgent : à la volumétrie actuelle un vivier → un score tient
-encore. Et depuis `37e7bc4` il y a enfin de quoi **prouver** qu'un ranker en deux temps ferait mieux
-avant de réécrire le classement — ce qui n'était pas le cas quand la grille a été écrite.
+### 🟡 Pipeline multi-étages (grille #1) — **chiffré, et la réponse est non**
+Le principe : au lieu de noter tous les candidats avec le même modèle, noter beaucoup de candidats
+avec un modèle bon marché puis ne repasser le modèle cher que sur les survivants. C'est un
+**entonnoir de coût**, rien d'autre.
+
+Ton moteur a déjà **trois étages** (candidats → scoring → re-ranking `shape_feed`/`spread_by_author`).
+Ce qui manquerait, c'est seulement le dédoublement de l'étage de scoring en léger + lourd.
+
+**Mesuré en production le 2026-08-21 : `candidates_collected: 78`, `deduplicated_total: 63`,
+`latency_ms: 82`.** Et le banc note 1700 candidats en 5 ms. L'entonnoir existe pour éviter de payer
+cher sur un vivier énorme — ici le vivier fait quelques dizaines et le scoring complet est gratuit.
+Découper ajouterait un modèle à entraîner, évaluer et maintenir pour supprimer un coût qui n'existe
+pas, en introduisant le défaut propre à l'entonnoir : le ranker léger jette des tweets que le lourd
+aurait remontés, et cette erreur est invisible et définitive.
+
+À rouvrir si le vivier change d'ordre de grandeur (dizaines de milliers) ou si une tête ML devient
+nettement plus lourde que la régression logistique actuelle. Le harnais d'éval (`37e7bc4`) permet
+alors de le **prouver** au lieu de le parier.
 
 ## 7. Rappels qui n'ont pas changé
 
