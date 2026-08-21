@@ -77,6 +77,37 @@ pub async fn track_handler(
         );
     }
 
+    // ── Un lecteur ne se signale pas lui-meme ────────────────────────
+    // L'audit de l'ecran mobile a releve que le menu « ... » du fil
+    // proposait « Signaler », « Ignorer » et « Bloquer » sur les tweets
+    // de l'utilisateur LUI-MEME (il lisait une liste figee). Des
+    // `skip`/`report`/`block` ont donc pu partir avec
+    // `author_id == user_id`.
+    //
+    // Sans cette garde, un tel evenement mettrait le lecteur en sourdine
+    // dans son propre fil (`damp_author_by`) et abimerait le bras de
+    // bandit de son propre compte, pour tout le monde. Le geste est
+    // accepte — il vaut pour ce tweet-la — mais il ne porte jamais sur
+    // le compte.
+    //
+    // La garde vit ici et pas seulement cote client : un correctif
+    // d'ecran ne protege que la version installee, et l'ancienne
+    // continuera d'emettre pendant des semaines.
+    let targets_self = req
+        .author_id
+        .as_deref()
+        .is_some_and(|author_id| author_id == req.user_id);
+    if targets_self {
+        warn!(user_id = %req.user_id, tweet_id = %req.tweet_id,
+              interaction = ?req.interaction_type,
+              "Interaction du lecteur sur son propre compte : ne portera pas sur l'auteur");
+    }
+    let author_id_for_account = if targets_self {
+        None
+    } else {
+        req.author_id.as_deref()
+    };
+
     let weight = req.interaction_type.weight();
 
     // Le temps passé est rapporté au temps que CE contenu demandait, pas jugé
@@ -198,7 +229,7 @@ pub async fn track_handler(
             .cache
             .mark_tweet_seen(&req.user_id, &req.tweet_id)
             .await;
-        match req.author_id.as_deref() {
+        match author_id_for_account {
             Some(author_id) if uuid::Uuid::parse_str(author_id).is_ok() => {
                 state
                     .cache
@@ -274,7 +305,7 @@ pub async fn track_handler(
     // ce lecteur-là, tout de suite, sur sa page suivante — voir
     // `services::feedback_loop`.
     if let Some(clicked) = req.interaction_type.ctr_label() {
-        if let Some(author_id) = req.author_id.as_deref() {
+        if let Some(author_id) = author_id_for_account {
             if uuid::Uuid::parse_str(author_id).is_ok() {
                 state
                     .cache
@@ -305,7 +336,7 @@ pub async fn track_handler(
     const FIRM_POSITIVE_DWELL_BONUS: f64 = 0.3; // ~consommation complète ou plus
     const FIRM_NEGATIVE_DWELL_BONUS: f64 = 0.0; // dwell_weight est déjà dans sa branche « survol »
     if req.interaction_type == crate::models::InteractionType::View && dwell_context.is_some() {
-        if let Some(author_id) = req.author_id.as_deref() {
+        if let Some(author_id) = author_id_for_account {
             if uuid::Uuid::parse_str(author_id).is_ok() {
                 if dwell_bonus > FIRM_POSITIVE_DWELL_BONUS {
                     state
@@ -327,7 +358,7 @@ pub async fn track_handler(
     // le plus intentionnel, celui qui ressemble le moins à un survol. Voir
     // `crate::cooccurrence`.
     if req.interaction_type == crate::models::InteractionType::Like {
-        if let Some(author_id) = req.author_id.as_deref() {
+        if let Some(author_id) = author_id_for_account {
             if uuid::Uuid::parse_str(author_id).is_ok() {
                 state
                     .cache
