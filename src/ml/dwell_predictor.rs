@@ -122,11 +122,23 @@ impl DwellModel {
 }
 
 #[derive(Clone)]
-pub struct DwellPredictor(Arc<RwLock<DwellModel>>);
+pub struct DwellPredictor(Arc<RwLock<DwellModel>>, crate::eval::OnlineEval);
 
 impl DwellPredictor {
     pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(DwellModel::default())))
+        Self(
+            Arc::new(RwLock::new(DwellModel::default())),
+            crate::eval::OnlineEval::new(),
+        )
+    }
+
+    /// Qualité mesurée sur la fenêtre glissante récente — voir `crate::eval`.
+    ///
+    /// La cible est CONTINUE ici : le rapport porte une RMSE, pas une AUC.
+    /// Sortir une AUC d'un temps de lecture reviendrait à inventer un seuil, et
+    /// le seuil choisi déciderait du résultat.
+    pub fn eval_report(&self) -> crate::eval::EvalReport {
+        self.1.report()
     }
 
     pub async fn load_or_default() -> Self {
@@ -139,7 +151,10 @@ impl DwellPredictor {
                             mean_weight = model.running_mean_weight,
                             "Dwell model loaded from disk"
                         );
-                        return Self(Arc::new(RwLock::new(model)));
+                        return Self(
+                            Arc::new(RwLock::new(model)),
+                            crate::eval::OnlineEval::new(),
+                        );
                     }
                     Err(e) => warn!("Failed to parse dwell model: {e}, using default"),
                 },
@@ -156,10 +171,17 @@ impl DwellPredictor {
 
     pub fn record_interaction(&self, features: [f64; N_FEATURES], observed_weight: f64) {
         let mut model = self.0.write().unwrap();
+        // Validation progressive — voir `crate::eval`. Les deux valeurs sont
+        // enregistrées sur l'échelle [0,1] interne au modèle, pas sur celle du
+        // poids de dwell : une RMSE n'a de sens que si prédiction et vérité
+        // vivent sur la même échelle.
+        let prior_prediction01 = model.predict01(&features);
+        let truth01 = ((observed_weight.clamp(SKIP_PENALTY, MAX_BONUS)) - SKIP_PENALTY) / RANGE;
         model.update(&features, observed_weight);
         let samples = model.samples_seen;
         let mean_weight = model.running_mean_weight;
         drop(model);
+        self.1.record(prior_prediction01, truth01);
         debug!(samples, mean_weight, observed_weight, "Dwell model updated");
     }
 

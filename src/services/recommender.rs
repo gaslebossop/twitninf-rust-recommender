@@ -217,6 +217,10 @@ impl RecommenderService {
         self.objectives.save().await;
     }
 
+    pub fn objective_predictor(&self) -> &ObjectivePredictor {
+        &self.objectives
+    }
+
     /// Accès direct au pool — réservé au rattrapage hors-ligne
     /// (`services::ctr_backfill`), qui interroge `tweet_likes`/`tweet_retweets`
     /// pour lister les interactions passées avant de les reconstruire en

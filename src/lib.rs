@@ -20,6 +20,7 @@ pub mod calibration; // Recalibration explicite de l'algo, depuis les Paramètre
 pub mod constants;
 pub mod cooccurrence;
 pub mod embeddings;
+pub mod eval; // Mesure hors-echantillon des modeles : AUC, log-loss, calibration, NDCG
 pub mod experiments;
 pub mod handlers;
 pub mod middleware;

@@ -169,11 +169,21 @@ pub fn extract_features(
 
 /// Service thread-safe pour le modèle CTR partagé entre requêtes
 #[derive(Clone)]
-pub struct CtrPredictor(Arc<RwLock<CtrModel>>);
+pub struct CtrPredictor(Arc<RwLock<CtrModel>>, crate::eval::OnlineEval);
 
 impl CtrPredictor {
     pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(CtrModel::default())))
+        Self(
+            Arc::new(RwLock::new(CtrModel::default())),
+            crate::eval::OnlineEval::new(),
+        )
+    }
+
+    /// Qualité mesurée du modèle sur la fenêtre glissante récente — voir
+    /// `crate::eval`. `samples_seen` dit combien le modèle a vu, ceci dit s'il
+    /// en a tiré quoi que ce soit.
+    pub fn eval_report(&self) -> crate::eval::EvalReport {
+        self.1.report()
     }
 
     pub async fn load_or_default() -> Self {
@@ -186,7 +196,10 @@ impl CtrPredictor {
                             global_ctr = model.global_ctr(),
                             "CTR model loaded from disk"
                         );
-                        return Self(Arc::new(RwLock::new(model)));
+                        return Self(
+                            Arc::new(RwLock::new(model)),
+                            crate::eval::OnlineEval::new(),
+                        );
                     }
                     Err(e) => match migrate_legacy_weights(&json) {
                         Some(model) => {
@@ -196,7 +209,10 @@ impl CtrPredictor {
                                 "CTR model migrated from a shorter feature vector — \
                                  learned weights kept, new feature(s) seeded at their default"
                             );
-                            return Self(Arc::new(RwLock::new(model)));
+                            return Self(
+                                Arc::new(RwLock::new(model)),
+                                crate::eval::OnlineEval::new(),
+                            );
                         }
                         None => warn!("Failed to parse CTR model: {e}, using default"),
                     },
@@ -216,10 +232,17 @@ impl CtrPredictor {
     /// Met à jour le modèle sur un event click/skip
     pub fn record_interaction(&self, features: [f64; N_FEATURES], clicked: bool) {
         let mut model = self.0.write().unwrap();
+        // Validation progressive : la prédiction est prise AVANT la mise à
+        // jour, donc sur un exemple que le modèle n'a jamais vu. Prise après,
+        // elle décrirait un modèle qui a déjà lu la réponse — et l'AUC qui en
+        // sortirait serait une flatterie, pas un diagnostic. Voir `crate::eval`.
+        let prior_prediction = model.predict(&features);
         model.update(&features, clicked);
         let samples = model.samples_seen;
         let global_ctr = model.global_ctr();
         drop(model);
+        self.1
+            .record(prior_prediction, if clicked { 1.0 } else { 0.0 });
         debug!(samples, global_ctr, clicked, "CTR model updated");
     }
 
@@ -312,6 +335,96 @@ mod tests {
         assert!(
             trained_pred > initial_pred,
             "Model should learn to predict high CTR"
+        );
+    }
+
+
+
+    /// Tirage a pile ou face deterministe (generateur congruentiel simple).
+    ///
+    /// Indispensable ici, et pas par gout du realisme : une suite d'etiquettes
+    /// strictement ALTERNEE fait osciller un apprenant en ligne en phase avec
+    /// elle. Chaque prediction, prise avant la mise a jour, herite du biais
+    /// deplace par l'echantillon precedent — donc elle est systematiquement
+    /// haute juste avant un negatif et basse juste avant un positif. La mesure
+    /// progressive y lit une anti-correlation parfaite : sur du bruit pur en
+    /// alternance stricte, l'AUC tombe a 0,06 au lieu de 0,50.
+    ///
+    /// Ce n'est pas un defaut du calcul, c'est la limite du protocole, notee
+    /// dans `crate::eval` : la validation progressive suppose que l'ordre
+    /// d'arrivee n'est pas correle a l'etiquette. Le trafic reel ne l'est pas ;
+    /// un test qui alterne, si.
+    fn melange(state: &mut u64) -> bool {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) & 1 == 1
+    }
+
+    /// Preuve de bout en bout que la mesure fonctionne — et qu'elle est
+    /// honnête.
+    ///
+    /// On alimente le modèle en ligne avec un signal REELLEMENT separable (les
+    /// tweets a forte velocite sont cliques, les autres non), et on verifie
+    /// que l'AUC mesuree en validation progressive monte nettement au-dessus
+    /// du hasard. Chaque prediction comptee a ete faite AVANT que le modele ne
+    /// voie l'echantillon correspondant : si le protocole etait casse (mesure
+    /// prise apres la mise a jour), ce test passerait aussi — c'est le test
+    /// jumeau ci-dessous qui ferme cette porte.
+    #[test]
+    fn la_mesure_progressive_detecte_un_modele_qui_apprend() {
+        let predictor = CtrPredictor::new();
+        let fort = extract_features(
+            0.95, 0.8, 0.7, 0.6, 0.6, 0.5, 0.8, 0.5, 0.5, true, true, 50_000, 0.9, 0.6,
+        );
+        let faible = extract_features(
+            0.05, 0.1, 0.1, 0.1, 0.1, 0.1, 0.05, 0.1, 20.0, false, false, 3, 0.0, 0.05,
+        );
+
+        // Ordre pseudo-aleatoire, pas alterne : voir `melange` plus bas.
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        for _ in 0..2_000 {
+            if melange(&mut rng) {
+                predictor.record_interaction(fort, true);
+            } else {
+                predictor.record_interaction(faible, false);
+            }
+        }
+
+        let report = predictor.eval_report();
+        assert!(report.samples >= crate::eval::MIN_SAMPLES_FOR_METRICS);
+        let auc = report.auc.expect("les deux classes sont presentes");
+        assert!(
+            auc > 0.90,
+            "un signal parfaitement separable doit ressortir : auc={auc}"
+        );
+        // Et la calibration doit suivre : le taux reel est de 50 %.
+        assert!(
+            (report.positive_rate - 0.5).abs() < 0.02,
+            "taux observe={}",
+            report.positive_rate
+        );
+    }
+
+    /// Le pendant : sur un signal qui ne contient AUCUNE information (meme
+    /// vecteur de features, etiquette tiree a pile ou face), l'AUC mesuree doit
+    /// rester au niveau du hasard. Un harnais qui trouverait du signal ici
+    /// serait un harnais qui ment.
+    #[test]
+    fn la_mesure_progressive_ne_trouve_rien_dans_du_bruit() {
+        let predictor = CtrPredictor::new();
+        let f = extract_features(
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 5.0, false, true, 1_000, 0.5, 0.5,
+        );
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        for _ in 0..2_000 {
+            let label = melange(&mut rng);
+            predictor.record_interaction(f, label);
+        }
+        let auc = predictor.eval_report().auc.expect("deux classes");
+        assert!(
+            (auc - 0.5).abs() < 0.05,
+            "aucune information a extraire, l'AUC doit rester au hasard : auc={auc}"
         );
     }
 

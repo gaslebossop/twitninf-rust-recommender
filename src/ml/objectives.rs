@@ -238,11 +238,32 @@ pub struct ObjectivePredictions {
 }
 
 #[derive(Clone)]
-pub struct ObjectivePredictor(Arc<RwLock<ObjectiveModels>>);
+pub struct ObjectivePredictor {
+    models: Arc<RwLock<ObjectiveModels>>,
+    /// Une fenêtre d'évaluation par tête : le rejet est rare par construction
+    /// et apprend beaucoup plus lentement que l'amplification. Les mélanger
+    /// masquerait exactement ce qu'on cherche à voir.
+    eval_amplify: crate::eval::OnlineEval,
+    eval_reject: crate::eval::OnlineEval,
+}
 
 impl ObjectivePredictor {
     pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(ObjectiveModels::default())))
+        Self::from_models(ObjectiveModels::default())
+    }
+
+    fn from_models(models: ObjectiveModels) -> Self {
+        Self {
+            models: Arc::new(RwLock::new(models)),
+            eval_amplify: crate::eval::OnlineEval::new(),
+            eval_reject: crate::eval::OnlineEval::new(),
+        }
+    }
+
+    /// Qualité mesurée de chaque tête — (amplification, rejet). Voir
+    /// `crate::eval`.
+    pub fn eval_reports(&self) -> (crate::eval::EvalReport, crate::eval::EvalReport) {
+        (self.eval_amplify.report(), self.eval_reject.report())
     }
 
     pub async fn load_or_default() -> Self {
@@ -257,7 +278,7 @@ impl ObjectivePredictor {
                             reject_rate = models.reject.base_rate(),
                             "Têtes multi-objectifs chargées depuis le disque"
                         );
-                        return Self(Arc::new(RwLock::new(models)));
+                        return Self::from_models(models);
                     }
                     Err(e) => warn!("Têtes multi-objectifs illisibles ({e}), repart des défauts"),
                 },
@@ -272,7 +293,7 @@ impl ObjectivePredictor {
     /// c'est au classement de décider quoi en faire, pas à elle de renvoyer
     /// une valeur neutre qui aurait l'air d'une prédiction.
     pub fn predict(&self, features: &[f64; N_FEATURES]) -> ObjectivePredictions {
-        let m = self.0.read().unwrap();
+        let m = self.models.read().unwrap();
         ObjectivePredictions {
             amplify: m.amplify.is_ready().then(|| m.amplify.predict(features)),
             reject: m.reject.is_ready().then(|| m.reject.predict(features)),
@@ -293,12 +314,19 @@ impl ObjectivePredictor {
         if amplify.is_none() && reject.is_none() {
             return false;
         }
-        let mut m = self.0.write().unwrap();
+        let mut m = self.models.write().unwrap();
+        // Validation progressive : prédire AVANT d'apprendre — voir
+        // `crate::eval`.
+        let mut pending: Vec<(&crate::eval::OnlineEval, f64, f64)> = Vec::with_capacity(2);
         if let Some(positive) = amplify {
+            let prior = m.amplify.predict(features);
             m.amplify.update(features, positive);
+            pending.push((&self.eval_amplify, prior, positive as u8 as f64));
         }
         if let Some(positive) = reject {
+            let prior = m.reject.predict(features);
             m.reject.update(features, positive);
+            pending.push((&self.eval_reject, prior, positive as u8 as f64));
         }
         let stats = (
             m.amplify.samples_seen,
@@ -307,6 +335,9 @@ impl ObjectivePredictor {
             m.reject.base_rate(),
         );
         drop(m);
+        for (window, prediction, truth) in pending {
+            window.record(prediction, truth);
+        }
         debug!(
             interaction = ?interaction,
             amplify_samples = stats.0, amplify_rate = stats.1,
@@ -323,15 +354,20 @@ impl ObjectivePredictor {
     /// été relayé, et un tweet montré que personne n'a signalé n'a pas été
     /// signalé.
     pub fn record_ignored(&self, features: &[f64; N_FEATURES]) {
-        let mut m = self.0.write().unwrap();
+        let mut m = self.models.write().unwrap();
+        let prior_amplify = m.amplify.predict(features);
+        let prior_reject = m.reject.predict(features);
         m.amplify.update(features, false);
         m.reject.update(features, false);
+        drop(m);
+        self.eval_amplify.record(prior_amplify, 0.0);
+        self.eval_reject.record(prior_reject, 0.0);
     }
 
     /// (échantillons, taux de base) pour chaque tête, dans l'ordre
     /// (amplification, rejet).
     pub fn stats(&self) -> ((u64, f64), (u64, f64)) {
-        let m = self.0.read().unwrap();
+        let m = self.models.read().unwrap();
         (
             (m.amplify.samples_seen, m.amplify.base_rate()),
             (m.reject.samples_seen, m.reject.base_rate()),
@@ -339,12 +375,12 @@ impl ObjectivePredictor {
     }
 
     pub fn total_samples(&self) -> u64 {
-        let m = self.0.read().unwrap();
+        let m = self.models.read().unwrap();
         m.amplify.samples_seen.max(m.reject.samples_seen)
     }
 
     pub async fn save(&self) {
-        let models = self.0.read().unwrap().clone();
+        let models = self.models.read().unwrap().clone();
         match serde_json::to_string_pretty(&models) {
             Ok(json) => {
                 let _ = fs::create_dir_all("data").await;

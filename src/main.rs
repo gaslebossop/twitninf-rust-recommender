@@ -7,6 +7,7 @@ mod config;
 mod constants;
 mod cooccurrence;
 mod embeddings;
+mod eval;
 mod experiments;
 mod handlers;
 mod middleware;
@@ -37,7 +38,8 @@ use tracing_subscriber::EnvFilter;
 use handlers::{
     account_status::account_status_handler,
     admin::{
-        admin_algo_stats_handler, admin_backfill_ctr_handler, admin_ban_handler,
+        admin_algo_eval_handler, admin_algo_stats_handler, admin_backfill_ctr_handler,
+        admin_ban_handler,
         admin_data_handler, admin_filters_handler, admin_get_weights_handler,
         admin_issue_strike_handler, admin_logs_handler, admin_reset_weights_handler,
         admin_revoke_strike_handler, admin_set_shadowban_handler,
@@ -201,6 +203,9 @@ async fn main() -> Result<()> {
             post(admin_reset_weights_handler),
         )
         .route("/admin/algo/stats", get(admin_algo_stats_handler))
+        // Qualite MESUREE des modeles (AUC, log-loss, calibration) — voir
+        // `crate::eval`. Distincte de /stats, qui ne dit que ce qu'ils ont vu.
+        .route("/admin/algo/eval", get(admin_algo_eval_handler))
         .route("/admin/algo/backfill-ctr", post(admin_backfill_ctr_handler))
         .route("/admin/logs", get(admin_logs_handler))
         .route("/admin/data", get(admin_data_handler))
