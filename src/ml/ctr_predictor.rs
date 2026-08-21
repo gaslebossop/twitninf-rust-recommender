@@ -20,7 +20,51 @@ use std::sync::{Arc, RwLock};
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-pub const N_FEATURES: usize = 15;
+pub const N_FEATURES: usize = 16;
+
+/// Indice de la feature « rang auquel ce tweet a ete SERVI ».
+///
+/// ── Le biais que ca corrige ─────────────────────────────────────────────────
+/// Un tweet en tete de page est clique bien plus qu'un tweet en position 40, a
+/// qualite strictement egale : c'est un effet du RANG, pas du contenu. Sans
+/// cette feature, le modele attribue tout cet ecart au contenu, apprend « les
+/// tweets comme celui-la marchent bien », les remonte encore, et le fil se
+/// fige sur ce qui etait deja en tete. C'est la boucle de retroaction la plus
+/// classique d'un systeme de recommandation, et le moteur n'avait rien contre
+/// elle.
+///
+/// ── La correction, et pourquoi elle ne coute rien au client ─────────────────
+/// Recette dite de la « tour peu profonde » (YouTube) : on ENTRAINE avec le
+/// rang reel, et on PREDIT avec un rang fixe. Le poids appris sur cette
+/// feature absorbe l'effet de rang ; au moment de classer, tous les candidats
+/// recoivent la meme valeur, donc ce terme s'annule dans la comparaison et il
+/// ne reste que le contenu.
+///
+/// Le rang reel n'a pas besoin de venir du client : le serveur SAIT a quelle
+/// place il a servi chaque tweet. Il est donc ecrit dans le vecteur au moment
+/// ou l'impression est memorisee (`record_impressions`), pas au moment du
+/// scoring — ou la pagination n'a pas encore eu lieu.
+pub const POSITION_FEATURE: usize = 15;
+
+/// Escompte de position : 1/log2(rang + 2).
+///
+/// Meme forme que l'escompte du NDCG, et pour la meme raison : la perte
+/// d'attention est brutale en haut de page et lente ensuite. Un ecart lineaire
+/// en rang decrirait mal ce que fait un lecteur qui fait defiler.
+/// Vaut ~0,63 en tete, 0,5 a la 3e place, 0,25 a la 15e.
+pub fn position_discount(rank: usize) -> f64 {
+    1.0 / ((rank + 2) as f64).log2()
+}
+
+/// Valeur de rang utilisee AU MOMENT DE CLASSER.
+///
+/// Identique pour tous les candidats — c'est ce qui fait que le terme de
+/// position s'annule dans la comparaison. On prend la tete de page : le
+/// classement repond alors a « ce tweet marcherait-il s'il etait montre en
+/// premier ? », qui est exactement la question a poser pour decider de l'ordre.
+pub fn serving_position() -> f64 {
+    position_discount(0)
+}
 const MODEL_PATH: &str = "data/ctr_model.json";
 
 /// CTR de référence avant tout entraînement — cohérent avec le prior de
@@ -71,6 +115,11 @@ impl Default for CtrModel {
                 0.03,  // activité du LECTEUR (engagement_velocity/20, clampé) —
                        // seule feature qui décrit qui regarde, pas ce qui est
                        // regardé ; prior faible tant qu'elle n'a pas appris
+                0.20,  // escompte de position — voir `POSITION_FEATURE`. Prior
+                       // POSITIF et net : plus le rang est haut, plus l'escompte
+                       // est grand, plus le clic est probable. C'est le seul
+                       // prior qu'on connaisse avec certitude avant tout
+                       // apprentissage.
             ],
             bias: -2.5867, // logit(PRIOR_CTR) — au lieu d'un -0.5 arbitraire qui prédisait ~38 % de CTR à froid
             learning_rate: 0.01,
@@ -148,6 +197,48 @@ pub fn extract_features(
     acceleration: f64,
     reader_engagement: f64,
 ) -> [f64; N_FEATURES] {
+    extract_features_at(
+        d1,
+        d2,
+        d3,
+        d4,
+        d5,
+        d6,
+        d7,
+        d8,
+        age_h,
+        is_trending,
+        has_media,
+        author_followers,
+        acceleration,
+        reader_engagement,
+        serving_position(),
+    )
+}
+
+/// Même vecteur, avec un escompte de position explicite.
+///
+/// Utilisé à l'ENTRAÎNEMENT, où l'on connaît le rang réellement servi. Le
+/// chemin de classement passe par `extract_features` ci-dessus, qui fixe la
+/// position à la tête de page pour tout le monde — voir `POSITION_FEATURE`.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_features_at(
+    d1: f64,
+    d2: f64,
+    d3: f64,
+    d4: f64,
+    d5: f64,
+    d6: f64,
+    d7: f64,
+    d8: f64,
+    age_h: f64,
+    is_trending: bool,
+    has_media: bool,
+    author_followers: i64,
+    acceleration: f64,
+    reader_engagement: f64,
+    position: f64,
+) -> [f64; N_FEATURES] {
     [
         d1,
         d2,
@@ -164,6 +255,7 @@ pub fn extract_features(
         if age_h < 2.0 { 1.0 } else { 0.0 },         // is_recent
         acceleration.clamp(0.0, 1.0),
         reader_engagement.clamp(0.0, 1.0),
+        position.clamp(0.0, 1.0),
     ]
 }
 
@@ -339,6 +431,99 @@ mod tests {
     }
 
 
+
+
+    // ─── Correction du biais de position ────────────────────────────────────
+
+    #[test]
+    fn l_escompte_de_position_decroit_avec_le_rang() {
+        let tete = position_discount(0);
+        let milieu = position_discount(10);
+        let bas = position_discount(45);
+        assert!(tete > milieu && milieu > bas, "{tete} {milieu} {bas}");
+        // Reste une valeur exploitable par un modele lineaire : borne, jamais
+        // nulle, jamais superieure a 1.
+        for rang in [0, 1, 5, 49, 500, 100_000] {
+            let d = position_discount(rang);
+            assert!(d > 0.0 && d <= 1.0, "rang={rang} escompte={d}");
+        }
+    }
+
+    /// La perte doit etre BRUTALE en haut de page et lente ensuite : passer de
+    /// la place 1 a la place 4 coute bien plus que de passer de la 41 a la 44.
+    /// Un escompte lineaire en rang dirait le contraire.
+    #[test]
+    fn la_perte_est_concentree_en_haut_de_page() {
+        let haut = position_discount(0) - position_discount(3);
+        let bas = position_discount(40) - position_discount(43);
+        assert!(haut > bas * 3.0, "haut={haut} bas={bas}");
+    }
+
+    /// Le coeur de la correction : au moment de CLASSER, tous les candidats
+    /// recoivent la meme valeur de position. Le terme s'annule donc dans la
+    /// comparaison, et il ne reste que le contenu.
+    #[test]
+    fn le_classement_utilise_la_meme_position_pour_tout_le_monde() {
+        let a = extract_features(
+            0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, true, true, 100, 0.5, 0.5,
+        );
+        let b = extract_features(
+            0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 9.0, false, false, 5, 0.1, 0.2,
+        );
+        assert_eq!(a[POSITION_FEATURE], b[POSITION_FEATURE]);
+        assert_eq!(a[POSITION_FEATURE], serving_position());
+    }
+
+    /// Et a l'ENTRAINEMENT, la position reelle passe bien dans le vecteur —
+    /// c'est ce qui permet au poids d'absorber l'effet de rang.
+    #[test]
+    fn l_entrainement_recoit_la_position_reelle() {
+        let tete = extract_features_at(
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, false, false, 10, 0.5, 0.5,
+            position_discount(0),
+        );
+        let bas = extract_features_at(
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, false, false, 10, 0.5, 0.5,
+            position_discount(40),
+        );
+        assert!(tete[POSITION_FEATURE] > bas[POSITION_FEATURE]);
+        // Tout le reste du vecteur est identique : seule la position change.
+        assert_eq!(&tete[..POSITION_FEATURE], &bas[..POSITION_FEATURE]);
+    }
+
+    /// Un modele nourri de clics en haut de page et de non-clics en bas doit
+    /// apprendre un poids de position POSITIF — c'est exactement l'effet de
+    /// rang, et c'est ce poids qui l'absorbe au lieu de le laisser contaminer
+    /// les dimensions de contenu.
+    #[test]
+    fn le_modele_apprend_a_absorber_l_effet_de_rang() {
+        let mut model = CtrModel::default();
+        let contenu = |position: f64| {
+            extract_features_at(
+                0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 100, 0.5, 0.5, position,
+            )
+        };
+        let mut rng = 0xDEADBEEFCAFEBABEu64;
+        for _ in 0..3_000 {
+            // MEME contenu des deux cotes : seul le rang differe. Tout ecart
+            // appris ne peut donc venir que du rang.
+            if melange(&mut rng) {
+                model.update(&contenu(position_discount(0)), true);
+            } else {
+                model.update(&contenu(position_discount(45)), false);
+            }
+        }
+        assert!(
+            model.weights[POSITION_FEATURE] > 0.0,
+            "poids de position appris = {}",
+            model.weights[POSITION_FEATURE]
+        );
+        // Et a rang egal, le modele ne distingue plus les deux : l'ecart a
+        // bien ete impute au rang, pas au contenu.
+        let p_tete = model.predict(&contenu(serving_position()));
+        let p_bas = model.predict(&contenu(serving_position()));
+        assert!((p_tete - p_bas).abs() < 1e-12);
+    }
 
     /// Tirage a pile ou face deterministe (generateur congruentiel simple).
     ///

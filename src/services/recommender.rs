@@ -255,25 +255,52 @@ impl RecommenderService {
 
     /// Mémorise le vecteur de features de chaque tweet servi, pour pouvoir
     /// entraîner le modèle sur ce qu'il a réellement produit.
-    async fn record_impressions(&self, user_id: &str, page_ids: &[String], scored: &[ScoredTweet]) {
+    async fn record_impressions(
+        &self,
+        user_id: &str,
+        page_ids: &[String],
+        scored: &[ScoredTweet],
+        offset: usize,
+    ) {
         let by_id: HashMap<&str, &ScoredTweet> =
             scored.iter().map(|s| (s.tweet_id.as_str(), s)).collect();
 
         let mut stored = 0usize;
-        for tweet_id in page_ids {
+        for (index, tweet_id) in page_ids.iter().enumerate() {
             let Some(s) = by_id.get(tweet_id.as_str()) else {
                 continue;
             };
             let Some(features) = s.ctr_features.as_ref() else {
                 continue;
             };
+
+            // ── Rang réellement servi ────────────────────────────────────────
+            // Les features ont été construites au SCORING, avant la
+            // pagination : elles portent donc la position neutre de tête de
+            // page, celle qui sert à classer. C'est ici, et seulement ici,
+            // qu'on sait à quelle place ce tweet est effectivement parti.
+            //
+            // C'est ce rang-là qu'il faut mémoriser pour l'entraînement : un
+            // tweet en position 40 cliqué vaut bien plus qu'un tweet en
+            // position 1 cliqué, et sans cette distinction le modèle attribue
+            // au CONTENU ce qui n'est qu'un effet de rang — puis remonte
+            // encore ce qui était déjà en tête. Voir
+            // `ctr_predictor::POSITION_FEATURE`.
+            //
+            // `offset + index` et pas `index` : une deuxième page servie
+            // commence au rang 50, pas au rang 0.
+            let mut features = features.clone();
+            if let Some(slot) = features.get_mut(crate::ml::ctr_predictor::POSITION_FEATURE) {
+                *slot = crate::ml::ctr_predictor::position_discount(offset + index);
+            }
+
             self.cache
-                .record_impression(user_id, tweet_id, features)
+                .record_impression(user_id, tweet_id, &features)
                 .await;
             stored += 1;
         }
         if stored > 0 {
-            debug!(user_id, stored, "Impressions CTR mémorisées");
+            debug!(user_id, stored, offset, "Impressions CTR mémorisées");
         }
     }
 
@@ -656,7 +683,7 @@ impl RecommenderService {
         // Uniquement les tweets réellement renvoyés : ceux qui sortent de la
         // pagination n'ont jamais été exposés au lecteur, les compter en
         // négatif fabriquerait des rejets qui n'ont pas eu lieu.
-        self.record_impressions(&req.user_id, &page_ids, &scored)
+        self.record_impressions(&req.user_id, &page_ids, &scored, offset)
             .await;
         let experiment_assignments = if req.enable_experiments.unwrap_or(false) {
             experiments::assign_variants(&self.pg, &req.user_id, &page_ids)

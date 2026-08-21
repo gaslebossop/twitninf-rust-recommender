@@ -72,6 +72,11 @@ impl Default for DwellModel {
                 0.0,  // is_recent
                 0.02, // engagement_acceleration
                 0.03, // activité du LECTEUR
+                0.0, // escompte de position — voir `ctr_predictor::POSITION_FEATURE`.
+                     // Prior NUL ici, contrairement au CTR : rien ne dit qu'on
+                     // lit plus longuement en haut de page qu'en bas, alors
+                     // qu'on y clique certainement plus. Le modèle
+                     // l'apprendra s'il y a quelque chose à apprendre.
             ],
             bias: logit(NEUTRAL01),
             learning_rate: 0.01,
@@ -156,7 +161,26 @@ impl DwellPredictor {
                             crate::eval::OnlineEval::new(),
                         );
                     }
-                    Err(e) => warn!("Failed to parse dwell model: {e}, using default"),
+                    // Même migration que le modèle CTR : un vecteur de poids
+                    // plus COURT que `N_FEATURES` vient d'un schéma enrichi
+                    // depuis la sauvegarde, pas d'un fichier corrompu. Sans
+                    // ça, chaque ajout de feature remettait l'apprentissage du
+                    // dwell à zéro en silence — le CTR avait déjà sa migration,
+                    // celui-ci ne l'avait jamais eue.
+                    Err(e) => match migrate_legacy_dwell(&json) {
+                        Some(model) => {
+                            info!(
+                                samples = model.samples_seen,
+                                "Modèle de dwell migré depuis un vecteur plus court — \
+                                 poids appris conservés, nouvelles features au défaut"
+                            );
+                            return Self(
+                                Arc::new(RwLock::new(model)),
+                                crate::eval::OnlineEval::new(),
+                            );
+                        }
+                        None => warn!("Failed to parse dwell model: {e}, using default"),
+                    },
                 },
                 Err(e) => warn!("Failed to read dwell model: {e}, using default"),
             }
@@ -219,6 +243,26 @@ fn sigmoid(x: f64) -> f64 {
 #[inline]
 fn logit(p: f64) -> f64 {
     (p / (1.0 - p)).ln()
+}
+
+/// Complète un modèle persisté dont le vecteur `weights` est plus court que
+/// `N_FEATURES`. Voir `ctr_predictor::migrate_legacy_weights` — même besoin,
+/// même règle : un tableau plus LONG reste un modèle neuf, il n'y a pas de
+/// façon honnête de deviner quelle feature a disparu.
+fn migrate_legacy_dwell(json: &str) -> Option<DwellModel> {
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let obj = value.as_object_mut()?;
+    let old = obj.get("weights")?.as_array()?.clone();
+    if old.is_empty() || old.len() >= N_FEATURES {
+        return None;
+    }
+    let defaults = DwellModel::default().weights;
+    let mut padded = old;
+    for w in defaults.iter().skip(padded.len()) {
+        padded.push(serde_json::json!(w));
+    }
+    obj.insert("weights".to_string(), serde_json::Value::Array(padded));
+    serde_json::from_value(value).ok()
 }
 
 #[cfg(test)]
