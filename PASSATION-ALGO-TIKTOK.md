@@ -4,16 +4,19 @@
 > par épuisement de contexte avant d'écrire sa passation. Ce fichier a été **reconstitué après coup**
 > à partir de `git log`, `git diff` et d'une relecture du code, par la session suivante (2026-08-21).
 >
-> Conséquence : les **preuves de compilation ci-dessous ont été relancées et vérifiées** par le
-> rédacteur, mais les **chiffres de performance** proviennent des messages de commit de l'agent et
-> **n'ont pas été reproduits**. Les traiter comme des affirmations à vérifier, pas comme des mesures.
+> Conséquence : tout ce qui est affirmé ici a été **revérifié** par le rédacteur — compilation, tests
+> et banc de performance rejoués (§2). Ce qui n'a PAS pu l'être est signalé comme tel à chaque fois.
+>
+> ⚠️ **Quatre affirmations de la passation d'origine (`PASSATION-ALGO-ET-FIL2B.md`) se sont révélées
+> périmées à la vérification** — dont le fameux dossier `dimensions/`. Voir §4 et §6.
 
 ---
 
 ## 1. État de la branche
 
 - Branche : `feat/algo-niveau-tiktok`, partant de `main` (`ed721da`).
-- **9 commits**, `+2991 / −218` sur 19 fichiers.
+- **11 commits** (9 de l'agent + 2 de la session suivante), `+2991 / −218` sur 19 fichiers pour la
+  part de l'agent.
 - Arbre **propre**. **Rien n'a été poussé** (la branche n'existe pas sur `origin`), **rien n'a été
   fusionné dans `main`**, **rien n'a été déployé**.
 
@@ -25,16 +28,20 @@ suivante — voir §5.
 
 | Commande | Résultat |
 |---|---|
-| `cargo check --all-targets` | **exit 0** — 39 warnings, aucune erreur |
-| `cargo test` | **199 passed ; 0 failed** ; 0 ignored |
+| `cargo check --all-targets` | **exit 0** — warnings préexistants seulement, aucune erreur |
+| `cargo test` | **207 passed ; 0 failed** (199 de l'agent + 8 du correcteur de calibration) |
+| `cargo run --release --example bench_scoring` | **15,96 ms → 5,06 ms, ×3,16** ; écart de score entre les deux chemins **exactement 0** |
 
 Les warnings sont des `never used` préexistants (`utils/math.rs` : `normalize`, `safe_ratio`,
 `sigmoid_scaled`, etc.), sans rapport avec le chantier.
 
 ## 3. Les commits, du plus récent au plus ancien
 
+Les deux premiers (`be78533`, `457ba2f`) sont de la session suivante, pas de l'agent.
+
 | Commit | Objet |
 |---|---|
+| `be78533` | **calibration** — `ml/calibrator.rs` : Platt sur les têtes, exposé sur `/admin/algo/eval` ; **non appliqué au classement** |
 | `457ba2f` | **refus sur soi-même** — un `skip`/`report`/`block` avec `author_id == user_id` ne porte plus sur le compte |
 | `ba41d8d` | **perf scoring** — `FeedShape` remplace un recomptage du fil par candidat ; une seule minuscule par tweet ; `score_tweet_ml` (morte) supprimée |
 | `de1f0ac` | **contrat** — `interaction_type: "open"` (poids 2,0) + `scores: [{tweet_id, score, confidence}]` dans `/recommendations` |
@@ -59,11 +66,11 @@ Grille reprise de `PASSATION-ALGO-ET-FIL2B.md` §6.
 | 2 | Multi-objectif | ✅ **fait** (`1351406`) — 4 têtes : CTR, dwell, amplification, rejet ; rejet **soustraite** |
 | 3 | Signaux temps réel | ✅ préexistant, non retouché |
 | 4 | Exploration / bandit | ✅ **branché sur `for_you`** (`recommender.rs:1138`) ; frontière corrigée (`ea9e4d4`). Trending ne passe **volontairement pas** par le bandit |
-| 5 | Démarrage à froid | ⚠️ **non traité ici** — voir la branche séparée `feat/poids-abonnements-coldstart` |
+| 5 | Démarrage à froid | ✅ **déjà sur `main`** — `cold_start_follow_multiplier` : renfort aux abonnements décroissant jusqu'à `COLD_START_INTERACTION_FLOOR`. Non retouché par le chantier |
 | 6 | Rétroaction négative | ✅ **fait** (`2329a5a` + `457ba2f`) |
-| 7 | Diversité / anti-bulle | ❌ **non traité** — rappel : les pénalités anti-bulle ont été volontairement retirées du mode Trending (`a9d74d5`), ne pas les y remettre sans le dire |
-| 8 | Calibration des scores | ⚠️ **mesurée, pas corrigée** — `eval.rs` sort l'ECE et la courbe de fiabilité, mais aucun correcteur Platt/isotonique n'est posé. ⚠️ `src/calibration.rs` **n'est pas ça** : c'est la calibration de **goût à l'inscription** (tours de tweets aimés) |
-| 9 | Performance | ✅ **mesurée** — banc `examples/bench_scoring.rs`. Chiffres annoncés (non reproduits) : 17,67 ms → 5,49 ms par recommandation, ×3,2 |
+| 7 | Diversité / anti-bulle | ✅ **largement en place** (préexistant) — **trois verrous** : vivier plafonné à `MAX_CANDIDATES_PER_AUTHOR = 12`, pénalité de score `diversity_multiplier`, plafond dur `MAX_PER_AUTHOR_PER_PAGE = 3` par page de 50 appliqué **à la construction, donc avant cache**. Plus `theme_diversity_multiplier` (sujet) et « un fil n'occupe qu'une entrée ». **Reste** : aucun quota explicite in/out-network. Rappel : pénalités anti-bulle volontairement retirées de Trending (`a9d74d5`) |
+| 8 | Calibration des scores | ✅ **mesurée ET corrigée** (`be78533`) — `src/ml/calibrator.rs` : mise à l'échelle de Platt, exposée sur `/admin/algo/eval` (`calibration_gain`). ⚠️ **Rien n'est appliqué au classement** — c'est une mesure, la décision de brancher se prend sur ce chiffre. ⚠️ `src/calibration.rs` **n'est pas ça** : c'est la calibration de **goût à l'inscription** |
+| 9 | Performance | ✅ **mesurée et REPRODUITE** — `cargo run --release --example bench_scoring` rejoué le 2026-08-21 : **15,96 ms → 5,06 ms, ×3,16**, et écart de score entre les deux chemins **exactement 0** (le gain ne vient pas d'un changement de résultat). Conforme aux ×3,2 annoncés |
 | 10 | Évaluabilité | ✅ **fait** (`37e7bc4`) — c'était le trou le plus grave ; exposé sur `GET /admin/algo/eval` |
 
 ## 5. Le commit `457ba2f` — ce qu'il faut savoir
@@ -94,23 +101,43 @@ tout lecteur tombant sur un cache chaud.
 (Rust → API → app) par relecture. Le chemin n'a **jamais été exécuté** — il demande Postgres, Redis
 et le moteur Rust vivants. À confirmer sur un environnement réel avant de conclure quoi que ce soit.
 
-### 🟠 Décider du sort de `src/algorithm/dimensions/`
-`d1_*`..`d8_*` — **toujours du code mort, jamais compilé** : `src/algorithm/mod.rs` n'expose que
-`d9_llm_understanding`, `dwell`, `scoring`, `trending`. L'agent n'y a pas touché et n'a pas tranché.
-Le supprimer ou le brancher, mais ne pas le laisser piéger le prochain lecteur.
+### ✅ ~~Poser un correcteur de calibration (grille #8)~~ — **posé le 2026-08-21** (`be78533`)
+`src/ml/calibrator.rs` — mise à l'échelle de Platt, exposée sur `/admin/algo/eval`
+(`calibration_gain` : ECE avant, ECE après, paramètres ajustés, pour les quatre têtes).
 
-### 🟠 Diversité / anti-bulle (grille #7)
-Non traité. Plafond par auteur, plafond par sujet, mélange in/out-network sur `for_you`.
+**Rien n'est appliqué au classement.** Brancher la correction déplace le fil de tout le monde, et le
+gain affiché est ajusté PUIS mesuré sur la même fenêtre — c'est un **plafond**, pas une promesse.
+La conduite est donc : regarder le chiffre sur un service vivant, puis décider.
 
-### 🟡 Poser un correcteur de calibration (grille #8)
-La mesure existe maintenant. Si l'ECE est mauvaise, Platt ou isotonique sur les têtes.
+### ✅ ~~Reproduire le banc~~ — **fait le 2026-08-21**
+×3,16 mesuré, écart de score nul. Voir §2.
+
+### ❌ ~~Décider du sort de `src/algorithm/dimensions/`~~ — **le dossier n'existe pas**
+**L'affirmation de la passation d'origine était périmée.** `src/algorithm/dimensions/` a été supprimé
+il y a longtemps par le commit `b5be392` (« remove dead code across the engine ») et **il est absent
+de `main` comme de la branche**. Il n'y a rien à trancher.
+
+⚠️ La note mémoire `rust-recommender-pieges` répète encore cette information périmée — à corriger.
+
+### 🟠 Le seul vrai reste de la diversité (grille #7) : le quota in/out-network
+Les **trois verrous** de diversité par auteur existent et sont préexistants (voir §4). Ce qui n'existe
+pas, c'est un **quota explicite** entre contenu d'abonnements et contenu hors-réseau : aujourd'hui
+l'appartenance au réseau agit par **multiplicateur de score** (`FOLLOW_FEED_BOOST`,
+`FOLLOW_MUTUAL_BOOST`, renfort de démarrage à froid), pas par part réservée.
+
+**Ce n'est délibérément pas fait ici, et la raison compte** : un quota est un plafond dur, et les
+plafonds durs sont exactement ce qui produit des trous quand le vivier est petit — c'est déjà
+documenté pour `MAX_PER_AUTHOR_PER_PAGE` (« le plafond n'est tenable que s'il existe au moins
+`ceil(PAGE_WINDOW / MAX_PER_AUTHOR_PER_PAGE)` auteurs distincts »). Avec 97 % de la table `users`
+issue de deux rafales scriptées, un quota 50/50 servirait surtout des pages courtes.
+
+À faire **après** avoir mesuré la part in/out réellement servie aujourd'hui — le harnais d'éval
+existe maintenant pour ça.
 
 ### 🟡 Pipeline multi-étages (grille #1)
-Le plus gros morceau, et le moins urgent : à la volumétrie actuelle (97 % de la table `users` vient
-de deux rafales scriptées) un vivier → un score tient encore.
-
-### 🟢 Reproduire le banc
-`cargo run --release --example bench_scoring` — les chiffres du §4 n'ont pas été revérifiés.
+Le plus gros morceau, et le moins urgent : à la volumétrie actuelle un vivier → un score tient
+encore. Et depuis `37e7bc4` il y a enfin de quoi **prouver** qu'un ranker en deux temps ferait mieux
+avant de réécrire le classement — ce qui n'était pas le cas quand la grille a été écrite.
 
 ## 7. Rappels qui n'ont pas changé
 
