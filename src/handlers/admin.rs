@@ -517,6 +517,21 @@ pub async fn admin_algo_stats_handler(
 //     ou signal qui n'arrive pas, pas un public sans réaction.
 //   * `null` partout → moins de `MIN_SAMPLES_FOR_METRICS` couples. On ne
 //     publie pas un chiffre qui invite à conclure sur trente observations.
+//
+// `calibration_gain` répond à la suite logique du deuxième point : « et si on
+// recalibrait ? ». Pour chaque tête, l'ECE avant, l'ECE après une mise à
+// l'échelle de Platt, et les deux paramètres ajustés. RIEN N'EST APPLIQUÉ au
+// classement — c'est une mesure, pas un réglage.
+//
+// Deux pièges de lecture :
+//   * le gain est ajusté PUIS mesuré sur la même fenêtre : c'est un PLAFOND,
+//     pas ce qu'on obtiendrait en production. Un plafond faible est en revanche
+//     une réponse ferme — inutile de brancher quoi que ce soit.
+//   * `calibrator: null` avec assez d'échantillons veut dire que l'ajustement a
+//     été REFUSÉ, presque toujours pour une pente négative : sur cette fenêtre,
+//     plus la tête annonce haut, moins l'événement arrive. Ce n'est pas un
+//     problème de calibration, c'est une tête qui n'ordonne rien — regarder
+//     `auc` (elle sera sous 0,50), pas la calibration.
 pub async fn admin_algo_eval_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -524,6 +539,8 @@ pub async fn admin_algo_eval_handler(
     require_admin!(headers, state);
 
     let (amplify, reject) = state.recommender.objective_predictor().eval_reports();
+    let (gain_amplify, gain_reject) =
+        state.recommender.objective_predictor().calibration_gains();
 
     (
         StatusCode::OK,
@@ -537,6 +554,12 @@ pub async fn admin_algo_eval_handler(
                 "dwell": state.recommender.dwell_predictor().eval_report(),
                 "amplify": amplify,
                 "reject": reject,
+            },
+            "calibration_gain": {
+                "ctr": state.recommender.ctr_predictor().calibration_gain(),
+                "dwell": state.recommender.dwell_predictor().calibration_gain(),
+                "amplify": gain_amplify,
+                "reject": gain_reject,
             }
         })),
     )

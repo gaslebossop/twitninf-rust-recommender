@@ -327,6 +327,31 @@ impl OnlineEval {
         self.0.read().unwrap().len()
     }
 
+    /// Ce qu'une recalibration de Platt rattraperait sur la fenêtre courante.
+    ///
+    /// `None` quand la cible n'est pas binaire (le modèle de temps de lecture) :
+    /// recalibrer une probabilité suppose qu'il y en ait une.
+    ///
+    /// Mesure seulement — rien n'est appliqué au classement. C'est délibéré :
+    /// brancher une correction sur les quatre têtes déplace le fil de tout le
+    /// monde, et le gain affiché ici est ajusté puis mesuré sur LA MÊME
+    /// fenêtre, donc optimiste. Il répond à « est-ce que ça vaut le coup ? »,
+    /// pas à « est-ce que ça marche ? ». Voir `crate::ml::calibrator`.
+    pub fn calibration_gain(&self) -> Option<crate::ml::CalibrationGain> {
+        let window: Vec<(f64, f64)> = {
+            let w = self.0.read().unwrap();
+            w.iter().map(|(p, t)| (*p as f64, *t as f64)).collect()
+        };
+        if window.len() < MIN_SAMPLES_FOR_METRICS {
+            return None;
+        }
+        if !window.iter().all(|(_, t)| *t == 0.0 || *t == 1.0) {
+            return None;
+        }
+        let binary: Vec<(f64, bool)> = window.iter().map(|(p, t)| (*p, *t > 0.5)).collect();
+        Some(crate::ml::calibration_gain(&binary, RELIABILITY_BINS))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

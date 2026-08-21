@@ -278,6 +278,12 @@ impl CtrPredictor {
         self.1.report()
     }
 
+    /// Ce qu'une recalibration rattraperait — mesure seulement, rien n'est
+    /// appliqué. Voir `crate::ml::calibrator`.
+    pub fn calibration_gain(&self) -> Option<crate::ml::CalibrationGain> {
+        self.1.calibration_gain()
+    }
+
     pub async fn load_or_default() -> Self {
         if Path::new(MODEL_PATH).exists() {
             match fs::read_to_string(MODEL_PATH).await {

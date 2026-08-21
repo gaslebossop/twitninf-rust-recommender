@@ -270,6 +270,14 @@ impl ObjectivePredictor {
         (self.eval_amplify.report(), self.eval_reject.report())
     }
 
+    /// Ce qu'une recalibration rattraperait sur chaque tete — (amplification,
+    /// rejet). Mesure seulement. Voir `crate::ml::calibrator`.
+    pub fn calibration_gains(
+        &self,
+    ) -> (Option<crate::ml::CalibrationGain>, Option<crate::ml::CalibrationGain>) {
+        (self.eval_amplify.calibration_gain(), self.eval_reject.calibration_gain())
+    }
+
     pub async fn load_or_default() -> Self {
         if Path::new(MODEL_PATH).exists() {
             match fs::read_to_string(MODEL_PATH).await {

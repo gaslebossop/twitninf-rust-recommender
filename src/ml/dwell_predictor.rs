@@ -146,6 +146,13 @@ impl DwellPredictor {
         self.1.report()
     }
 
+    /// Ce qu'une recalibration rattraperait. `None` ici dans le cas courant :
+    /// la cible est le temps de lecture, une valeur continue, et recalibrer une
+    /// probabilite suppose qu'il y en ait une.
+    pub fn calibration_gain(&self) -> Option<crate::ml::CalibrationGain> {
+        self.1.calibration_gain()
+    }
+
     pub async fn load_or_default() -> Self {
         if Path::new(MODEL_PATH).exists() {
             match fs::read_to_string(MODEL_PATH).await {
