@@ -104,6 +104,30 @@ impl InteractionType {
         }
     }
 
+    /// Poids de mise en sourdine de l'AUTEUR déclenché par ce geste.
+    ///
+    /// `None` = ce geste ne dit rien du compte, seulement du tweet.
+    ///
+    /// Tous les refus ne se valent pas, et c'est exactement ce que le moteur
+    /// ignorait : « ça ne m'intéresse pas » était le SEUL geste à porter sur
+    /// l'auteur, alors que c'est le plus faible des trois. Un signalement dit
+    /// que le contenu n'aurait pas dû être montré ; un blocage dit qu'on ne
+    /// veut plus rien voir de ce compte.
+    ///
+    /// L'échelle est celle de `author_damping` (0,32^n) : 1 point divise la
+    /// visibilité par ~3, 2 points par ~10, 5 points la posent au plancher.
+    ///
+    /// `Skip` reste volontairement à `None` : ignorer UN tweet ne dit rien de
+    /// son auteur.
+    pub fn refusal_strikes(self) -> Option<f64> {
+        match self {
+            InteractionType::NotInterested => Some(1.0),
+            InteractionType::Report => Some(2.0),
+            InteractionType::Block => Some(5.0),
+            _ => None,
+        }
+    }
+
     /// Label d'entraînement du modèle CTR pour cette interaction.
     ///
     /// `Some(true)`  → engagement positif avéré, exemple positif.
@@ -733,5 +757,55 @@ mod profile_index_tests {
         assert!(!relu.following_set.is_empty());
         assert!(relu.follows("a") && relu.is_mutual("b") && relu.has_seen("t1"));
         assert!(!relu.follows("z"));
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    /// Le classement des trois refus doit être strict et dans cet ordre :
+    /// bloquer > signaler > ne pas être intéressé. C'est l'inversion de cet
+    /// ordre qui était le bug — seul le plus faible des trois agissait.
+    #[test]
+    fn les_refus_sont_ordonnes_du_plus_faible_au_plus_fort() {
+        let pas_interesse = InteractionType::NotInterested.refusal_strikes().unwrap();
+        let signalement = InteractionType::Report.refusal_strikes().unwrap();
+        let blocage = InteractionType::Block.refusal_strikes().unwrap();
+        assert!(pas_interesse < signalement, "{pas_interesse} < {signalement}");
+        assert!(signalement < blocage, "{signalement} < {blocage}");
+    }
+
+    /// Ignorer un tweet ne dit rien de son auteur, ni un geste positif.
+    #[test]
+    fn seuls_les_refus_explicites_mettent_un_auteur_en_sourdine() {
+        for muet in [
+            InteractionType::Skip,
+            InteractionType::Like,
+            InteractionType::View,
+            InteractionType::Unlike,
+            InteractionType::Interested,
+        ] {
+            assert!(
+                muet.refusal_strikes().is_none(),
+                "{muet:?} ne doit pas viser l'auteur"
+            );
+        }
+    }
+
+    /// Les trois gestes qui mettent un auteur en sourdine doivent aussi être
+    /// étiquetés négatifs pour le modèle CTR : sourdine et apprentissage ne
+    /// doivent pas se contredire.
+    #[test]
+    fn un_refus_est_toujours_un_negatif_pour_le_modele() {
+        for refus in [
+            InteractionType::NotInterested,
+            InteractionType::Report,
+            InteractionType::Block,
+        ] {
+            assert!(refus.refusal_strikes().is_some());
+            assert_eq!(refus.ctr_label(), Some(false), "{refus:?}");
+            assert!(refus.weight() < 0.0, "{refus:?}");
+        }
     }
 }

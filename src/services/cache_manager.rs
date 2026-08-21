@@ -137,9 +137,27 @@ impl CacheManager {
     // s'accumule : plus on le refuse, plus il descend.
 
     pub async fn damp_author(&self, user_id: &str, author_id: &str) {
+        self.damp_author_by(user_id, author_id, 1.0).await;
+    }
+
+    /// Même mise en sourdine, avec un poids explicite.
+    ///
+    /// Tous les refus ne se valent pas. « Ça ne m'intéresse pas » dit un
+    /// désaccord de goût ; un SIGNALEMENT dit que le contenu n'aurait pas dû
+    /// être montré, et un BLOCAGE dit qu'on ne veut plus rien voir de ce
+    /// compte. Les trois passaient par le même `+1`, quand ils passaient
+    /// quelque part.
+    ///
+    /// Le poids s'accumule dans le même ZSET et se relit par
+    /// `author_damping`, qui décroît géométriquement : deux « points de
+    /// refus » divisent la visibilité par ~10, cinq la posent au plancher.
+    pub async fn damp_author_by(&self, user_id: &str, author_id: &str, strikes: f64) {
+        if !(strikes.is_finite() && strikes > 0.0) {
+            return;
+        }
         let key = format!("twitninf:damped:{}", user_id);
         let mut c = self.conn.lock().await;
-        let _: Result<f64, _> = c.zincr(&key, author_id, 1.0_f64).await;
+        let _: Result<f64, _> = c.zincr(&key, author_id, strikes).await;
         let _: Result<(), _> = c.expire(&key, TTL_DAMPED_AUTHORS as i64).await;
     }
 
