@@ -201,24 +201,149 @@ Appliqués ensuite, dans cet ordre :
 | Abonnement | Bonus Plus / Pro |
 | **Frein de vélocité** | ×0,5 pendant 1 h (voir §8) |
 
-### 5.4 Le modèle CTR
+### 5.4 Les cinq têtes de prédiction
 
-Une régression logistique entraînée en continu (SGD) prédit la probabilité de
-clic sur **15 caractéristiques** : les 9 dimensions, l'âge, le caractère
-tendance, la présence de média, le log des abonnés, la fraîcheur,
-l'accélération, et — seule à décrire *qui regarde* plutôt que *ce qui est
-regardé* — l'activité du lecteur.
+Le moteur ne prédit plus une seule chose. Cinq régressions logistiques
+entraînées en ligne (SGD), **toutes sur le même vecteur de 22 caractéristiques**
+et sur **la même impression mémorisée** — ce n'est pas cinq fois plus de données
+à récolter, c'est cinq lectures différentes des mêmes données.
+
+| Tête | Prédit | Prior | Poids |
+|---|---|---|---|
+| `reply` | p(réponse écrite) | 0,004 | 0,24 |
+| `amplify` | p(retweet, partage, favori, commentaire) | 0,02 | 0,22 |
+| `dwell` | temps de lecture attendu | — | 0,20 |
+| `ctr` | p(geste positif, tous confondus) | 0,07 | 0,12 |
+| `profile` | p(visite du profil de l'auteur) | 0,012 | 0,10 |
+| `fav` | p(j'aime) | 0,030 | 0,08 |
+| `reject` | p(signalement, blocage, « pas intéressé ») | 0,005 | **négatif** |
+
+Les règles pèsent **0,90** face à ces 0,96 : le mélange est à parité, et un test
+le verrouille.
+
+#### Pourquoi un `lift` et pas une probabilité
+
+C'est la correction qui rend ces poids honnêtes. `blend_positive` fait une
+moyenne **pondérée** de valeurs dans [0,1]. Or le score de règles balaie 0,2 à
+0,8 tandis qu'une probabilité de réponse balaie 0,002 à 0,01 : injectée telle
+quelle, la tête rare n'apporte aucune variance au classement — elle abaisse tous
+les scores d'à peu près la même quantité, ce qui ne change **aucun ordre**. Le
+mélange annoncé « moitié règles, moitié modèles » était donc, en pratique,
+presque entièrement piloté par les règles.
+
+Chaque tête entretient donc la moyenne courante de ses propres prédictions, et
+ce qui entre dans le mélange est le rapport à cette moyenne, écrasé dans [0,1] :
 
 ```
-score = score × 0,60 + CTR_prédit × 0,40
+lift = p / moyenne_de_la_tête
+valeur = lift / (lift + 1)      → 0,5 à la moyenne, 0,667 au double
 ```
 
-**Activé seulement au-delà de 200 échantillons**, pour ne pas classer sur un
-modèle qui n'a rien appris. Persisté sur disque tous les 50 nouveaux
-échantillons, et **migré** si le nombre de caractéristiques change (les poids
-appris sont conservés, le nouveau est initialisé à sa valeur par défaut).
+X documente le même principe autrement : les poids de son classeur lourd ont été
+choisis pour que « chaque probabilité d'engagement pondérée contribue en moyenne
+à peu près autant au score ». Chez eux c'est une somme, et le réglage tient dans
+les poids ; chez nous c'est une moyenne, donc il doit être dans la valeur.
 
-### 5.5 Boost temps réel
+> **Le rejet fait exception et garde sa probabilité brute** : il entre en
+> multiplicateur (`1 − 0,60 × p`), et un lift y vaudrait 0,5 pour un tweet
+> parfaitement ordinaire — ce qui pénaliserait tout le corpus de 30 %.
+
+#### Étiquetage : ce qu'une interaction dit, et ce qu'elle ne dit pas
+
+Les interactions arrivent **une par une**. Un lecteur qui aime *et* retweete
+produit deux événements : étiqueter le retweet « n'a pas aimé » serait faux une
+fois sur deux. Chaque tête par événement ne compte donc comme positif que son
+propre geste, comme négatif que les refus explicites, et **`None` partout
+ailleurs** — un `None` est une réponse, pas un oubli.
+
+Le gros des négatifs vient d'ailleurs : une impression expirée sans la moindre
+réaction est un négatif pour **les cinq têtes** à la fois. C'est ce qui rend les
+têtes rares entraînables du tout — leurs positifs se comptent en dizaines, leurs
+négatifs en dizaines de milliers.
+
+#### Démarrage à froid, par tête
+
+**200 échantillons chacune, comptés séparément.** Une tête froide ne renvoie
+rien, et `blend_positive` la retire du dénominateur : elle ne vaut pas zéro, elle
+n'existe pas. Une tête qui apprend lentement (le rejet est rare par
+construction) n'entraîne pas les autres avec elle.
+
+### 5.5 Les 22 caractéristiques
+
+Les 16 premières décrivent le tweet, son âge, son auteur, et — seule à décrire
+*qui regarde* — l'activité du lecteur. La 16ᵉ est l'escompte de position :
+**entraînée avec le rang réel, prédite avec un rang fixe**, si bien que le poids
+appris absorbe l'effet « on clique plus en haut de page » et que le terme
+s'annule dans la comparaison entre candidats (recette de la « tour peu
+profonde » de YouTube).
+
+Les 6 dernières sont neuves :
+
+| # | Caractéristique | Ce qu'elle apporte |
+|---|---|---|
+| 16 | D3 × activité du lecteur | Le graphe d'un compte inactif est une liste morte |
+| 17 | D8 × média | Le même sujet ne se consomme pas pareil en texte et en vidéo |
+| 18 | D1 × fraîcheur | Distingue un contenu qui **décolle** d'un contenu qui a vécu |
+| 19 | D2 × activité du lecteur | Un gros consommateur devient plus exigeant |
+| 20 | D5 × D8 | « Lui ressemble ET correspond à ses habitudes » |
+| 21 | **Affinité collaborative** | Voir §5.6 |
+
+Les cinq croisements existent parce qu'une régression logistique est
+**additive** : elle ne peut pas apprendre « le graphe social compte davantage
+pour un lecteur très actif ». C'est précisément ce qu'un réseau de neurones
+apprendrait à notre place — mais sur 22 caractéristiques *denses* (pas des
+identifiants à forte cardinalité), les interactions utiles sont peu nombreuses
+et connues : on peut les écrire. C'est le pont classique entre régression
+logistique et réseau.
+
+> **Élargir le vecteur ne perd pas l'appris.** Les trois modèles persistés
+> migrent : un vecteur plus court est complété par les valeurs par défaut, les
+> poids déjà appris sont conservés. `objectives.rs` n'avait pas cette migration
+> — sans elle, cet élargissement aurait remis à zéro, en silence, des dizaines
+> de milliers d'échantillons.
+
+### 5.6 L'espace collaboratif
+
+Le moteur avait deux notions de ressemblance et il manquait la troisième :
+`embeddings` rapproche deux tweets qui parlent de la même chose,
+`cooccurrence` sait dire « les fans de A aiment souvent B » — mais aucune
+représentation ne permettait de comparer **un lecteur et un auteur
+directement**.
+
+`collab.rs` factorise la matrice de co-occurrence auteur × auteur par
+**itération orthogonale** et en tire 16 axes. Un auteur est un point ; un lecteur
+est le barycentre des auteurs qu'il consomme ; l'affinité est le cosinus des
+deux. C'est la construction « interested in » × « known for » de **SimClusters**
+(X), obtenue par factorisation plutôt que par descente de gradient — le choix qui
+convient quand on n'a pas des milliards d'interactions par entité.
+
+Reconstruit toutes les 15 minutes, hors du verrou de classement, et **échangé
+d'un coup**. Le repère est déterministe d'une reconstruction à l'autre (tri par
+degré puis par identifiant) : sans cela, le poids appris sur ce trait
+poursuivrait une cible mouvante.
+
+> **En dessous de 30 auteurs placés, le module se tait** et le trait retombe sur
+> sa valeur neutre (0,5 = « aucun rapport constaté »). À dix auteurs éligibles,
+> c'est le cas aujourd'hui : le code est écrit pour mordre quand le corpus
+> grossira, pas pour faire semblant maintenant.
+
+### 5.7 Le mélange dépend de la surface
+
+Un seul modèle, mais son poids varie — découper le modèle en quatre diviserait
+par quatre un compte d'échantillons déjà mince.
+
+| Surface | Règles | Têtes apprises |
+|---|---|---|
+| `for_you`, `discover` | ×1,00 | ×1,00 |
+| `trending` | ×1,35 | ×0,65 |
+| `feed` (abonnements) | ×1,20 | ×0,80 |
+
+Sur les tendances, ce qui fait qu'un contenu monte est dans D1 et D7, pas dans
+les habitudes d'un lecteur particulier. Sur le fil d'abonnement, le lecteur a
+**déjà choisi** ces comptes : une tête d'engagement qui rerange ce qu'il a
+explicitement demandé se met en travers de son choix.
+
+### 5.8 Boost temps réel
 
 Un like ou un rejet ajuste immédiatement l'auteur concerné pour **30 minutes** :
 `+0,15` après un signal positif, `−0,08` après un négatif. C'est ce qui fait
@@ -330,6 +455,7 @@ track
 | **Balayage CTR** | 60 s | Les impressions expirées sans engagement deviennent les **exemples négatifs**. Sans elles le modèle n'a que des positifs et ne discrimine rien. Persiste le modèle tous les 50 échantillons. |
 | **Auto-tuner** | continu | Au-delà de **500 échantillons**, réajuste les poids D1–D8 depuis ceux appris par le modèle CTR. Désactivé si un administrateur a fixé les poids à la main. |
 | **Rattrapage d'embeddings** | 30 s | Calcule les vecteurs manquants par petits lots (798/798 aujourd'hui). |
+| **Espace collaboratif** | 15 min | Relit la co-occurrence et refactorise les 16 axes (voir §5.6). Une fois au démarrage, puis un balayage sur quinze. |
 
 Le modèle d'embeddings (`all-MiniLM-L6-v2`, 384 dimensions, ONNX local) est
 chargé **en tâche de fond au démarrage** : le serveur écoute immédiatement et
@@ -424,9 +550,18 @@ Par honnêteté, les limites connues :
 - **Le corpus est mince.** 10 auteurs éligibles, dont un pèse plus que tous les
   autres réunis. Aucune diversification ne peut créer une variété qui n'existe
   pas encore en base.
-- **Le modèle CTR réapprend.** Le passage à 15 caractéristiques a conservé les
-  43 751 échantillons, mais tout élargissement futur repart d'un poids par
-  défaut sur la nouvelle dimension.
+- **Les têtes neuves repartent de zéro.** `fav`, `reply` et `profile` n'ont
+  aucun échantillon : il leur faut 200 chacune avant de peser, et la réponse est
+  rare par construction. `amplify`, `reject` et `ctr` gardent le leur grâce à la
+  migration, mais les six nouvelles caractéristiques partent d'un prior.
+- **L'espace collaboratif ne mord pas encore.** Il lui faut 30 auteurs placés ;
+  le corpus n'en a pas. Le trait vaut donc 0,5 pour tout le monde aujourd'hui —
+  c'est-à-dire rien.
+- **Aucun plongement APPRIS des interactions.** La factorisation extrait la
+  structure du graphe de co-appréciation ; elle n'apprend pas une représentation
+  par descente de gradient comme les tables de `Monolith`. À ce volume c'est le
+  bon choix, mais c'est un plafond : le jour où les interactions se comptent en
+  millions, c'est là qu'il faudra revenir.
 - **Le bandit part de zéro.** Aucune récompense accumulée tant que les
   interactions ne se comptent pas en milliers par auteur.
 - **Aucune mesure avant/après.** Il n'existe pas de tableau de bord comparant

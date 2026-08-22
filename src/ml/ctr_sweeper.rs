@@ -32,6 +32,15 @@ const MAX_PER_SWEEP: usize = 500;
 /// Nombre de nouveaux samples avant réécriture du modèle sur disque.
 const SAVE_EVERY_SAMPLES: u64 = 50;
 
+/// Passages de balayage entre deux reconstructions de l'espace collaboratif.
+///
+/// Quinze minutes. La co-occurrence bouge à l'échelle des j'aime, pas des
+/// secondes, et la factorisation lit toute la matrice : la refaire plus souvent
+/// coûterait sans rien apprendre de neuf. Le repère doit d'ailleurs être STABLE
+/// d'un rafraîchissement au suivant, sinon le poids appris sur le trait
+/// d'affinité poursuit une cible mouvante — voir `crate::collab`.
+const COLLAB_EVERY_SWEEPS: u32 = 15;
+
 pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
@@ -43,9 +52,18 @@ pub fn spawn(recommender: Arc<RecommenderService>, cache: CacheManager) {
         let mut last_saved_at = recommender.ctr_stats().0;
         let mut last_dwell_saved_at = recommender.dwell_stats().0;
         let mut last_objectives_saved_at = recommender.objective_samples();
+        // Reconstruit une première fois dès le démarrage : sans ça, le trait
+        // d'affinité resterait neutre pendant le premier quart d'heure de vie
+        // du service, à chaque déploiement.
+        recommender.refresh_collab_space().await;
+        let mut sweeps: u32 = 0;
 
         loop {
             ticker.tick().await;
+            sweeps = sweeps.wrapping_add(1);
+            if sweeps % COLLAB_EVERY_SWEEPS == 0 {
+                recommender.refresh_collab_space().await;
+            }
 
             let expired = cache.drain_expired_impressions(MAX_PER_SWEEP).await;
             let n = expired.len();
