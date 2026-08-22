@@ -58,9 +58,35 @@ pub const DIM: usize = 16;
 
 /// En dessous, la factorisation n'a pas de sens — on préfère ne rien rendre.
 ///
-/// Trente auteurs pour seize axes est déjà maigre ; c'est un plancher, pas une
-/// cible.
-const MIN_AUTHORS: usize = 30;
+/// Huit points suffisent à porter deux axes en gardant quatre points par axe.
+/// Sous ce seuil, il n'y a plus de graphe, seulement une poignée de relations
+/// isolées.
+///
+/// ⚠ Ce plancher valait 30 dans la première version, et c'était une erreur de
+/// cadrage : le vrai problème n'était pas le nombre d'auteurs mais le fait de
+/// réclamer `DIM` axes quel que soit ce nombre. Seize directions orthogonales
+/// ne s'estiment pas à partir de douze points — les quatre dernières n'auraient
+/// été que du bruit orthonormé. C'est `effective_dim` qui règle ça, et le
+/// plancher redevient ce qu'il aurait toujours dû être : bas.
+const MIN_AUTHORS: usize = 8;
+
+/// Points de graphe exigés par axe extrait.
+///
+/// Quatre : en dessous, un « axe » ne sépare plus des groupes, il mémorise des
+/// individus. C'est le même raisonnement que le nombre d'observations par
+/// paramètre en régression, appliqué à une factorisation.
+const AUTHORS_PER_AXIS: usize = 4;
+
+/// Nombre d'axes réellement extractibles d'un graphe de `n` auteurs.
+///
+/// Une falaise remplacée par une rampe : le module ne se tait plus dès qu'il
+/// manque un auteur, il parle à la résolution que le corpus autorise, et cette
+/// résolution monte toute seule à mesure que le corpus grossit. Les axes non
+/// extraits restent à zéro dans le vecteur — un plongement de plus faible
+/// dimension complété par des zéros, ce qui laisse le cosinus valide.
+pub fn effective_dim(authors: usize) -> usize {
+    (authors / AUTHORS_PER_AXIS).clamp(2, DIM)
+}
 
 /// Plafond de la matrice. Au-delà, on garde les auteurs les mieux connectés :
 /// le coût de l'itération est linéaire en nombre d'arêtes, et les auteurs à une
@@ -222,12 +248,16 @@ impl CollabSpace {
             rows[i].push((j, (*w / norm) as f32));
         }
 
-        let basis = subspace_iteration(&rows, n, DIM, ITERATIONS);
+        let dims = effective_dim(n);
+        let basis = subspace_iteration(&rows, n, dims, ITERATIONS);
 
         let mut vectors = HashMap::with_capacity(n);
         for (id, i) in index {
+            // Les axes au-dela de `dims` restent a zero : le vecteur vit dans
+            // un sous-espace de dimension `dims`, complete par des zeros. Le
+            // cosinus reste exact, il porte simplement moins de nuances.
             let mut v = [0.0f32; DIM];
-            for (d, item) in v.iter_mut().enumerate() {
+            for (d, item) in v.iter_mut().enumerate().take(dims) {
                 *item = basis[d][i];
             }
             if normalize(&mut v) {
@@ -237,7 +267,8 @@ impl CollabSpace {
 
         info!(
             authors = vectors.len(),
-            dims = DIM,
+            dims,
+            max_dims = DIM,
             "Plongements collaboratifs reconstruits"
         );
         Self { vectors }
@@ -412,6 +443,55 @@ mod tests {
             .collect();
         let space = CollabSpace::from_edges(edges);
         assert!(!space.is_usable(), "5 auteurs ne font pas un espace");
+    }
+
+    /// La rampe : le nombre d'axes suit la taille du graphe, et ne demande
+    /// jamais plus de directions qu'il n'y a de points pour les porter.
+    #[test]
+    fn la_dimension_suit_la_taille_du_graphe() {
+        assert_eq!(effective_dim(8), 2, "plancher a deux axes");
+        assert_eq!(effective_dim(12), 3);
+        assert_eq!(effective_dim(40), 10);
+        assert_eq!(effective_dim(4000), DIM, "plafonne a DIM");
+        // L'invariant qui compte : jamais plus d'axes que d'auteurs.
+        for n in 8..200 {
+            assert!(effective_dim(n) <= n, "n={n}");
+        }
+    }
+
+    /// Le cas REEL de la production au 2026-08-22 : douze auteurs, un graphe
+    /// dense (85 %) et des poids qui vont de 1 a 218. La premiere version se
+    /// taisait dessus ; elle ne doit plus.
+    #[test]
+    fn douze_auteurs_denses_produisent_un_espace() {
+        // Deux groupes qui se co-apprecient fortement, plus un fond faible
+        // entre tout le monde — la forme d'un petit graphe reel.
+        let mut edges = Vec::new();
+        for i in 0..12 {
+            for j in 0..12 {
+                if i == j {
+                    continue;
+                }
+                let meme_groupe = (i < 6) == (j < 6);
+                edges.push((
+                    format!("a{i}"),
+                    format!("a{j}"),
+                    if meme_groupe { 200.0 } else { 2.0 },
+                ));
+            }
+        }
+        let space = CollabSpace::from_edges(edges);
+        assert!(space.is_usable(), "douze auteurs doivent suffire");
+        assert_eq!(space.len(), 12);
+
+        // Et la structure doit ressortir : un lecteur du premier groupe est
+        // plus proche du premier groupe que du second.
+        let lecteur = space
+            .reader(&[("a0".into(), 1.0), ("a1".into(), 1.0)])
+            .expect("lecteur placable");
+        let dedans = space.affinity(&lecteur, "a4").unwrap();
+        let dehors = space.affinity(&lecteur, "a9").unwrap();
+        assert!(dedans > dehors, "dedans={dedans} dehors={dehors}");
     }
 
     /// LE test du module : deux communautés disjointes doivent se retrouver

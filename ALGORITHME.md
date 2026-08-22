@@ -322,10 +322,16 @@ d'un coup**. Le repère est déterministe d'une reconstruction à l'autre (tri p
 degré puis par identifiant) : sans cela, le poids appris sur ce trait
 poursuivrait une cible mouvante.
 
-> **En dessous de 30 auteurs placés, le module se tait** et le trait retombe sur
-> sa valeur neutre (0,5 = « aucun rapport constaté »). À dix auteurs éligibles,
-> c'est le cas aujourd'hui : le code est écrit pour mordre quand le corpus
-> grossira, pas pour faire semblant maintenant.
+**Le nombre d'axes suit la taille du graphe** — `effective_dim(n) = n/4`, borné
+à [2, 16]. Réclamer seize directions orthogonales à douze points n'a pas de sens :
+les dernières ne seraient que du bruit orthonormé. Douze auteurs donnent donc
+trois axes, quarante en donnent dix, et la résolution monte toute seule à mesure
+que le corpus grossit — sans rien changer au code.
+
+> **En dessous de 8 auteurs placés, le module se tait** et le trait retombe sur
+> sa valeur neutre (0,5 = « aucun rapport constaté »). Mesuré en production le
+> 2026-08-22 : 12 auteurs, 112 arêtes sur 132 possibles (85 % de densité), poids
+> de 1 à 218 — le graphe est dense et bien pondéré, il porte trois axes.
 
 ### 5.7 Le mélange dépend de la surface
 
