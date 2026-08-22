@@ -176,7 +176,13 @@ impl RecommenderService {
                         crate::algorithm::scoring::FeedShape::empty(),
                         &AlgoWeights::default(),
                     );
-                let features = ctr_feature_vector(tweet, &profile, &scored);
+                // 0,5 = « aucun rapport constate » pour l'affinite collaborative.
+                // Ce rattrapage reconstruit des vecteurs pour des impressions
+                // PASSEES ; l'espace factorise d'aujourd'hui ne dit rien de la
+                // position qu'occupaient ces auteurs a ce moment-la, et
+                // inventer une valeur apprendrait au modele une correlation qui
+                // n'a jamais existe. La valeur neutre est la seule honnete.
+                let features = ctr_feature_vector(tweet, &profile, &scored, 0.5);
                 model.update(&features, clicked);
                 samples_trained += 1;
                 trained_for_user += 1;

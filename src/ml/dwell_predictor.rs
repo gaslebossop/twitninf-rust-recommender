@@ -77,6 +77,19 @@ impl Default for DwellModel {
                      // lit plus longuement en haut de page qu'en bas, alors
                      // qu'on y clique certainement plus. Le modèle
                      // l'apprendra s'il y a quelque chose à apprendre.
+                // ── Croisements (voir `ctr_predictor::CROSS_BASE`) ─────────
+                // Tous nuls sauf celui qui porte le média : le temps de
+                // consommation d'une image ou d'une vidéo est non nul par
+                // construction, donc son croisement avec la personnalisation
+                // est le seul dont le signe soit évident d'avance.
+                0.0,  // d3 x activité du lecteur
+                0.06, // d8 x has_media
+                0.0,  // d1 x is_recent
+                0.0,  // d2 x activité du lecteur
+                0.0,  // d5 x d8
+                // Un auteur proche du gout du lecteur retient plus longtemps :
+                // c'est plausible, mais moins evident que pour le clic.
+                0.05, // affinite collaborative
             ],
             bias: logit(NEUTRAL01),
             learning_rate: 0.01,
@@ -278,7 +291,7 @@ mod tests {
     use crate::ml::ctr_predictor::extract_features;
 
     fn sample_features() -> [f64; N_FEATURES] {
-        extract_features(0.6, 0.5, 0.4, 0.5, 0.4, 0.3, 0.4, 0.3, 0.5, false, true, 5000, 0.5, 0.5)
+        extract_features(0.6, 0.5, 0.4, 0.5, 0.4, 0.3, 0.4, 0.3, 0.5, false, true, 5000, 0.5, 0.5, 0.5)
     }
 
     #[test]

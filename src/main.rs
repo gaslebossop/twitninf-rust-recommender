@@ -3,6 +3,7 @@ mod ads;
 mod algorithm;
 mod bandit;
 mod calibration;
+mod collab;
 mod config;
 mod constants;
 mod cooccurrence;

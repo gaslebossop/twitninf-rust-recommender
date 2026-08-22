@@ -275,10 +275,43 @@ pub fn score_tweet_with_weights(
 /// pas dominer une dimension qui n'a encore rien appris à côté de lui. Et
 /// l'amplification pèse plus que le temps de lecture — relayer engage sa
 /// propre audience, lire longuement n'engage que soi.
-const W_RULES: f64 = 0.50;
-const W_CTR: f64 = 0.30;
+/// ── Pourquoi ces valeurs ont change ────────────────────────────────────────
+/// Les tetes positives n'entrent plus dans le melange sous forme de
+/// probabilite brute, mais de `lift` centre sur 0,5 (voir `Head::lift`). C'est
+/// ce qui rend ces poids honnetes : avant, une tete qui predisait 0,02 ne
+/// pouvait pas peser 30 % d'une moyenne ponderee ou les regles valaient 0,5 —
+/// elle abaissait tous les scores d'a peu pres autant, sans changer d'ordre.
+/// Le melange annonce moitie/moitie etait donc, en pratique, presque
+/// entierement pilote par les regles.
+///
+/// ── Et pourquoi PAS les ratios de X ────────────────────────────────────────
+/// Le classeur lourd de X pese la reponse 13,5 contre 0,5 pour le j'aime.
+/// Recopier ce rapport ici serait une erreur : chez X les poids compensent la
+/// RARETE de chaque evenement a l'interieur d'une somme, or notre `lift` a
+/// deja fait ce travail. Ce qui reste a exprimer, c'est seulement combien on
+/// TIENT a chaque geste, a rarete deja neutralisee. D'ou un etalement bien
+/// plus resserre — mais le meme ordre : repondre vaut plus que relayer, qui
+/// vaut plus que visiter un profil, qui vaut plus qu'aimer.
+const W_RULES: f64 = 0.90;
+/// Ecrire une reponse est le geste le plus couteux et le plus rare.
+const W_REPLY: f64 = 0.24;
+/// Relayer engage sa propre audience — et doit donc peser plus que le temps de
+/// lecture, qui n'engage que soi. Ordre verrouille par un test.
+const W_AMPLIFY: f64 = 0.22;
+/// Le temps de lecture : mesure, mais devine — voir `algorithm::dwell`.
 const W_DWELL: f64 = 0.20;
-const W_AMPLIFY: f64 = 0.25;
+/// Aller voir l'auteur, c'est de l'interet pour le compte, pas pour le post.
+const W_PROFILE: f64 = 0.10;
+/// Le j'aime coute un pouce.
+const W_FAV: f64 = 0.08;
+/// La tete generique, tous gestes positifs confondus.
+///
+/// Fortement REDUITE (0,30 -> 0,12) : depuis que les tetes par evenement
+/// existent, elle dit surtout ce qu'elles disent deja, en moins precis. On ne
+/// la retire pas pour autant — c'est la seule qui porte des dizaines de
+/// milliers d'echantillons d'historique, la ou les nouvelles repartent de zero.
+/// Sa part decroitra d'elle-meme a mesure que les autres murissent.
+const W_CTR: f64 = 0.12;
 
 /// Part de score qu'un rejet CERTAIN retire.
 ///
@@ -306,13 +339,55 @@ const REJECT_PENALTY_MAX: f64 = 0.60;
 /// mélange passe de 0,60/0,40 à 0,625/0,375 (et 0,70/0,30 → 0,714/0,286 pour
 /// le dwell seul). L'écart va dans le sens prudent — les règles pèsent un
 /// peu PLUS — et la formule unique vaut mieux qu'une table à maintenir.
+/// Ponderation des tetes selon la SURFACE.
+///
+/// Instagram fait tourner un modele different par surface ; a notre volume,
+/// decouper le modele en quatre diviserait par quatre un compte d'echantillons
+/// deja mince. On garde donc UN modele et on fait varier son poids : c'est le
+/// meme raisonnement que `AlgoWeights`, applique un cran plus haut.
+///
+/// Chaque champ est un multiplicateur applique aux poids ci-dessus.
+#[derive(Debug, Clone, Copy)]
+pub struct BlendProfile {
+    pub rules: f64,
+    pub learned: f64,
+}
+
+impl BlendProfile {
+    /// Fil principal et decouverte : le melange nominal.
+    pub const BALANCED: BlendProfile = BlendProfile { rules: 1.0, learned: 1.0 };
+
+    /// Tendances : ce qui fait qu'un contenu monte est dans D1 et D7, pas dans
+    /// ce qu'un lecteur particulier a l'habitude d'aimer. On rend la main aux
+    /// regles.
+    pub const TRENDING: BlendProfile = BlendProfile { rules: 1.35, learned: 0.65 };
+
+    /// Fil d'abonnement : le lecteur a DEJA choisi ces comptes. Une tete
+    /// d'engagement qui rerange ce qu'il a explicitement demande se met en
+    /// travers de son choix — c'est le reproche fait a tous les fils
+    /// chronologiques devenus algorithmiques.
+    pub const FOLLOWING: BlendProfile = BlendProfile { rules: 1.20, learned: 0.80 };
+}
+
+impl Default for BlendProfile {
+    fn default() -> Self {
+        Self::BALANCED
+    }
+}
+
 fn blend_positive(rules: f64, terms: &[(f64, Option<f64>)]) -> f64 {
-    let mut weighted = rules * W_RULES;
-    let mut total = W_RULES;
+    blend_positive_with(BlendProfile::BALANCED, rules, terms)
+}
+
+fn blend_positive_with(profile: BlendProfile, rules: f64, terms: &[(f64, Option<f64>)]) -> f64 {
+    let w_rules = W_RULES * profile.rules;
+    let mut weighted = rules * w_rules;
+    let mut total = w_rules;
     for (weight, value) in terms {
         if let Some(v) = value {
-            weighted += v * weight;
-            total += weight;
+            let w = weight * profile.learned;
+            weighted += v * w;
+            total += w;
         }
     }
     (weighted / total).clamp(0.0, 1.0)
@@ -345,6 +420,8 @@ pub fn score_tweet_ml_with_weights(
     objectives: Option<&ObjectivePredictor>,
     realtime_boost: f64,
     weights: &AlgoWeights,
+    blend: BlendProfile,
+    collab_affinity: f64,
 ) -> ScoredTweet {
     let mut scored = score_tweet_with_weights(
         tweet,
@@ -354,7 +431,7 @@ pub fn score_tweet_ml_with_weights(
         weights,
     );
 
-    let features = ctr_feature_vector(tweet, profile, &scored);
+    let features = ctr_feature_vector(tweet, profile, &scored, collab_affinity);
     scored.ctr_features = Some(features.to_vec());
 
     // Prédiction faite ICI et non par l'appelant : les features ne sont
@@ -366,7 +443,10 @@ pub fn score_tweet_ml_with_weights(
         .map(|o| o.predict(&features))
         .unwrap_or_default();
 
-    let ml_ctr = ctr.map(|m| m.predict_ctr(&features));
+    // `ctr_lift` et non `predict_ctr` : c'est la valeur ramenee sur l'echelle
+    // commune du melange. La probabilite brute reste ce qu'on mesure, pas ce
+    // qu'on classe.
+    let ml_ctr = ctr.map(|m| m.ctr_lift(&features));
     // Le dwell prédit vit sur [SKIP_PENALTY, MAX_BONUS] (voir `algorithm::dwell`),
     // pas [0, 1] comme le CTR et le score de règles — reprojeté pour mélanger
     // sur la même échelle que les autres termes.
@@ -375,12 +455,16 @@ pub fn score_tweet_ml_with_weights(
         ((predicted - DWELL_MIN) / (DWELL_MAX - DWELL_MIN)).clamp(0.0, 1.0)
     });
 
-    scored.score = blend_positive(
+    scored.score = blend_positive_with(
+        blend,
         scored.score,
         &[
             (W_CTR, ml_ctr),
             (W_DWELL, ml_dwell01),
-            (W_AMPLIFY, objectives.amplify),
+            (W_AMPLIFY, objectives.amplify_lift),
+            (W_REPLY, objectives.reply_lift),
+            (W_PROFILE, objectives.profile_lift),
+            (W_FAV, objectives.fav_lift),
         ],
     );
 
@@ -388,7 +472,7 @@ pub fn score_tweet_ml_with_weights(
     // Appliqué APRÈS le mélange positif, sur le score déjà constitué : un tweet
     // que le modèle s'attend à voir signalé est rétrogradé quelle que soit sa
     // qualité par ailleurs, exactement comme la pénalité de toxicité.
-    if let Some(p_reject) = objectives.reject {
+    if let Some(p_reject) = objectives.reject_p {
         let penalty = 1.0 - REJECT_PENALTY_MAX * p_reject.clamp(0.0, 1.0);
         scored.score *= penalty;
         trace!(tweet_id = %tweet.id, p_reject, penalty, "Tête de rejet appliquée");
@@ -417,6 +501,10 @@ pub(crate) fn ctr_feature_vector(
     tweet: &RawTweet,
     profile: &UserProfile,
     scored: &ScoredTweet,
+    // Affinite collaborative lecteur x auteur, deja resolue par l'appelant :
+    // elle demande l'espace factorise (`crate::collab`), que le scoring n'a pas
+    // et n'a pas a avoir. Meme traitement que `realtime_boost`.
+    collab_affinity: f64,
 ) -> [f64; N_FEATURES] {
     let age_h = age_hours(tweet);
     let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
@@ -438,6 +526,7 @@ pub(crate) fn ctr_feature_vector(
         tweet.author_followers,
         ev_accel,
         reader_engagement,
+        collab_affinity,
     )
 }
 
@@ -1469,14 +1558,63 @@ mod tests {
         );
     }
 
-    /// Le barème historique à trois termes (règles/CTR/dwell = 0,50/0,30/0,20)
-    /// doit être reproduit à l'identique : c'est le cas nominal en production
-    /// une fois les deux modèles mûrs.
+    /// Le melange annonce « moitie regles, moitie modeles » doit l'etre
+    /// REELLEMENT une fois toutes les tetes mures.
+    ///
+    /// C'est ce que la normalisation en `lift` a rendu possible : avec des
+    /// probabilites brutes, une tete rare ne pouvait pas peser sa part
+    /// nominale, quel que soit son poids. Ce test verrouille la parite a
+    /// quelques points pres — s'il casse, c'est qu'une tete a ete ajoutee sans
+    /// rearbitrer l'equilibre.
     #[test]
-    fn le_bareme_historique_a_trois_termes_est_reproduit() {
-        let attendu = 0.40 * 0.50 + 0.80 * 0.30 + 0.60 * 0.20;
-        let obtenu = blend_positive(0.40, &[(W_CTR, Some(0.80)), (W_DWELL, Some(0.60))]);
-        assert!((obtenu - attendu).abs() < 1e-12, "{obtenu} vs {attendu}");
+    fn a_pleine_maturite_le_melange_est_a_parite() {
+        let somme_apprise = W_CTR + W_DWELL + W_AMPLIFY + W_REPLY + W_PROFILE + W_FAV;
+        let part_regles = W_RULES / (W_RULES + somme_apprise);
+        assert!(
+            (0.45..=0.55).contains(&part_regles),
+            "les regles pesent {part_regles}, hors de la fourchette de parite"
+        );
+    }
+
+    /// Une tete encore froide ne doit pas deplacer l'equilibre : elle sort du
+    /// denominateur, elle ne vaut pas zero.
+    #[test]
+    fn une_tete_froide_ne_penalise_pas_le_tweet() {
+        let toutes_froides = blend_positive(0.40, &[(W_CTR, None), (W_REPLY, None)]);
+        assert!((toutes_froides - 0.40).abs() < 1e-12);
+        // Une tete tiede a 0,5 (valeur exactement moyenne d'un lift) laisse le
+        // score de regles ou il est, elle ne le tire ni vers le haut ni vers le
+        // bas.
+        let neutre = blend_positive(0.50, &[(W_REPLY, Some(0.5))]);
+        assert!((neutre - 0.50).abs() < 1e-12, "{neutre}");
+    }
+
+    /// Le profil de surface deplace le curseur dans le bon sens.
+    #[test]
+    fn le_profil_de_surface_change_la_part_des_regles() {
+        let regles = 0.80;
+        let tete = 0.20;
+        let equilibre = blend_positive_with(
+            BlendProfile::BALANCED,
+            regles,
+            &[(W_CTR, Some(tete))],
+        );
+        let tendances = blend_positive_with(
+            BlendProfile::TRENDING,
+            regles,
+            &[(W_CTR, Some(tete))],
+        );
+        let abonnements = blend_positive_with(
+            BlendProfile::FOLLOWING,
+            regles,
+            &[(W_CTR, Some(tete))],
+        );
+        // Les regles valent 0,80 et la tete 0,20 : plus les regles pesent, plus
+        // le resultat monte.
+        assert!(
+            tendances > abonnements && abonnements > equilibre,
+            "tendances={tendances} abonnements={abonnements} equilibre={equilibre}"
+        );
     }
 
     /// Le mélange reste une moyenne pondérée : il ne peut pas sortir de

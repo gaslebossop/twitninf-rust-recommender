@@ -8,7 +8,7 @@ use tokio::join;
 use tracing::{debug, info, trace, warn};
 
 use crate::algorithm::scoring::{
-    compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights,
+    compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights, BlendProfile,
     theme_diversity_multiplier, FeedShape,
 };
 use crate::bandit::bandit_select;
@@ -50,6 +50,12 @@ pub struct RecommenderService {
     /// Têtes multi-objectifs (amplification, rejet) — voir `ml::objectives`.
     objectives: ObjectivePredictor,
     auto_tuner: std::sync::Arc<AutoTuner>,
+    /// Espace collaboratif — voir `crate::collab`.
+    ///
+    /// Reconstruit périodiquement en tâche de fond, jamais modifié sur place :
+    /// le classement le lit sous verrou partagé pendant qu'une reconstruction
+    /// prépare le suivant à côté, puis l'échange d'un coup.
+    collab: std::sync::Arc<std::sync::RwLock<crate::collab::CollabSpace>>,
 }
 
 impl RecommenderService {
@@ -60,6 +66,7 @@ impl RecommenderService {
             ctr_predictor: CtrPredictor::new(),
             dwell_predictor: DwellPredictor::new(),
             objectives: ObjectivePredictor::new(),
+            collab: Default::default(),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -75,6 +82,7 @@ impl RecommenderService {
             ctr_predictor: CtrPredictor::new(),
             dwell_predictor: DwellPredictor::new(),
             objectives: ObjectivePredictor::new(),
+            collab: Default::default(),
             auto_tuner,
         }
     }
@@ -96,6 +104,7 @@ impl RecommenderService {
             ctr_predictor,
             dwell_predictor,
             objectives,
+            collab: Default::default(),
             auto_tuner,
         }
     }
@@ -110,6 +119,7 @@ impl RecommenderService {
             ctr_predictor,
             dwell_predictor,
             objectives,
+            collab: Default::default(),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -142,6 +152,29 @@ impl RecommenderService {
     /// Persiste le modèle CTR sur disque.
     pub async fn persist_ctr_model(&self) {
         self.ctr_predictor.save().await;
+    }
+
+    /// Reconstruit l'espace collaboratif depuis la co-occurrence.
+    ///
+    /// Appelé par la boucle de fond (`ml::ctr_sweeper`). La reconstruction se
+    /// fait ENTIÈREMENT hors du verrou : lire Redis et factoriser prend le
+    /// temps que ça prend, et bloquer le classement pendant ce temps mettrait
+    /// tous les fils en attente. Seul l'échange final est sous verrou.
+    pub async fn refresh_collab_space(&self) {
+        let space = crate::collab::CollabSpace::build(&self.cache).await;
+        let authors = space.len();
+        let usable = space.is_usable();
+        *self.collab.write().unwrap() = space;
+        info!(
+            authors,
+            usable, "Espace collaboratif echange"
+        );
+    }
+
+    /// (auteurs places, exploitable ?) — pour `/admin/algo/stats`.
+    pub fn collab_stats(&self) -> (usize, bool) {
+        let s = self.collab.read().unwrap();
+        (s.len(), s.is_usable())
     }
 
     pub fn ctr_predictor(&self) -> &CtrPredictor {
@@ -854,6 +887,26 @@ impl RecommenderService {
         // Même garde-fou que le CTR, seuil identique : les deux modèles partagent
         // le même vecteur de features et démarrent d'un prior tout aussi vide.
         let use_dwell = dwell_samples >= 200;
+        // Le melange depend de la SURFACE — voir `BlendProfile`. Resolu une
+        // fois pour tout le lot : le mode ne change pas d'un candidat a
+        // l'autre.
+        // ── Position du lecteur dans l'espace collaboratif ─────────────────
+        //
+        // Resolue UNE fois pour tout le lot : elle ne depend que du lecteur.
+        // `None` quand l'espace est trop maigre ou que ce lecteur n'a aucun
+        // auteur place — le trait retombe alors sur sa valeur neutre, et le
+        // modele se comporte comme s'il n'existait pas.
+        let collab_space = self.collab.read().unwrap();
+        let reader_collab = collab_space
+            .is_usable()
+            .then(|| collab_space.reader(&profile.top_authors))
+            .flatten();
+
+        let blend_profile = match mode {
+            RecommendMode::Trending => BlendProfile::TRENDING,
+            RecommendMode::Feed => BlendProfile::FOLLOWING,
+            RecommendMode::ForYou | RecommendMode::Discover => BlendProfile::BALANCED,
+        };
         let detector = GarbageContentDetector::new();
         let enforcer = ShadowbanEnforcer::new();
         let mut dropped_garbage = 0usize;
@@ -953,6 +1006,11 @@ impl RecommenderService {
                 Some(&self.objectives),
                 realtime_boost,
                 weights,
+                blend_profile,
+                reader_collab
+                    .as_ref()
+                    .and_then(|v| collab_space.affinity(v, &tweet.user_id))
+                    .unwrap_or(0.5),
             );
             let base_score = s.score;
 

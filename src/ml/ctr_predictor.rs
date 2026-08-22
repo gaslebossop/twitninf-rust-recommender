@@ -20,7 +20,31 @@ use std::sync::{Arc, RwLock};
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-pub const N_FEATURES: usize = 16;
+pub const N_FEATURES: usize = 22;
+
+/// Indice du premier CROISEMENT de traits.
+///
+/// ── Ce que ces cinq traits achetent ────────────────────────────────────────
+/// Une regression logistique est ADDITIVE : elle ne peut pas apprendre « le
+/// graphe social compte davantage pour un lecteur tres actif ». Elle apprend un
+/// poids pour le graphe social et un poids pour l'activite du lecteur, et les
+/// additionne — l'interaction entre les deux lui est structurellement
+/// inaccessible.
+///
+/// C'est precisement ce qu'un reseau de neurones apprendrait a notre place. Or
+/// avec 16 traits DENSES (pas des identifiants a forte cardinalite), le nombre
+/// d'interactions utiles est petit et connu : on peut les ecrire. C'est le pont
+/// classique entre regression logistique et reseau — la machine a factorisation
+/// fait la meme chose en apprenant toutes les paires, ce qui coute `k·n`
+/// parametres la ou nous en depensons cinq.
+///
+/// ── Pourquoi APRES la feature de position ──────────────────────────────────
+/// `POSITION_FEATURE` vaut 15 et est lu par `record_impressions`. Les nouveaux
+/// traits sont donc ajoutes A LA FIN : la migration des modeles persistes
+/// (`migrate_legacy_weights`) complete un vecteur plus court par les defauts,
+/// donc les poids deja appris sur les 16 premiers traits survivent intacts. Ne
+/// jamais inserer un trait AVANT l'indice 15.
+pub const CROSS_BASE: usize = 16;
 
 /// Indice de la feature « rang auquel ce tweet a ete SERVI ».
 ///
@@ -92,6 +116,20 @@ pub struct CtrModel {
     pub samples_seen: u64,
     pub total_clicks: u64,
     pub total_views: u64,
+    /// Moyenne courante des predictions — denominateur de `lift`.
+    ///
+    /// Voir `ml::objectives::Head::lift` pour le raisonnement complet. En deux
+    /// mots : `blend_positive` est une moyenne PONDEREE, et une tete qui predit
+    /// autour de 0,05 face a un score de regles qui balaie 0,2–0,8 n'y apporte
+    /// presque aucune variance — elle abaisse tous les scores d'a peu pres
+    /// autant, ce qui ne change aucun ordre. Diviser par cette moyenne rend a
+    /// la tete la plage qui lui est due.
+    ///
+    /// `serde(default)` : le modele deja persiste en production ne porte pas ce
+    /// champ. Il repart de 0,0, et `lift` retombe sur son plancher le temps du
+    /// premier echantillon.
+    #[serde(default)]
+    pub pred_mean: f64,
 }
 
 impl Default for CtrModel {
@@ -120,12 +158,29 @@ impl Default for CtrModel {
                        // est grand, plus le clic est probable. C'est le seul
                        // prior qu'on connaisse avec certitude avant tout
                        // apprentissage.
+                // ── Croisements (voir `CROSS_BASE`) ────────────────────────
+                // Priors FAIBLES et tous positifs : on affirme seulement que
+                // ces produits vont dans le meme sens que leurs facteurs, ce
+                // qui est le minimum defendable. Leur amplitude est de toute
+                // facon petite — un produit de deux valeurs de [0,1] vaut en
+                // moyenne bien moins que chacune d'elles.
+                0.04, // d3 x activite du lecteur
+                0.03, // d8 x has_media
+                0.06, // d1 x is_recent — le croisement « ca decolle »
+                0.03, // d2 x activite du lecteur
+                0.03, // d5 x d8
+                // Prior NET : si deux lecteurs qui se ressemblent aiment le
+                // meme auteur, c'est le signal le plus direct qui existe.
+                // C'est aussi le seul trait dont on sait d'avance qu'il
+                // n'apporte rien quand il vaut 0,5 (voir `crate::collab`).
+                0.15, // affinite collaborative
             ],
             bias: -2.5867, // logit(PRIOR_CTR) — au lieu d'un -0.5 arbitraire qui prédisait ~38 % de CTR à froid
             learning_rate: 0.01,
             samples_seen: 0,
             total_clicks: 0,
             total_views: 0,
+            pred_mean: PRIOR_CTR,
         }
     }
 }
@@ -164,6 +219,20 @@ impl CtrModel {
             self.total_clicks += 1;
         }
         self.total_views += 1;
+        // Entretenue ici et pas dans `predict` : `predict` ne prend qu'un
+        // verrou de LECTURE et tourne sur chaque candidat de chaque fil.
+        let n = self.samples_seen as f64;
+        self.pred_mean += (pred - self.pred_mean) / n;
+    }
+
+    /// Prediction ramenee sur l'echelle commune du melange — voir `pred_mean`
+    /// et `ml::objectives::Head::lift`. Centree sur 0,5 quel que soit le taux
+    /// de base observe.
+    pub fn lift(&self, features: &[f64; N_FEATURES]) -> f64 {
+        let p = self.predict(features);
+        let mean = self.pred_mean.max(1e-4);
+        let l = p / mean;
+        l / (l + 1.0)
     }
 
     pub fn global_ctr(&self) -> f64 {
@@ -196,6 +265,7 @@ pub fn extract_features(
     author_followers: i64,
     acceleration: f64,
     reader_engagement: f64,
+    collab_affinity: f64,
 ) -> [f64; N_FEATURES] {
     extract_features_at(
         d1,
@@ -213,6 +283,7 @@ pub fn extract_features(
         acceleration,
         reader_engagement,
         serving_position(),
+        collab_affinity,
     )
 }
 
@@ -238,6 +309,7 @@ pub fn extract_features_at(
     acceleration: f64,
     reader_engagement: f64,
     position: f64,
+    collab_affinity: f64,
 ) -> [f64; N_FEATURES] {
     [
         d1,
@@ -256,6 +328,40 @@ pub fn extract_features_at(
         acceleration.clamp(0.0, 1.0),
         reader_engagement.clamp(0.0, 1.0),
         position.clamp(0.0, 1.0),
+        // ── Croisements — voir `CROSS_BASE` ─────────────────────────────
+        // 16 · graphe social x activite du lecteur. Un lecteur qui consomme
+        //      beaucoup a un graphe qui veut dire quelque chose ; celui d'un
+        //      compte inactif est une liste morte.
+        d3 * reader_engagement.clamp(0.0, 1.0),
+        // 17 · personnalisation x media. Le meme sujet ne se consomme pas de
+        //      la meme facon en texte et en video.
+        d8 * if has_media { 1.0 } else { 0.0 },
+        // 18 · velocite x fraicheur. Vingt j'aime en une heure et vingt
+        //      j'aime en trois jours sont le meme D1 et pas du tout le meme
+        //      evenement — c'est le croisement qui distingue un contenu qui
+        //      DECOLLE d'un contenu qui a simplement vecu.
+        d1 * if age_h < 2.0 { 1.0 } else { 0.0 },
+        // 19 · contenu x activite du lecteur. Un gros consommateur devient
+        //      plus exigeant sur la qualite ; un lecteur occasionnel prend ce
+        //      qu'on lui donne.
+        d2 * reader_engagement.clamp(0.0, 1.0),
+        // 20 · comportement x personnalisation. Les deux dimensions qui
+        //      decrivent le lecteur : leur produit dit « ce tweet lui
+        //      ressemble ET correspond a ses habitudes », ce que la somme des
+        //      deux ne distingue pas d'« il excelle sur une seule des deux ».
+        d5 * d8,
+        // 21 · AFFINITE COLLABORATIVE — voir `crate::collab`.
+        //
+        //      Le seul trait qui ne se deduit ni du tweet ni du profil : il
+        //      vient de la position du lecteur ET de celle de l'auteur dans un
+        //      espace factorise a partir du graphe de co-appreciation. C'est le
+        //      pendant du produit scalaire « interested in » x « known for » de
+        //      SimClusters.
+        //
+        //      0,5 quand l'un des deux n'est pas placable : la valeur d'un
+        //      cosinus nul, c'est-a-dire « aucun rapport constate », qui est
+        //      bien ce qu'on sait dans ce cas.
+        collab_affinity.clamp(0.0, 1.0),
     ]
 }
 
@@ -325,6 +431,13 @@ impl CtrPredictor {
     /// Retourne le score CTR prédit pour un tweet scoré
     pub fn predict_ctr(&self, features: &[f64; N_FEATURES]) -> f64 {
         self.0.read().unwrap().predict(features)
+    }
+
+    /// Ce que le CLASSEMENT consomme — voir `CtrModel::lift`. `predict_ctr`
+    /// reste la probabilite brute, qui est ce qu'il faut pour mesurer une AUC
+    /// ou une calibration.
+    pub fn ctr_lift(&self, features: &[f64; N_FEATURES]) -> f64 {
+        self.0.read().unwrap().lift(features)
     }
 
     /// Met à jour le modèle sur un event click/skip
@@ -412,6 +525,7 @@ mod tests {
         let model = CtrModel::default();
         let features = extract_features(
             0.8, 0.7, 0.6, 0.5, 0.5, 0.7, 0.6, 0.4, 1.0, true, true, 10000, 0.8, 0.5,
+            0.5,
         );
         let p = model.predict(&features);
         assert!(p >= 0.0 && p <= 1.0, "CTR prediction out of range: {p}");
@@ -422,6 +536,7 @@ mod tests {
         let mut model = CtrModel::default();
         let high_eng = extract_features(
             0.9, 0.8, 0.7, 0.6, 0.6, 0.8, 0.7, 0.5, 0.5, true, true, 50000, 0.9, 0.5,
+            0.5,
         );
         let initial_pred = model.predict(&high_eng);
 
@@ -472,9 +587,11 @@ mod tests {
     fn le_classement_utilise_la_meme_position_pour_tout_le_monde() {
         let a = extract_features(
             0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, true, true, 100, 0.5, 0.5,
+            0.5,
         );
         let b = extract_features(
             0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 9.0, false, false, 5, 0.1, 0.2,
+            0.5,
         );
         assert_eq!(a[POSITION_FEATURE], b[POSITION_FEATURE]);
         assert_eq!(a[POSITION_FEATURE], serving_position());
@@ -487,10 +604,12 @@ mod tests {
         let tete = extract_features_at(
             0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, false, false, 10, 0.5, 0.5,
             position_discount(0),
+            0.5,
         );
         let bas = extract_features_at(
             0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, false, false, 10, 0.5, 0.5,
             position_discount(40),
+            0.5,
         );
         assert!(tete[POSITION_FEATURE] > bas[POSITION_FEATURE]);
         // Tout le reste du vecteur est identique : seule la position change.
@@ -507,6 +626,7 @@ mod tests {
         let contenu = |position: f64| {
             extract_features_at(
                 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 100, 0.5, 0.5, position,
+                0.5,
             )
         };
         let mut rng = 0xDEADBEEFCAFEBABEu64;
@@ -567,9 +687,11 @@ mod tests {
         let predictor = CtrPredictor::new();
         let fort = extract_features(
             0.95, 0.8, 0.7, 0.6, 0.6, 0.5, 0.8, 0.5, 0.5, true, true, 50_000, 0.9, 0.6,
+            0.5,
         );
         let faible = extract_features(
             0.05, 0.1, 0.1, 0.1, 0.1, 0.1, 0.05, 0.1, 20.0, false, false, 3, 0.0, 0.05,
+            0.5,
         );
 
         // Ordre pseudo-aleatoire, pas alterne : voir `melange` plus bas.
@@ -606,6 +728,7 @@ mod tests {
         let predictor = CtrPredictor::new();
         let f = extract_features(
             0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 5.0, false, true, 1_000, 0.5, 0.5,
+            0.5,
         );
         let mut rng = 0x9E3779B97F4A7C15u64;
         for _ in 0..2_000 {
@@ -652,6 +775,7 @@ mod tests {
         let mut model = CtrModel::default();
         let features = extract_features(
             0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0, false, false, 1000, 0.5, 0.5,
+            0.5,
         );
         let before = model.predict(&features);
         model.update(&features, true); // clicked → should increase

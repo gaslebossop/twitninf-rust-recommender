@@ -17,6 +17,7 @@ pub mod ads; // Targeted advertising
 pub mod algorithm;
 pub mod bandit; // Phase 3: Contextual Bandit
 pub mod calibration; // Recalibration explicite de l'algo, depuis les Paramètres
+pub mod collab; // Plongements collaboratifs : lecteurs et auteurs dans le meme espace
 pub mod constants;
 pub mod cooccurrence;
 pub mod embeddings;

@@ -538,6 +538,8 @@ pub async fn admin_algo_eval_handler(
 ) -> (StatusCode, Json<Value>) {
     require_admin!(headers, state);
 
+    let heads = state.recommender.objective_predictor().stats_all();
+    let (collab_authors, collab_usable) = state.recommender.collab_stats();
     let (amplify, reject) = state.recommender.objective_predictor().eval_reports();
     let (gain_amplify, gain_reject) =
         state.recommender.objective_predictor().calibration_gains();
@@ -552,6 +554,24 @@ pub async fn admin_algo_eval_handler(
             "models": {
                 "ctr": state.recommender.ctr_predictor().eval_report(),
                 "dwell": state.recommender.dwell_predictor().eval_report(),
+                // Les cinq tetes, dans l'ordre de `Objective::ALL` :
+                // amplification, rejet, j'aime, reponse, profil.
+                "heads": heads
+                    .iter()
+                    .zip(["amplify", "reject", "fav", "reply", "profile"])
+                    .map(|((samples, rate, ready), name)| {
+                        serde_json::json!({
+                            "name": name,
+                            "samples": samples,
+                            "base_rate": rate,
+                            "active": ready,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "collab": {
+                    "authors": collab_authors,
+                    "usable": collab_usable,
+                },
                 "amplify": amplify,
                 "reject": reject,
             },
