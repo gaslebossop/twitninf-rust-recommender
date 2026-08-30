@@ -70,16 +70,24 @@ impl ShadowbanEnforcer {
 
     /// Filtre dur — le tweet a-t-il sa place sur cette surface ?
     ///
-    /// Un invariant traverse toute la fonction : **un lecteur ne perd jamais un
-    /// compte qu'il suit.** Le fil d'abonnement n'est fermé à aucun niveau, et un
-    /// auteur suivi n'est jamais retiré de « Pour toi ». Retirer en silence à
-    /// quelqu'un un compte qu'il a explicitement demandé, c'est précisément le
-    /// reproche que le mot « shadowban » désigne — et ça n'apporte rien : le
-    /// lecteur ira le chercher sur le profil, où le contenu est de toute façon
-    /// resté.
+    /// Deux verdicts distincts, et ils ne suivent PAS la même règle :
     ///
-    /// Ce qui est fermé, ce sont les surfaces où l'on **pousse** du contenu vers
-    /// des gens qui n'ont rien demandé.
+    /// 1. **La restriction de COMPTE** (`level`) ne fait aucune exception pour
+    ///    les abonnés. `Suppressed` ferme toute recommandation — « Pour toi »
+    ///    compris — et `Ghosted` ferme jusqu'au fil d'abonnement. C'est la
+    ///    décision produit du 2026-08-30 : les deux derniers crans sont des
+    ///    sanctions de compte, pas des réglages de découverte, donc suivre
+    ///    l'auteur ne les contourne plus.
+    ///
+    ///    Ce qui reste vrai : le contenu n'est jamais supprimé et le profil
+    ///    continue de le servir. Ce sont les FILS qui se ferment.
+    ///
+    /// 2. **L'inéligibilité d'un POST** (`eligibility`) garde, elle,
+    ///    l'exception : elle vise un contenu isolé publié par un compte par
+    ///    ailleurs sain, et retirer ça du fil de quelqu'un qui a explicitement
+    ///    demandé l'auteur n'a jamais été le but. Elle ne joue donc que sur les
+    ///    surfaces où l'on POUSSE du contenu vers des gens qui n'ont rien
+    ///    demandé.
     pub fn admit(
         &self,
         level: ShadowbanLevel,
@@ -87,24 +95,18 @@ impl ShadowbanEnforcer {
         surface: Surface,
         viewer_follows_author: bool,
     ) -> Verdict {
-        // Le fil d'abonnement n'est jamais filtré, à aucun niveau.
-        if surface == Surface::FollowerFeed {
-            return Verdict::allow(level.score_multiplier());
+        // 1. Restriction de compte — quel que soit le lien d'abonnement.
+        if level.restricts(surface) {
+            return Verdict::block(match level {
+                ShadowbanLevel::Ghosted => "account_ghosted",
+                _ => "account_suppressed",
+            });
         }
 
-        // « Pour toi » mélange comptes suivis et découverte : seule la moitié
-        // découverte est concernée. Sans cette exception, un compte restreint
-        // disparaîtrait pour ses propres abonnés, puisque l'application sert son
-        // fil principal en mode `for_you` et non en mode `feed`.
-        let is_discovery = !viewer_follows_author || surface != Surface::ForYou;
-
+        // 2. Inéligibilité du post — seulement là où l'on pousse le contenu.
+        let is_discovery =
+            surface.is_recommendation() && (!viewer_follows_author || surface != Surface::ForYou);
         if is_discovery {
-            if level.restricts(surface) {
-                return Verdict::block(match level {
-                    ShadowbanLevel::Ghosted => "account_ghosted",
-                    _ => "account_suppressed",
-                });
-            }
             if let ContentEligibility::NotRecommended(reason) = eligibility {
                 return Verdict::block(reason.label());
             }
@@ -120,11 +122,12 @@ impl ShadowbanEnforcer {
     /// une mise en avant : le fermer au mode seul laisserait passer par la porte
     /// de derrière ce qu'on ferme par la grande.
     ///
-    /// Sauf pour un compte suivi : quelle que soit la source qui l'a récupéré,
-    /// le lecteur l'a demandé, donc ce n'est pas une mise en avant. Sans cette
-    /// exception l'invariant d'`admit()` fuyait — il suffisait que la
-    /// déduplication retienne la source `Trending` pour qu'un abonné perde un
-    /// compte restreint dans son fil principal.
+    /// Sauf pour un compte suivi : quelle que soit la source qui l'a
+    /// récupéré, le lecteur l'a demandé, donc ce n'est pas une mise en avant.
+    /// Depuis le 2026-08-30 cette exception ne protège plus le compte lui-même
+    /// (`admit()` applique la restriction de compte quel que soit l'abonnement) :
+    /// elle ne sert plus qu'à ne pas requalifier en découverte le post d'un
+    /// compte SAIN qu'un abonné a explicitement demandé.
     pub fn effective_surface(
         tweet: &RawTweet,
         mode: &RecommendMode,
@@ -195,49 +198,44 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_ferme_la_decouverte_pas_pour_toi() {
-        let v = e().admit(ShadowbanLevel::Suppressed, OK, Surface::Trending, false);
-        assert!(!v.allowed);
-        assert_eq!(v.blocked_by, Some("account_suppressed"));
+    fn suppressed_ferme_toute_recommandation_pas_le_fil_d_abonnement() {
+        for surface in [Surface::Trending, Surface::Discover, Surface::ForYou] {
+            let v = e().admit(ShadowbanLevel::Suppressed, OK, surface, false);
+            assert!(!v.allowed, "{surface:?} doit être fermée");
+            assert_eq!(v.blocked_by, Some("account_suppressed"));
+        }
+        // Ce qui distingue encore Suppressed de Ghosted : le fil d'abonnement.
         assert!(
-            !e().admit(ShadowbanLevel::Suppressed, OK, Surface::Discover, false)
-                .allowed
-        );
-        // Pour toi reste ouvert : la sanction est graduée, pas binaire.
-        assert!(
-            e().admit(ShadowbanLevel::Suppressed, OK, Surface::ForYou, false)
+            e().admit(ShadowbanLevel::Suppressed, OK, Surface::FollowerFeed, true)
                 .allowed
         );
     }
 
     #[test]
-    fn ghosted_ferme_toute_recommandation() {
-        for surface in [Surface::ForYou, Surface::Discover, Surface::Trending] {
-            let v = e().admit(ShadowbanLevel::Ghosted, OK, surface, false);
-            assert!(!v.allowed, "{surface:?} doit être fermée");
+    fn ghosted_ferme_tout_fil_d_abonnement_compris() {
+        for surface in [
+            Surface::ForYou,
+            Surface::Discover,
+            Surface::Trending,
+            Surface::FollowerFeed,
+        ] {
+            let v = e().admit(ShadowbanLevel::Ghosted, OK, surface, true);
+            assert!(!v.allowed, "{surface:?} doit être fermée, même pour un abonné");
             assert_eq!(v.blocked_by, Some("account_ghosted"));
         }
     }
 
+    /// Décision du 2026-08-30 : suivre l'auteur ne contourne plus une
+    /// restriction de COMPTE. L'exception ne survit que pour l'inéligibilité
+    /// d'un post isolé — voir le test suivant.
     #[test]
-    fn un_abonne_ne_perd_jamais_le_compte_qu_il_suit() {
-        // Ni via le fil d'abonnement…
+    fn suivre_l_auteur_ne_contourne_plus_la_restriction_de_compte() {
         assert!(
-            e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::FollowerFeed, true)
+            !e().admit(ShadowbanLevel::Suppressed, OK, Surface::ForYou, true)
                 .allowed
         );
         assert!(
-            e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::FollowerFeed, false)
-                .allowed
-        );
-        // …ni via « Pour toi », que l'application utilise comme fil principal.
-        assert!(
-            e().admit(ShadowbanLevel::Ghosted, SPAM, Surface::ForYou, true)
-                .allowed
-        );
-        // Mais la mise en avant publique reste fermée, même pour un abonné.
-        assert!(
-            !e().admit(ShadowbanLevel::Ghosted, OK, Surface::Trending, true)
+            !e().admit(ShadowbanLevel::Ghosted, OK, Surface::FollowerFeed, true)
                 .allowed
         );
     }
@@ -301,20 +299,24 @@ mod tests {
 
     #[test]
     fn la_source_ne_requalifie_pas_un_compte_suivi() {
-        // Le piège : la déduplication garde la source de plus fort poids. Si
-        // c'est `Trending`, un abonné se retrouvait à consulter une surface
-        // « mise en avant » pour un compte qu'il suit — et le perdait.
+        // La déduplication garde la source de plus fort poids. Si c'est
+        // `Trending`, un abonné se retrouverait à consulter une surface « mise
+        // en avant » pour un compte qu'il suit. La requalification reste donc
+        // désactivée pour un abonné — ce qui, depuis le 2026-08-30, ne concerne
+        // plus que l'inéligibilité d'un POST : la restriction de COMPTE, elle,
+        // s'applique de toute façon sur les deux surfaces.
         let promu = RawTweet {
             source: TweetSource::Trending,
             ..Default::default()
         };
         let surface = ShadowbanEnforcer::effective_surface(&promu, &RecommendMode::ForYou, true);
         assert_eq!(surface, Surface::ForYou);
-        assert!(
-            e().admit(ShadowbanLevel::Ghosted, SPAM, surface, true)
-                .allowed
-        );
+        // Compte sain, post signalé : l'abonné le garde.
+        assert!(e().admit(ShadowbanLevel::Clean, SPAM, surface, true).allowed);
+        // Compte restreint : plus d'échappatoire par l'abonnement.
+        assert!(!e().admit(ShadowbanLevel::Ghosted, SPAM, surface, true).allowed);
     }
+
 
     #[test]
     fn multiplicateur_inchange_pour_le_scoring() {

@@ -72,8 +72,8 @@ pub enum ShadowbanLevel {
     #[default]
     Clean, // Visibilité normale — aucune suppression
     Monitoring, // Rétrogradation légère (-15%) — aucune surface fermée
-    Suppressed, // Rétrogradation forte (-55%) + exclu de Trending & Discover
-    Ghosted,    // Exclu de toute recommandation — reste visible des abonnés
+    Suppressed, // Exclu de toute recommandation (Pour toi, Découverte, Tendances) — le fil d'abonnement reste
+    Ghosted,    // Niveau maximal : plus aucun fil, fil d'abonnement compris
 }
 
 impl ShadowbanLevel {
@@ -94,16 +94,22 @@ impl ShadowbanLevel {
     /// Vrai si cette surface est fermée à ce niveau.
     ///
     /// `Monitoring` ne ferme rien : c'est un palier d'alerte, pas une sanction.
-    /// Aucun niveau ne ferme le fil d'abonnement — un lecteur qui suit un compte
-    /// a fait un choix explicite, et le lui retirer en silence est précisément
-    /// ce que « shadowban » désigne péjorativement.
+    ///
+    /// Les deux derniers crans ne font AUCUNE exception pour les abonnés —
+    /// décision produit du 2026-08-30, qui remplace l'invariant précédent
+    /// (« un lecteur ne perd jamais un compte qu'il suit ») :
+    ///
+    /// - `Suppressed` ferme toutes les surfaces de recommandation, « Pour toi »
+    ///   compris, y compris pour qui suit l'auteur. Seul le fil d'abonnement
+    ///   explicite subsiste — c'est ce qui distingue encore ce cran du suivant.
+    /// - `Ghosted` est le cran maximal : plus aucun fil ne sert ce compte, le
+    ///   fil d'abonnement compris. Le contenu reste en ligne et lisible sur le
+    ///   profil ; il n'est simplement plus distribué nulle part.
     pub fn restricts(self, surface: Surface) -> bool {
         match self {
             ShadowbanLevel::Clean | ShadowbanLevel::Monitoring => false,
-            ShadowbanLevel::Suppressed => {
-                matches!(surface, Surface::Trending | Surface::Discover)
-            }
-            ShadowbanLevel::Ghosted => surface.is_recommendation(),
+            ShadowbanLevel::Suppressed => surface.is_recommendation(),
+            ShadowbanLevel::Ghosted => true,
         }
     }
 
@@ -145,12 +151,10 @@ impl ShadowbanLevel {
                  recommandés, mais un peu moins mis en avant."
             }
             ShadowbanLevel::Suppressed => {
-                "Ton compte est temporairement retiré des Tendances et de la \
-                 Découverte. Tes abonnés voient toujours tout ce que tu publies."
+                "Ton compte n'est temporairement plus recommandé : ni dans « Pour toi », ni en Découverte, ni en Tendances. Tes abonnés te voient toujours dans leur fil d'abonnement."
             }
             ShadowbanLevel::Ghosted => {
-                "Ton compte n'est temporairement plus recommandé. Tes posts \
-                 restent en ligne et visibles par tes abonnés et sur ton profil."
+                "Ton compte n'est temporairement distribué dans aucun fil, y compris celui de tes abonnés. Tes posts restent en ligne et lisibles sur ton profil."
             }
         }
     }
@@ -285,24 +289,49 @@ impl StrikePolicy {
 
     pub fn thresholds(self) -> StrikeThresholds {
         match self {
-            // Faible nuisance : large marge avant la moindre fermeture de surface.
+            // ── Seuils resserres le 2026-08-22 ────────────────────────────
+            //
+            // Demande explicite : « au bout de 2 avertissements on doit deja y
+            // etre ». L'ancienne grille (2/4/7/12) laissait un compte
+            // spammeur dans la Decouverte jusqu'a son 4e avertissement, et
+            // dans « Pour toi » jusqu'au 7e.
+            //
+            // Ce qui a ETE ECARTE : redefinir `Suppressed` pour qu'il ferme
+            // aussi « Pour toi ». Ca aurait rendu `Suppressed` et `Ghosted`
+            // identiques a l'admission — les deux fermant alors tout sauf le
+            // fil d'abonnement — et ecrase un barreau de l'echelle pour rien.
+            // Le comportement demande EXISTE DEJA : c'est `Ghosted`. Il
+            // suffisait de l'atteindre plus vite.
+            //
+            //   2 avertissements -> hors Tendances et Decouverte
+            //   3 avertissements -> hors « Pour toi » pour qui ne suit pas
+            //
+            // ⚠ Les avertissements sont poses AUTOMATIQUEMENT par le
+            // classifieur et vivent 90 jours. A ces seuils, deux faux positifs
+            // suffisent a retirer un vrai compte de la decouverte. Si ca
+            // arrive, la reponse est de corriger le classifieur ou de revoquer
+            // (`POST /admin/strike/revoke`), pas de remonter les seuils en
+            // aveugle.
             StrikePolicy::Spam => StrikeThresholds {
-                monitoring: 2,
-                suppressed: 4,
-                ghosted: 7,
-                permanent: 12,
+                monitoring: 1,
+                suppressed: 2,
+                ghosted: 3,
+                permanent: 8,
             },
             StrikePolicy::EngagementBait => StrikeThresholds {
-                monitoring: 2,
-                suppressed: 4,
-                ghosted: 7,
-                permanent: 12,
+                monitoring: 1,
+                suppressed: 2,
+                ghosted: 3,
+                permanent: 8,
             },
+            // Reste plus large que les deux precedents : reprendre du contenu
+            // sans apport nuit moins que spammer, et l'etiquette est la plus
+            // sujette au faux positif des trois.
             StrikePolicy::Unoriginal => StrikeThresholds {
-                monitoring: 3,
-                suppressed: 6,
-                ghosted: 10,
-                permanent: 16,
+                monitoring: 2,
+                suppressed: 3,
+                ghosted: 5,
+                permanent: 10,
             },
             // Nuisance moyenne.
             StrikePolicy::Misinformation => StrikeThresholds {

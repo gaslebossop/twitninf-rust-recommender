@@ -294,8 +294,8 @@ mod tests {
     #[test]
     fn avertissement_expire_apres_90_jours() {
         let now = Utc::now();
-        // 4 spams suffisent normalement à Suppressed…
-        let recent = ledger(StrikePolicy::Spam, &[1, 2, 3, 4], now);
+        // 2 spams suffisent à Suppressed depuis le resserrage du 2026-08-22…
+        let recent = ledger(StrikePolicy::Spam, &[1, 2], now);
         assert_eq!(recent.level(now), ShadowbanLevel::Suppressed);
 
         // …mais plus rien passé la fenêtre : le compte remonte seul.
@@ -307,15 +307,45 @@ mod tests {
     #[test]
     fn seuils_plus_stricts_selon_la_nuisance() {
         let now = Utc::now();
-        // Deux faits : rien de fermé côté spam, surface fermée côté haine.
+        // ⚠ Depuis le resserrage du 2026-08-22, spam et haine ferment leurs
+        // surfaces AU MEME RYTHME (2 faits -> Suppressed, 3 -> Ghosted). La
+        // graduation par nuisance ne subsiste plus que sur le bannissement
+        // definitif : 8 faits pour le spam, 4 pour la haine. C'est une
+        // consequence assumee de la demande « au bout de 2 on doit deja y
+        // etre » — la noter ici plutot que la laisser se decouvrir en prod.
         assert_eq!(
             ledger(StrikePolicy::Spam, &[1, 2], now).level(now),
-            ShadowbanLevel::Monitoring
+            ShadowbanLevel::Suppressed
         );
         assert_eq!(
             ledger(StrikePolicy::HatefulConduct, &[1, 2], now).level(now),
             ShadowbanLevel::Suppressed
         );
+        // Ce qui reste gradue : le point de non-retour.
+        assert!(
+            StrikePolicy::HatefulConduct.thresholds().permanent
+                < StrikePolicy::Spam.thresholds().permanent
+        );
+        // Et « repris sans apport » reste plus indulgent que « spam ».
+        assert!(
+            StrikePolicy::Unoriginal.thresholds().suppressed
+                > StrikePolicy::Spam.thresholds().suppressed
+        );
+    }
+
+    /// Le comportement demandé le 2026-08-22 : hors « Pour toi » ET hors
+    /// Explorer une fois le palier atteint. C'est `Ghosted` qui le fait — la
+    /// définition des niveaux n'a pas bougé, seuls les seuils ont baissé.
+    #[test]
+    fn trois_avertissements_spam_ferment_pour_toi_et_explorer() {
+        let now = Utc::now();
+        let l = ledger(StrikePolicy::Spam, &[1, 2, 3], now);
+        assert_eq!(l.level(now), ShadowbanLevel::Ghosted);
+        assert!(l.level(now).restricts(Surface::ForYou));
+        assert!(l.level(now).restricts(Surface::Trending));
+        assert!(l.level(now).restricts(Surface::Discover));
+        // Ghosted ferme désormais jusqu'au fil d'abonnement (2026-08-30).
+        assert!(l.level(now).restricts(Surface::FollowerFeed));
     }
 
     #[test]
@@ -330,7 +360,8 @@ mod tests {
     fn les_domaines_ne_s_additionnent_pas() {
         let now = Utc::now();
         // 3 domaines à 1 fait chacun : aucun ne franchit son propre seuil de
-        // suppression, donc le compte reste au pire en surveillance.
+        // SUPPRESSION, donc aucune surface ne se ferme. C'est tout l'objet du
+        // test : additionnés, ces 3 faits vaudraient Ghosted côté spam.
         let l = StrikeLedger {
             user_id: "u1".into(),
             strikes: vec![
@@ -340,16 +371,29 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(l.level(now), ShadowbanLevel::Clean);
+        assert_eq!(l.level(now), ShadowbanLevel::Monitoring);
+        assert!(!l.level(now).restricts(Surface::Trending));
     }
 
     #[test]
-    fn le_fil_d_abonnement_n_est_jamais_ferme() {
+    fn ghosted_ferme_jusqu_au_fil_d_abonnement() {
         let now = Utc::now();
         let l = ledger(StrikePolicy::HatefulConduct, &[1, 2, 3, 4, 5], now);
         assert_eq!(l.level(now), ShadowbanLevel::Ghosted);
-        assert!(!l.level(now).restricts(Surface::FollowerFeed));
+        assert!(l.level(now).restricts(Surface::FollowerFeed));
         assert!(l.level(now).restricts(Surface::Trending));
+    }
+
+    /// Le cran juste en dessous, qui porte toute la différence : Suppressed
+    /// ferme « Pour toi » comme Ghosted, mais laisse le fil d'abonnement.
+    #[test]
+    fn suppressed_laisse_le_fil_d_abonnement() {
+        let now = Utc::now();
+        let l = ledger(StrikePolicy::Spam, &[1, 2], now);
+        assert_eq!(l.level(now), ShadowbanLevel::Suppressed);
+        assert!(l.level(now).restricts(Surface::ForYou));
+        assert!(l.level(now).restricts(Surface::Trending));
+        assert!(!l.level(now).restricts(Surface::FollowerFeed));
     }
 
     #[test]
@@ -380,7 +424,7 @@ mod tests {
     fn date_de_retour_est_celle_du_plus_ancien_fait_actif() {
         let now = Utc::now();
         let l = ledger(StrikePolicy::Spam, &[10, 40, 80], now);
-        assert_eq!(l.level(now), ShadowbanLevel::Monitoring);
+        assert_eq!(l.level(now), ShadowbanLevel::Ghosted);
         let recovers = l.level_expires_at(now).expect("une date de retour");
         // Le plus ancien (80 j) expire dans ~10 jours.
         let days = (recovers - now).num_days();
@@ -431,15 +475,23 @@ mod tests {
     #[test]
     fn statut_expose_les_surfaces_fermees_et_la_date() {
         let now = Utc::now();
-        let l = ledger(StrikePolicy::Spam, &[1, 2, 3, 4], now);
+        // Palier Suppressed : toute recommandation se ferme, le fil d'abonnement reste.
+        let l = ledger(StrikePolicy::Spam, &[1, 2], now);
         let st = l.status(now);
         assert_eq!(st.level, ShadowbanLevel::Suppressed);
         assert!(st.restricted_surfaces.contains(&"trending"));
         assert!(st.restricted_surfaces.contains(&"discover"));
+        assert!(st.restricted_surfaces.contains(&"for_you"));
         assert!(!st.restricted_surfaces.contains(&"follower_feed"));
         assert!(st.recovers_at.is_some());
-        assert_eq!(st.active_strikes, 4);
+        assert_eq!(st.active_strikes, 2);
         assert_eq!(st.per_policy.len(), 1);
-        assert_eq!(st.per_policy[0].active_strikes, 4);
+        assert_eq!(st.per_policy[0].active_strikes, 2);
+
+        // Palier suivant : le fil d'abonnement se ferme à son tour, et le statut le dit.
+        let st3 = ledger(StrikePolicy::Spam, &[1, 2, 3], now).status(now);
+        assert_eq!(st3.level, ShadowbanLevel::Ghosted);
+        assert!(st3.restricted_surfaces.contains(&"for_you"));
+        assert!(st3.restricted_surfaces.contains(&"follower_feed"));
     }
 }
