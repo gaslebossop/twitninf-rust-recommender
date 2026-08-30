@@ -224,6 +224,30 @@ impl CacheManager {
         json.and_then(|j| serde_json::from_str(&j).ok())
     }
 
+    /// Interrupteur booleen generique, lu dans Redis.
+    ///
+    /// Sert aujourd'hui a `admin:taste:enabled`, qui allume ou eteint le modele
+    /// neuronal externe sans recompiler ni redemarrer le moteur. Absent =
+    /// eteint : c'est la valeur sure, et elle garantit qu'un deploiement ne
+    /// peut pas allumer quoi que ce soit tout seul.
+    ///
+    /// Toute valeur autre que `0`, `false` ou vide compte pour allume — un
+    /// operateur qui tape `1`, `on` ou `true` doit obtenir ce qu'il attend.
+    pub async fn admin_flag_enabled(&self, key: &str) -> bool {
+        let mut c = self.conn.lock().await;
+        let val: Option<String> = c.get(key).await.ok().flatten();
+        match val.as_deref().map(str::trim) {
+            None | Some("") | Some("0") | Some("false") | Some("off") => false,
+            Some(_) => true,
+        }
+    }
+
+    pub async fn admin_set_flag(&self, key: &str, on: bool) {
+        let mut c = self.conn.lock().await;
+        let _: Result<(), _> = c.set(key, if on { "1" } else { "0" }).await;
+        debug!(key, on, "Admin flag set");
+    }
+
     pub async fn admin_clear_weights(&self) {
         let mut c = self.conn.lock().await;
         let _: Result<(), _> = c.del("admin:algo:weights").await;

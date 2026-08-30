@@ -3,12 +3,14 @@ import { useAuth } from './useAuth'
 import { SignIn } from './SignIn'
 import { Dashboard } from './pages/Dashboard'
 import { Weights } from './pages/Weights'
+import { Model } from './pages/Model'
 import { Moderation } from './pages/Moderation'
 import { Logs } from './pages/Logs'
 
 const SECTIONS = [
   { id: 'dashboard', label: 'Instruments' },
   { id: 'weights', label: 'Poids' },
+  { id: 'model', label: 'Modèle' },
   { id: 'moderation', label: 'Modération' },
   { id: 'logs', label: 'Journal' },
 ] as const
@@ -41,6 +43,7 @@ export default function App() {
       <main className="content">
         {section === 'dashboard' && <Dashboard apiKey={key} />}
         {section === 'weights' && <Weights apiKey={key} />}
+        {section === 'model' && <Model apiKey={key} />}
         {section === 'moderation' && <Moderation apiKey={key} />}
         {section === 'logs' && <Logs apiKey={key} />}
       </main>

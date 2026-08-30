@@ -365,11 +365,13 @@ pub enum AuthorTier {
     Free,
     Plus,
     Pro,
+    Ultra,
 }
 
 impl AuthorTier {
     pub fn resolve(tier: &str, legacy_premium: bool) -> Self {
         match tier {
+            "ultra" => Self::Ultra,
             "pro" => Self::Pro,
             "plus" => Self::Plus,
             _ if legacy_premium => Self::Pro,

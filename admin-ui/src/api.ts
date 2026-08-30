@@ -103,6 +103,67 @@ export class ApiError extends Error {
   }
 }
 
+
+// ─── Modèle neuronal (taste-model) ──────────────────────────────────────────
+//
+// Deux points de vue qui ne disent pas la même chose, et qu'il ne faut pas
+// confondre : `engine` est ce que le MOTEUR constate en appelant le service
+// (appels, échecs, latence), `service` est ce que le SERVICE dit de lui-même
+// (entraînement, qualité mesurée). `service: null` = injoignable.
+
+export interface TasteEngineView {
+  active: boolean
+  warm: boolean
+  /** Poids RELATIF du terme dans le mélange. Ne pas afficher en pourcentage. */
+  weight: number
+  /**
+   * Part réelle dans le score final. `blend_positive` renormalise sur les
+   * termes DISPONIBLES : un poids de 0,12 pèse 6,1 % quand les sept termes sont
+   * mûrs, 7,2 % quand le CTR et le dwell sont encore froids. C'est CE chiffre
+   * qu'on montre.
+   */
+  share: number
+  calls: number
+  failures: number
+  timeouts: number
+  last_latency_ms: number
+  mean_p: number
+}
+
+export interface PrequentialHead {
+  n: number
+  auc: number
+  log_loss: number
+  ece: number
+  base_rate: number
+}
+
+export interface TasteServiceView {
+  started_at: number
+  bootstrapped: boolean
+  train_rounds: number
+  examples_seen: number
+  last_train: number | null
+  last_error: string | null
+  sparse_saves: number
+  dense_saves: number
+  expired_ids: number
+  scored: number
+  catalog_size: number
+  watermark: number | null
+  uptime_s: number
+  params_dense: number
+  params_sparse: number
+  sparse_tables: Record<string, { rows: number; dim: number }>
+  prequential: Record<string, PrequentialHead>
+}
+
+export interface TasteStatus {
+  enabled: boolean
+  engine: TasteEngineView
+  service: TasteServiceView | null
+}
+
 async function request<T>(path: string, key: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -165,4 +226,12 @@ export const api = {
     }),
 
   logs: (key: string) => request<{ logs: LogEntry[]; count: number }>('/admin/logs', key),
+
+  taste: (key: string) => request<TasteStatus>('/admin/taste', key),
+
+  setTaste: (key: string, enabled: boolean) =>
+    request<{ success: boolean; enabled: boolean; message: string }>('/admin/taste', key, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
 }

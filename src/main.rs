@@ -14,6 +14,10 @@ mod handlers;
 mod middleware;
 mod ml;
 mod models;
+// Client du service taste-model. `main.rs` redeclare la liste des modules
+// independamment de `lib.rs` : oublier cette ligne casse UNIQUEMENT le binaire,
+// pas la bibliotheque, donc `cargo check --lib` ne le verrait pas.
+mod neural;
 mod services;
 mod shadowban;
 mod utils;
@@ -40,6 +44,7 @@ use handlers::{
     account_status::account_status_handler,
     admin::{
         admin_algo_eval_handler, admin_algo_stats_handler, admin_backfill_ctr_handler,
+        admin_taste_handler, admin_taste_toggle_handler,
         admin_ban_handler,
         admin_data_handler, admin_filters_handler, admin_get_weights_handler,
         admin_issue_strike_handler, admin_logs_handler, admin_reset_weights_handler,
@@ -207,6 +212,7 @@ async fn main() -> Result<()> {
         // Qualite MESUREE des modeles (AUC, log-loss, calibration) — voir
         // `crate::eval`. Distincte de /stats, qui ne dit que ce qu'ils ont vu.
         .route("/admin/algo/eval", get(admin_algo_eval_handler))
+        .route("/admin/taste", get(admin_taste_handler).post(admin_taste_toggle_handler))
         .route("/admin/algo/backfill-ctr", post(admin_backfill_ctr_handler))
         .route("/admin/logs", get(admin_logs_handler))
         .route("/admin/data", get(admin_data_handler))

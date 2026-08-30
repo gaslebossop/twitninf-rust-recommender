@@ -53,6 +53,15 @@ const IMPRESSION_FATIGUE_START: i64 = 2;
 const SUBSCRIPTION_BOOST_PLUS: f64 = 1.03;
 const SUBSCRIPTION_BOOST_PRO: f64 = 1.06;
 
+/// Ultra coûte ~85x le prix de Pro (30 € vs 300 NF fixe, ~2550 € au cours du
+/// 2026-08-28 à 8,50 €/NF — voir `api/src/constants/subscriptionTiers.js`).
+/// Étendre tel quel le taux linéaire Plus→Pro (0,002 de boost par euro)
+/// donnerait +510 % : ça casserait l'invariant ci-dessus, un tweet Ultra
+/// dominerait quasi tout le fil gratuit. Amorti en racine carrée du ratio de
+/// prix : extra = extra_Pro × sqrt(85) ≈ ×9. Reste un départage plus marqué
+/// que Pro, sans devenir un classement parallèle.
+const SUBSCRIPTION_BOOST_ULTRA: f64 = 1.55;
+
 
 /// Ce que D6 a besoin de savoir du fil DEJA construit.
 ///
@@ -313,6 +322,80 @@ const W_FAV: f64 = 0.08;
 /// Sa part decroitra d'elle-meme a mesure que les autres murissent.
 const W_CTR: f64 = 0.12;
 
+/// Modèle neuronal externe (`taste-model`, voir `crate::neural`).
+///
+/// ── Pourquoi un poids modeste pour commencer ────────────────────────────────
+/// Le modèle a été mesuré hors-ligne sur un `test` jamais lu pendant son
+/// entraînement : AUC 0,759 contre 0,721 pour l'équivalent des traits denses
+/// seuls — un gain réel (IC [+0,002 ; +0,076]). Mais contre LightGBM (0,744) et
+/// contre une régression logistique enrichie du contenu (0,745), l'écart est
+/// **statistiquement indécidable** à ce volume de données. Lui donner d'emblée
+/// le poids d'une tête mûre reviendrait à parier au-delà de ce qui est mesuré.
+///
+/// ── Pourquoi 0,12 et pas 0,15 ───────────────────────────────────────────────
+/// Un test verrouille la part des règles autour de la moitié du mélange
+/// (`a_pleine_maturite_le_melange_est_a_parite`). Toute tête ajoutée dilue cette
+/// part : à 0,15, elle tombait à 0,448, sous le plancher. 0,12 la ramène à
+/// 0,4545. Le poids n'est donc pas choisi au jugé — il est contraint par un
+/// invariant explicite du mélange.
+///
+/// Ça place le modèle au même niveau que `W_CTR` : assez pour déplacer des
+/// ordres et rendre l'effet observable, pas assez pour qu'une dérive du service
+/// emporte le classement. Ce poids est fait pour monter, sur la foi de la
+/// validation progressive publiée par le service sur `/stats` — pas sur une
+/// intuition, et pas sans rouvrir le test de parité.
+const W_NEURAL: f64 = 0.12;
+
+/// Nombre d'echantillons avant qu'un modele appris pese dans le melange.
+///
+/// Etait ecrit en dur (`>= 200`) a deux endroits de `score_all`. Sorti ici
+/// parce qu'un TROISIEME lecteur en a besoin : l'ecran admin doit savoir quels
+/// termes sont reellement presents pour calculer la part de chacun, et un seuil
+/// recopie une fois de plus finirait par diverger.
+pub const ML_MIN_SAMPLES: u64 = 200;
+
+/// Le poids reellement applique au modele neuronal, pour l'affichage admin.
+///
+/// Expose la CONSTANTE plutot que de la recopier cote handler : une valeur
+/// affichee qui differe de celle qui sert est pire que pas de valeur du tout.
+pub fn neural_weight() -> f64 {
+    W_NEURAL
+}
+
+/// PART reelle du modele neuronal dans le score final.
+///
+/// ── Pourquoi ce n'est pas `W_NEURAL` ────────────────────────────────────────
+/// `blend_positive` est une moyenne PONDEREE renormalisee sur les termes
+/// DISPONIBLES : un poids de 0,12 ne veut pas dire « 12 % du score ». Sa part
+/// depend de ce qui est present a cote. A pleine maturite (7 termes), 0,12
+/// pese 0,12/1,98 = 6,1 %. Quand le CTR et le dwell sont encore froids, le
+/// meme poids pese 7,2 %.
+///
+/// L'ecran admin affichait la constante en pourcentage — un chiffre presque
+/// deux fois trop gros, exactement le genre a faire regler un poids a l'envers.
+pub fn neural_share(ctr: bool, dwell: bool, amplify: bool, reply: bool, profile: bool, fav: bool) -> f64 {
+    let mut total = W_RULES + W_NEURAL;
+    if ctr {
+        total += W_CTR;
+    }
+    if dwell {
+        total += W_DWELL;
+    }
+    if amplify {
+        total += W_AMPLIFY;
+    }
+    if reply {
+        total += W_REPLY;
+    }
+    if profile {
+        total += W_PROFILE;
+    }
+    if fav {
+        total += W_FAV;
+    }
+    W_NEURAL / total
+}
+
 /// Part de score qu'un rejet CERTAIN retire.
 ///
 /// La tête de rejet est le seul terme NÉGATIF du classement, et c'est ce qui
@@ -422,6 +505,12 @@ pub fn score_tweet_ml_with_weights(
     weights: &AlgoWeights,
     blend: BlendProfile,
     collab_affinity: f64,
+    // `lift` du modele neuronal externe pour CE tweet, deja ramene sur
+    // l'echelle commune par `NeuralClient::lift`. `None` quand le service est
+    // eteint, injoignable, en echec, ou pas encore assez chaud pour que son
+    // lift veuille dire quelque chose : dans tous ces cas le melange se
+    // comporte exactement comme avant l'ajout du terme.
+    neural_lift: Option<f64>,
 ) -> ScoredTweet {
     let mut scored = score_tweet_with_weights(
         tweet,
@@ -465,6 +554,7 @@ pub fn score_tweet_ml_with_weights(
             (W_REPLY, objectives.reply_lift),
             (W_PROFILE, objectives.profile_lift),
             (W_FAV, objectives.fav_lift),
+            (W_NEURAL, neural_lift),
         ],
     );
 
@@ -1232,6 +1322,7 @@ pub fn subscription_boost(tier: AuthorTier) -> f64 {
         AuthorTier::Free => 1.0,
         AuthorTier::Plus => SUBSCRIPTION_BOOST_PLUS,
         AuthorTier::Pro => SUBSCRIPTION_BOOST_PRO,
+        AuthorTier::Ultra => SUBSCRIPTION_BOOST_ULTRA,
     }
 }
 
@@ -1558,6 +1649,69 @@ mod tests {
         );
     }
 
+    /// La PART affichee doit etre celle qui sert, pas la constante.
+    #[test]
+    fn la_part_du_modele_depend_des_termes_presents() {
+        // Tout mur : sept termes se partagent le melange.
+        let pleine = neural_share(true, true, true, true, true, true);
+        assert!((pleine - W_NEURAL / 1.98).abs() < 1e-9, "{pleine}");
+        assert!((pleine - 0.061).abs() < 0.002, "part a maturite = {pleine}");
+
+        // Seul face aux regles : sa part est mecaniquement plus grande.
+        let seul = neural_share(false, false, false, false, false, false);
+        assert!(seul > pleine, "{seul} <= {pleine}");
+        assert!((seul - W_NEURAL / (W_RULES + W_NEURAL)).abs() < 1e-9);
+
+        // Et dans tous les cas, la part est STRICTEMENT plus petite que le
+        // poids brut : c'est tout l'objet de cette fonction.
+        assert!(seul < W_NEURAL, "part {seul} >= poids {W_NEURAL}");
+    }
+
+    /// Le modele neuronal absent ne doit RIEN changer.
+    ///
+    /// C'est le contrat de securite du branchement : service eteint, injoignable,
+    /// trop lent ou pas encore chaud, le classement doit etre au bit pres celui
+    /// d'avant. Sans ce test, une panne du service pourrait deplacer le fil de
+    /// tout le monde sans que rien ne le signale.
+    #[test]
+    fn modele_neuronal_absent_ne_change_rien() {
+        let sans = blend_positive(0.42, &[(W_CTR, Some(0.6)), (W_DWELL, Some(0.4))]);
+        let avec_none = blend_positive(
+            0.42,
+            &[(W_CTR, Some(0.6)), (W_DWELL, Some(0.4)), (W_NEURAL, None)],
+        );
+        assert_eq!(sans, avec_none);
+    }
+
+    /// Present, il doit reellement deplacer le score -- dans le bon sens.
+    ///
+    /// Un `lift` de 0,5 est la valeur neutre (le tweet est aussi probable que la
+    /// moyenne) : il tire le melange vers 0,5, donc il BAISSE un score de regles
+    /// eleve et REMONTE un score faible. Ce qu'on verifie ici, c'est la
+    /// monotonie : plus le modele est confiant, plus le score monte.
+    #[test]
+    fn modele_neuronal_present_deplace_le_score_dans_le_bon_sens() {
+        let base = 0.50;
+        let neutre = blend_positive(base, &[(W_NEURAL, Some(0.5))]);
+        let confiant = blend_positive(base, &[(W_NEURAL, Some(0.9))]);
+        let mefiant = blend_positive(base, &[(W_NEURAL, Some(0.1))]);
+        assert!((neutre - base).abs() < 1e-9, "un lift neutre ne bouge rien");
+        assert!(confiant > neutre, "{confiant} <= {neutre}");
+        assert!(mefiant < neutre, "{mefiant} >= {neutre}");
+    }
+
+    /// Sa part reste BORNEE : meme avec une confiance maximale, il ne peut pas
+    /// emporter le classement a lui seul.
+    #[test]
+    fn le_modele_neuronal_ne_peut_pas_emporter_le_melange() {
+        let base = 0.20;
+        let maxi = blend_positive(base, &[(W_NEURAL, Some(1.0))]);
+        let part = W_NEURAL / (W_RULES + W_NEURAL);
+        let attendu = base * (1.0 - part) + 1.0 * part;
+        assert!((maxi - attendu).abs() < 1e-9);
+        assert!(part < 0.15, "part du modele = {part}, trop grande pour un seul terme");
+    }
+
     /// Le melange annonce « moitie regles, moitie modeles » doit l'etre
     /// REELLEMENT une fois toutes les tetes mures.
     ///
@@ -1568,7 +1722,8 @@ mod tests {
     /// rearbitrer l'equilibre.
     #[test]
     fn a_pleine_maturite_le_melange_est_a_parite() {
-        let somme_apprise = W_CTR + W_DWELL + W_AMPLIFY + W_REPLY + W_PROFILE + W_FAV;
+        let somme_apprise =
+            W_CTR + W_DWELL + W_AMPLIFY + W_REPLY + W_PROFILE + W_FAV + W_NEURAL;
         let part_regles = W_RULES / (W_RULES + somme_apprise);
         assert!(
             (0.45..=0.55).contains(&part_regles),
@@ -1664,6 +1819,7 @@ mod tests {
 
     #[test]
     fn abonnes_devant_gratuits_a_qualite_egale() {
+        assert!(subscription_boost(AuthorTier::Ultra) > subscription_boost(AuthorTier::Pro));
         assert!(subscription_boost(AuthorTier::Pro) > subscription_boost(AuthorTier::Plus));
         assert!(subscription_boost(AuthorTier::Plus) > subscription_boost(AuthorTier::Free));
         assert_eq!(subscription_boost(AuthorTier::Free), 1.0);
@@ -1680,8 +1836,22 @@ mod tests {
         assert!(gratuit > pro, "gratuit={gratuit} pro={pro}");
     }
 
+    /// Même garantie pour Ultra, malgré son boost nettement plus fort (+55 %,
+    /// amorti depuis un ratio de prix de ~85x sur Pro — voir le commentaire de
+    /// `SUBSCRIPTION_BOOST_ULTRA`). Il faut un écart de score brut d'au moins
+    /// ~35 % (1 - 1/1.55) pour que le gratuit l'emporte quand même : ici 40 %
+    /// (0.50 contre 0.30), avec de la marge. Ultra reste un départage marqué,
+    /// pas une immunité.
+    #[test]
+    fn un_bien_meilleur_tweet_gratuit_reste_devant_un_tweet_ultra() {
+        let gratuit = 0.50 * subscription_boost(AuthorTier::Free);
+        let ultra = 0.30 * subscription_boost(AuthorTier::Ultra);
+        assert!(gratuit > ultra, "gratuit={gratuit} ultra={ultra}");
+    }
+
     #[test]
     fn palier_resolu_depuis_les_deux_colonnes() {
+        assert_eq!(AuthorTier::resolve("ultra", false), AuthorTier::Ultra);
         assert_eq!(AuthorTier::resolve("pro", false), AuthorTier::Pro);
         assert_eq!(AuthorTier::resolve("plus", false), AuthorTier::Plus);
         // Compte historique : `premium` seul, sans palier explicite.

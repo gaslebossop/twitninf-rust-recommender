@@ -543,6 +543,15 @@ pub async fn admin_algo_eval_handler(
     let (amplify, reject) = state.recommender.objective_predictor().eval_reports();
     let (gain_amplify, gain_reject) =
         state.recommender.objective_predictor().calibration_gains();
+    let (
+        neural_calls,
+        neural_failures,
+        neural_timeouts,
+        neural_latency,
+        neural_mean,
+        neural_active,
+        neural_warm,
+    ) = state.recommender.neural.stats_snapshot();
 
     (
         StatusCode::OK,
@@ -571,6 +580,30 @@ pub async fn admin_algo_eval_handler(
                 "collab": {
                     "authors": collab_authors,
                     "usable": collab_usable,
+                },
+                // Modele neuronal externe (`taste-model`). Ce bloc repond a la
+                // seule question qui compte une fois branche : est-ce qu'il
+                // CONTRIBUE ? Trois facons de ne pas contribuer, et il faut
+                // pouvoir les distinguer :
+                //   * `active: false`      -> `admin:taste:enabled` est a 0, ou
+                //                             la cle de service manque ;
+                //   * `warm: false`        -> allume, mais pas encore assez
+                //                             d'observations pour que son lift
+                //                             veuille dire quelque chose ;
+                //   * `failures` qui monte -> service injoignable ou trop lent,
+                //                             le classement retombe sur celui
+                //                             d'avant sans que rien ne casse.
+                // Un `failures` qui suit `calls` de pres est le signal a
+                // surveiller : le fil marche, mais le modele n'y est pour rien.
+                "neural": {
+                    "active": neural_active,
+                    "warm": neural_warm,
+                    "calls": neural_calls,
+                    "failures": neural_failures,
+                    "timeouts": neural_timeouts,
+                    "last_latency_ms": neural_latency,
+                    "mean_p": neural_mean,
+                    "weight": crate::algorithm::scoring::neural_weight(),
                 },
                 "amplify": amplify,
                 "reject": reject,
@@ -809,3 +842,122 @@ pub async fn admin_data_handler(
 // ─── GET /admin/panel ─────────────────────────────────────────────────────────
 
 pub use crate::admin::ui::admin_ui_handler;
+
+// ─── GET /admin/taste ──────────────────────────────────────────────────────────
+//
+// Tout ce qu'il faut pour répondre à « est-ce que le nouveau modèle va bien ? »,
+// en un appel. Deux points de vue, qui ne disent pas la même chose :
+//
+//   `engine`  ce que le MOTEUR constate en appelant le service : appels,
+//             échecs, latence, et surtout `active`/`warm` — les deux raisons
+//             non-fautives de ne rien apporter au classement.
+//
+//   `service` ce que le SERVICE dit de lui-même : tours d'entraînement,
+//             exemples digérés, validation progressive, tables creuses.
+//             `null` s'il est injoignable — et c'est une réponse, pas une
+//             absence de réponse.
+//
+// Le champ `enabled` est lu dans Redis, pas dans la mémoire du moteur : c'est
+// la source de vérité de l'interrupteur, et elle peut avoir été changée par
+// quelqu'un d'autre depuis le dernier appel au fil.
+pub async fn admin_taste_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    let (calls, failures, timeouts, latency, mean_p, active, warm) =
+        state.recommender.neural.stats_snapshot();
+    let enabled = state
+        .recommender
+        .cache_manager()
+        .admin_flag_enabled("admin:taste:enabled")
+        .await;
+    let service = state.recommender.neural.service_stats().await;
+
+    // Part REELLE dans le score final : elle depend des autres termes presents,
+    // pas seulement du poids du modele. Recalculee ici a partir de l'etat vivant
+    // des autres tetes — c'est le chiffre a afficher, la constante ne veut rien
+    // dire toute seule.
+    use crate::algorithm::scoring::ML_MIN_SAMPLES;
+    let (ctr_samples, _) = state.recommender.ctr_predictor().stats();
+    let (dwell_samples, _) = state.recommender.dwell_predictor().stats();
+    let heads = state.recommender.objective_predictor().stats_all();
+    let ready = |i: usize| heads.get(i).map(|(_, _, r)| *r).unwrap_or(false);
+    // Ordre de `Objective::ALL` : amplify, reject, fav, reply, profile.
+    let share = crate::algorithm::scoring::neural_share(
+        ctr_samples >= ML_MIN_SAMPLES,
+        dwell_samples >= ML_MIN_SAMPLES,
+        ready(0),
+        ready(3),
+        ready(4),
+        ready(2),
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "enabled": enabled,
+            "engine": {
+                "active": active,
+                "warm": warm,
+                "weight": crate::algorithm::scoring::neural_weight(),
+                "share": share,
+                "calls": calls,
+                "failures": failures,
+                "timeouts": timeouts,
+                "last_latency_ms": latency,
+                "mean_p": mean_p,
+            },
+            "service": service,
+        })),
+    )
+}
+
+// ─── POST /admin/taste ─────────────────────────────────────────────────────────
+//
+// L'interrupteur. `{"enabled": false}` retire le modèle du classement à la
+// requête de fil suivante — sans recompiler, sans redémarrer, sans toucher au
+// service (qui continue d'apprendre pendant ce temps, ce qui est exactement ce
+// qu'on veut : on le débranche, on ne le perd pas).
+//
+// C'est le seul geste destructeur de cette page, et il est réversible d'un
+// clic. L'écran ne propose donc pas de régler un poids ni de vider un modèle :
+// ces choix-là se prennent sur des chiffres, pas sur un bouton.
+pub async fn admin_taste_toggle_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    require_admin!(headers, state);
+
+    let Some(on) = body.get("enabled").and_then(|v| v.as_bool()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": "champ `enabled` (booleen) attendu" })),
+        );
+    };
+    state
+        .recommender
+        .cache_manager()
+        .admin_set_flag("admin:taste:enabled", on)
+        .await;
+    // Appliqué aussi en mémoire tout de suite : sans ça, l'écran afficherait
+    // l'ancien état jusqu'à la prochaine requête de fil, et on croirait que le
+    // bouton n'a pas marché.
+    state.recommender.neural.set_enabled(on);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "enabled": on,
+            "message": if on {
+                "Modele branche sur le classement."
+            } else {
+                "Modele debranche. Le service continue d'apprendre."
+            },
+        })),
+    )
+}

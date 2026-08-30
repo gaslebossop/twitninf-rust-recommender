@@ -56,6 +56,19 @@ pub struct RecommenderService {
     /// le classement le lit sous verrou partagé pendant qu'une reconstruction
     /// prépare le suivant à côté, puis l'échange d'un coup.
     collab: std::sync::Arc<std::sync::RwLock<crate::collab::CollabSpace>>,
+    /// Client du modele neuronal externe — voir `crate::neural`.
+    ///
+    /// Inerte par defaut : il faut ET la cle de service dans l'environnement,
+    /// ET `admin:taste:enabled` a `1` dans Redis. Un deploiement du moteur ne
+    /// peut donc pas allumer le modele tout seul.
+    pub neural: std::sync::Arc<crate::neural::NeuralClient>,
+}
+
+impl RecommenderService {
+    /// Acces au cache pour les routes admin (interrupteur du modele neuronal).
+    pub fn cache_manager(&self) -> &CacheManager {
+        &self.cache
+    }
 }
 
 impl RecommenderService {
@@ -67,6 +80,7 @@ impl RecommenderService {
             dwell_predictor: DwellPredictor::new(),
             objectives: ObjectivePredictor::new(),
             collab: Default::default(),
+            neural: std::sync::Arc::new(crate::neural::NeuralClient::from_env()),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -83,6 +97,7 @@ impl RecommenderService {
             dwell_predictor: DwellPredictor::new(),
             objectives: ObjectivePredictor::new(),
             collab: Default::default(),
+            neural: std::sync::Arc::new(crate::neural::NeuralClient::from_env()),
             auto_tuner,
         }
     }
@@ -105,6 +120,7 @@ impl RecommenderService {
             dwell_predictor,
             objectives,
             collab: Default::default(),
+            neural: std::sync::Arc::new(crate::neural::NeuralClient::from_env()),
             auto_tuner,
         }
     }
@@ -120,6 +136,7 @@ impl RecommenderService {
             dwell_predictor,
             objectives,
             collab: Default::default(),
+            neural: std::sync::Arc::new(crate::neural::NeuralClient::from_env()),
             auto_tuner: std::sync::Arc::new(AutoTuner::new()),
         }
     }
@@ -637,6 +654,25 @@ impl RecommenderService {
         // que `velocity_throttles` et `realtime_author_boosts` juste au-dessus.
         let taste_boosts = self.taste_boosts(&mode, &profile, &deduped).await;
 
+        // ── Modele neuronal externe (`taste-model`) ──────────────────────────
+        //
+        // L'interrupteur est relu ICI, sur l'aller-retour Redis qui existe deja
+        // pour les poids : eteindre le modele prend effet a la requete suivante,
+        // sans recompiler ni redemarrer le moteur. C'est ce qui rend le
+        // branchement sur le fil de tout le monde reversible en une commande.
+        self.neural
+            .set_enabled(self.cache.admin_flag_enabled("admin:taste:enabled").await);
+        // Un seul appel pour tout le vivier, avant la boucle SYNCHRONE de
+        // scoring — meme patron que `velocity_throttles` et `taste_boosts`.
+        // En cas de panne, de lenteur ou d'extinction, la carte est vide et le
+        // classement est exactement celui d'avant.
+        let neural_scores = if self.neural.is_active() {
+            let ids: Vec<String> = deduped.iter().map(|t| t.id.clone()).collect();
+            self.neural.scores(&req.user_id, &ids).await
+        } else {
+            std::collections::HashMap::new()
+        };
+
         debug!("Scoring {} tweets with 8 dimensions...", deduped_count);
         let mut auto_strike_candidates = Vec::new();
         let scored = self.score_all(
@@ -648,6 +684,7 @@ impl RecommenderService {
             &realtime_author_boosts,
             &arm_stats,
             &taste_boosts,
+            &neural_scores,
             &mut auto_strike_candidates,
         );
         debug!(scored_count = scored.len(), "Scoring complete");
@@ -665,8 +702,33 @@ impl RecommenderService {
             .collect();
         trace!("Top 5 scores: {:?}", top_5);
 
-        let tweet_map: HashMap<&str, &RawTweet> =
-            deduped.iter().map(|t| (t.id.as_str(), t)).collect();
+        // ── La carte ne contient QUE les tweets ADMIS ────────────────────────
+        //
+        // Construite sur `deduped`, elle contenait aussi ceux que
+        // `enforcer.admit` venait d'écarter. `shape_feed` remonte la chaîne des
+        // réponses en lisant cette carte : une réponse à un compte `Ghosted`
+        // ramenait donc son parent dans le fil, alors que ce parent avait été
+        // refusé quelques lignes plus haut.
+        //
+        // Constaté en production le 2026-08-22 : `policiercongo`, au niveau
+        // `Ghosted`, sortait encore 3 tweets dans le fil d'un lecteur qui ne le
+        // suit pas — les 3 étaient des parents tirés par leurs réponses.
+        //
+        // Le SQL des candidats ferme déjà cette porte pour les comptes bannis
+        // ou suspendus (« répondre à un compte bloqué aurait suffi à le faire
+        // réapparaître par la porte de derrière »), mais le shadowban est
+        // décidé côté Rust, APRÈS la requête. Il fallait la fermer ici aussi.
+        //
+        // Conséquence voulue : une réponse dont le parent n'est pas admis est
+        // écartée elle aussi. `shape_feed` le fait déjà pour tout ancêtre
+        // manquant — « le contexte serait incomplet, on écarte ».
+        let admitted: std::collections::HashSet<&str> =
+            scored.iter().map(|s| s.tweet_id.as_str()).collect();
+        let tweet_map: HashMap<&str, &RawTweet> = deduped
+            .iter()
+            .filter(|t| admitted.contains(t.id.as_str()))
+            .map(|t| (t.id.as_str(), t))
+            .collect();
 
         // Mise en forme du fil : plafonne les réponses et fait précéder chacune
         // du tweet auquel elle répond.
@@ -868,6 +930,7 @@ impl RecommenderService {
         realtime_author_boosts: &HashMap<String, f64>,
         arm_stats: &HashMap<String, (f64, u32)>,
         taste_boosts: &HashMap<String, f64>,
+        neural_scores: &HashMap<String, f64>,
         auto_strike_candidates: &mut Vec<AutoStrikeCandidate>,
     ) -> Vec<ScoredTweet> {
         let mut author_count: HashMap<String, u32> = HashMap::new();
@@ -882,11 +945,11 @@ impl RecommenderService {
         let mut feed_shape = FeedShape::empty();
         let (ctr_samples, _) = self.ctr_predictor.stats();
         // Activer ML CTR seulement si suffisamment de données (évite overfitting cold-start)
-        let use_ml = ctr_samples >= 200;
+        let use_ml = ctr_samples >= crate::algorithm::scoring::ML_MIN_SAMPLES;
         let (dwell_samples, _) = self.dwell_predictor.stats();
         // Même garde-fou que le CTR, seuil identique : les deux modèles partagent
         // le même vecteur de features et démarrent d'un prior tout aussi vide.
-        let use_dwell = dwell_samples >= 200;
+        let use_dwell = dwell_samples >= crate::algorithm::scoring::ML_MIN_SAMPLES;
         // Le melange depend de la SURFACE — voir `BlendProfile`. Resolu une
         // fois pour tout le lot : le mode ne change pas d'un candidat a
         // l'autre.
@@ -1011,6 +1074,14 @@ impl RecommenderService {
                     .as_ref()
                     .and_then(|v| collab_space.affinity(v, &tweet.user_id))
                     .unwrap_or(0.5),
+                // `is_warm` : tant que la moyenne courante n'a pas assez
+                // d'observations, le `lift` n'a pas de sens et la tete reste
+                // muette — meme garde que le seuil de demarrage a froid des
+                // tetes `objectives`.
+                neural_scores
+                    .get(&tweet.id)
+                    .filter(|_| self.neural.is_warm())
+                    .map(|p| self.neural.lift(*p)),
             );
             let base_score = s.score;
 
@@ -3738,6 +3809,34 @@ mod tests {
     fn shape(scored: &[ScoredTweet], raw: &[RawTweet]) -> Vec<String> {
         let map: HashMap<&str, &RawTweet> = raw.iter().map(|t| (t.id.as_str(), t)).collect();
         shape_feed(scored, &map)
+    }
+
+    /// Le parent d'une réponse ne doit PAS entrer dans le fil quand il a été
+    /// écarté par le filtre d'admission.
+    ///
+    /// C'est le défaut trouvé en production le 2026-08-22 : `tweet_map` était
+    /// construite sur TOUS les candidats, pas seulement les admis, donc
+    /// `shape_feed` ramenait le parent en remontant la chaîne. Un compte
+    /// `Ghosted` sortait ainsi 3 tweets dans le fil d'un lecteur qui ne le
+    /// suivait pas — tirés par leurs réponses, par la porte de derrière.
+    ///
+    /// Ici, « écarté » se traduit par « absent de la carte » : c'est
+    /// exactement ce que fait l'appelant depuis le correctif.
+    #[test]
+    fn un_parent_non_admis_ne_revient_pas_par_sa_reponse() {
+        let raw = vec![tweet("racine"), reply("rep", "banni")];
+        // « banni » n'est PAS dans `raw` : il a été refusé à l'admission.
+        let out = shape(&scored_of(&["rep", "racine"]), &raw);
+
+        assert!(
+            !out.iter().any(|x| x == "banni"),
+            "le parent ecarte est revenu dans le fil : {out:?}"
+        );
+        assert!(
+            !out.iter().any(|x| x == "rep"),
+            "la reponse doit tomber avec son parent (contexte incomplet) : {out:?}"
+        );
+        assert_eq!(out, vec!["racine".to_string()]);
     }
 
     #[test]

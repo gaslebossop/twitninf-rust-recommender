@@ -630,6 +630,27 @@ button:disabled {
   border-bottom: none;
 }
 
+/* Aucune table n'avait d'en-tete avant la page Modele : sans cette regle, les
+   `th` sortaient en gras centre, style navigateur, au milieu d'une interface
+   qui n'utilise le gras nulle part ailleurs. */
+.dim-table th,
+.list-table th {
+  padding: 6px 10px;
+  text-align: right;
+  font-family: var(--font-body);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-bottom: 1px solid var(--border);
+}
+
+.dim-table th:first-child,
+.list-table th:first-child {
+  text-align: left;
+}
+
 .dim-name {
   color: var(--ink-soft);
   font-family: var(--font-body);

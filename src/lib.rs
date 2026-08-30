@@ -27,6 +27,7 @@ pub mod handlers;
 pub mod middleware;
 pub mod ml; // Phase 2: ML CTR Predictor + User Weights + AutoTuner
 pub mod models;
+pub mod neural; // Client du service taste-model (modele neuronal entraine en continu)
 pub mod services;
 pub mod shadowban; // Suppression des comptes contenu poubelle
 pub mod utils;
