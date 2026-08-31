@@ -49,7 +49,7 @@ pub async fn health_handler(State(state): State<AppState>) -> (StatusCode, Json<
             db: db_status,
             redis: redis_status,
             uptime_secs: uptime,
-            algorithm: "NeuralRank Fusion v2.1 — 8 dimensions + ML CTR + bandit + garbage filter",
+            algorithm: "NeuralRank Fusion v2.4 - 10 dimensions + ML multi-objectif + bandit + filtre poubelle",
         }),
     )
 }

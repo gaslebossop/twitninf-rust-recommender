@@ -485,7 +485,7 @@ pub async fn admin_algo_stats_handler(
             reject_samples,
             reject_rate,
             reject_active: reject_samples >= min_objective,
-            algorithm_version: "2.3.0 — 9D + multi-objectif (CTR, dwell, amplification, rejet) + bandit + admin node",
+            algorithm_version: "2.4.0 - 10D (dont affinite de gout) + multi-objectif + bandit + plancher de personnalisation",
         })),
     )
 }
