@@ -609,36 +609,38 @@ pub async fn record_interaction(
         )
         .await?;
 
-    if is_impression {
-        client
-            .execute(
-                r#"
-            INSERT INTO tweet_ab_variant_metrics (
-                variant_id, impressions, interactions, reward, updated_at
-            ) VALUES ($1, 1, 0, 0, NOW())
-            ON CONFLICT (variant_id) DO UPDATE
-            SET impressions = tweet_ab_variant_metrics.impressions + 1,
-                updated_at = NOW()
-        "#,
-                &[&variant_uuid],
-            )
-            .await?;
-    } else {
-        client
-            .execute(
-                r#"
-            INSERT INTO tweet_ab_variant_metrics (
-                variant_id, impressions, interactions, reward, updated_at
-            ) VALUES ($1, 0, 1, $2, NOW())
-            ON CONFLICT (variant_id) DO UPDATE
-            SET interactions = tweet_ab_variant_metrics.interactions + 1,
-                reward = tweet_ab_variant_metrics.reward + EXCLUDED.reward,
-                updated_at = NOW()
-        "#,
-                &[&variant_uuid, &reward],
-            )
-            .await?;
-    }
+    // Une impression est une EXPOSITION : tout evenement recu sur la variante
+    // en compte une, qu'il s'agisse d'un simple `View` ou d'un like.
+    //
+    // Avant, `impressions` n'etait incremente que pour `View` et `interactions`
+    // que pour le reste : les deux compteurs etaient DISJOINTS. Leur rapport
+    // n'etait donc pas un taux — le denominateur ne contenait pas le
+    // numerateur — et l'ecran affichait des lignes comme « 1 vue ·
+    // 5 interactions », impossibles a lire autrement que comme un bug.
+    //
+    // Desormais `impressions >= interactions` par construction, et
+    // `interactions / impressions` est un vrai taux d'engagement par
+    // exposition. C'est aussi ce que veut `choose_active_variant`, qui equilibre
+    // sur `impressions` : il cherche « combien de fois la variante a ete
+    // montree », pas « combien de fois quelqu'un n'a rien fait ».
+    let interaction_delta: i64 = if is_impression { 0 } else { 1 };
+    let reward_delta: f64 = if is_impression { 0.0 } else { reward };
+
+    client
+        .execute(
+            r#"
+        INSERT INTO tweet_ab_variant_metrics (
+            variant_id, impressions, interactions, reward, updated_at
+        ) VALUES ($1, 1, $2, $3, NOW())
+        ON CONFLICT (variant_id) DO UPDATE
+        SET impressions = tweet_ab_variant_metrics.impressions + 1,
+            interactions = tweet_ab_variant_metrics.interactions + EXCLUDED.interactions,
+            reward = tweet_ab_variant_metrics.reward + EXCLUDED.reward,
+            updated_at = NOW()
+    "#,
+            &[&variant_uuid, &interaction_delta, &reward_delta],
+        )
+        .await?;
 
     if status == "active" {
         maybe_finalize(pg, &experiment_id, min_impressions).await
