@@ -167,7 +167,7 @@ flux dense qui n'existe pas ici : « tendance » et « graphe social » regarden
 72 h.
 
 L'élargissement adaptatif, qui n'existait que pour Trending, vaut maintenant
-pour **tous les modes** : on rouvre les fenêtres par paliers (×1, ×4, ×12)
+pour **tous les modes** : on rouvre les fenêtres par paliers (×1, ×3, ×6)
 jusqu'à `CANDIDATE_TARGET_POOL = 200`, soit quatre candidats par place servie.
 
 Le premier palier vaut 1 : **sur un flux dense, rien ne change**, ni le vivier
