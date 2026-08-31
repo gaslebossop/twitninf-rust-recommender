@@ -142,4 +142,17 @@ pub const CANDIDATE_TARGET_POOL: usize = 200;
 /// large et une décote de fraîcheur forte servent du frais quand il y en a et
 /// du choix quand il n'y en a pas — un vivier étroit, lui, sert ce qu'il a,
 /// frais ou non.
-pub const CANDIDATE_WIDEN_STEPS: [i32; 3] = [1, 4, 12];
+pub const CANDIDATE_WIDEN_STEPS: [i32; 3] = [1, 3, 6];
+
+/// Gain minimal qu'un élargissement doit rapporter pour qu'on tente le suivant.
+///
+/// Sans cette règle, une cible hors d'atteinte fait dérouler TOUS les paliers à
+/// chaque requête : le vivier plafonne à ce que le corpus contient, et on ne
+/// gagne plus que de l'âge. Constaté au premier déploiement — le vivier montait
+/// à 103 pour une cible de 200, donc l'élargissement allait systématiquement au
+/// maximum, et la page servie est passée de deux tweets récents sur cinquante à
+/// … deux, avec un âge médian de dix-sept jours.
+///
+/// Si un palier ne rapporte pas au moins ce facteur, le corpus est épuisé :
+/// continuer n'ajoute que du vieux.
+pub const CANDIDATE_WIDEN_MIN_GAIN: f64 = 1.25;

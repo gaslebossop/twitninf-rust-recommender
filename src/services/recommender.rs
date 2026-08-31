@@ -16,7 +16,7 @@ use crate::bandit::bandit_select;
 use crate::constants::{
     COLD_START_FOLLOW_BOOST_MAX, COLD_START_INTERACTION_FLOOR, EXCLUDE_SEEN_MIN_REMAINING,
     FOLLOW_FEED_BOOST, FOLLOW_MUTUAL_BOOST, TRENDING_HOOK_POOL, TRENDING_HOOK_SIZE,
-    CANDIDATE_TARGET_POOL, CANDIDATE_WIDEN_STEPS,
+    CANDIDATE_TARGET_POOL, CANDIDATE_WIDEN_MIN_GAIN, CANDIDATE_WIDEN_STEPS,
     TRENDING_HOOK_TEMPERATURE, TRENDING_MEDIA_BOOST,
     TRENDING_SHUFFLE_TEMPERATURE, TRENDING_TASTE_BOOST_MAX,
 };
@@ -1848,8 +1848,21 @@ impl RecommenderService {
                 )
                 .await?;
 
+            let precedent = all.len();
             all = map_rows(rows);
             if all.len() >= CANDIDATE_TARGET_POOL {
+                break;
+            }
+            // Le palier n'a pas assez rapporté : le corpus est épuisé, et
+            // continuer n'ajouterait que de l'âge. Voir
+            // `CANDIDATE_WIDEN_MIN_GAIN`.
+            if attempt > 0 && (all.len() as f64) < precedent as f64 * CANDIDATE_WIDEN_MIN_GAIN {
+                debug!(
+                    attempt,
+                    precedent,
+                    candidates = all.len(),
+                    "Élargissement sans gain — corpus épuisé, on s'arrête"
+                );
                 break;
             }
             debug!(

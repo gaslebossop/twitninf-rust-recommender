@@ -1027,9 +1027,8 @@ pub fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile, now: DateTime<U
     let age_h = age_hours_at(t, now);
     trace!(age_h, "D4 Tweet age in hours");
 
-    // Phase 1: demi-vie réduite de 6h → 4h pour favoriser contenu frais (+CTR)
-    let recency = (-0.173 * age_h).exp(); // ln(2)/4h ≈ 0.173
-    trace!(recency, "D4 Recency (4h half-life, Phase 1 optimization)");
+    let recency = recency_decay(age_h);
+    trace!(recency, "D4 Recency (decroissance a deux echelles)");
 
     // Alignement heure d'activité utilisateur
     //
@@ -1642,6 +1641,50 @@ pub fn age_hours_at(t: &RawTweet, now: DateTime<Utc>) -> f64 {
     (diff.num_seconds() as f64 / 3600.0).max(0.0)
 }
 
+/// Part de la décote de fraîcheur portée par la composante RAPIDE.
+const RECENCY_FAST_SHARE: f64 = 0.70;
+/// ln(2) / 4 h — ce qui fait qu'un contenu de quelques heures se détache.
+const RECENCY_FAST_RATE: f64 = 0.173_286_8;
+/// ln(2) / 7 j — ce qui fait qu'un contenu de trois jours reste devant un
+/// contenu de trois semaines.
+const RECENCY_SLOW_RATE: f64 = 0.004_126_0;
+
+/// Décote de fraîcheur, à DEUX échelles de temps.
+///
+/// ── Pourquoi pas une seule exponentielle ────────────────────────────────────
+/// La version précédente valait `exp(-ln2/4h × âge)` : demi-vie de quatre
+/// heures, calibrée pour une plateforme au flux dense. Passé trois jours, elle
+/// vaut `e^-12,5 ≈ 0` — et **zéro pour tout le monde ne classe plus personne**.
+/// D4 devenait incapable de distinguer un tweet de quatre jours d'un tweet de
+/// trente.
+///
+/// Ça ne se voyait pas tant que les fenêtres de collecte s'arrêtaient à 72 h :
+/// le vivier ne contenait rien d'assez vieux pour que ça compte. En élargissant
+/// la collecte, le défaut est sorti d'un coup — mesuré en production le
+/// 2026-08-31, page de 50 tweets : **2 seulement avaient moins de 72 h, alors
+/// que le vivier en contenait 45**. Les vieux gagnaient parce que D1 et D7
+/// comptent l'engagement ABSOLU, qui s'accumule avec l'âge, pendant que D4 ne
+/// départageait plus rien.
+///
+/// Deux composantes, donc : une rapide qui fait ressortir ce qui vient d'être
+/// publié, une lente qui continue de déclasser le vieux bien au-delà.
+///
+/// ```text
+///   âge      avant    après
+///    1 h     0,84     0,89
+///    6 h     0,35     0,54
+///   24 h     0,016    0,30
+///   72 h     0,000    0,22
+///    7 j     0,000    0,15
+///   20 j     0,000    0,05
+/// ```
+#[inline]
+pub fn recency_decay(age_h: f64) -> f64 {
+    let age = age_h.max(0.0);
+    RECENCY_FAST_SHARE * (-RECENCY_FAST_RATE * age).exp()
+        + (1.0 - RECENCY_FAST_SHARE) * (-RECENCY_SLOW_RATE * age).exp()
+}
+
 /// Sigmoid : σ(x) = 1 / (1 + e^-x)  →  σ(0) = 0.5
 pub fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
@@ -2105,6 +2148,47 @@ mod tests {
         // l'horloge lui-même, à quelques microsecondes près.
         let libre = score_tweet_with_weights(&tweet, &profile, 0, FeedShape::empty(), &weights);
         assert!((libre.score - a.score).abs() < 1e-6, "libre={} fixe={}", libre.score, a.score);
+    }
+
+    // ─── Décote de fraîcheur ─────────────────────────────────────────────────
+
+    /// Le défaut corrigé : passé trois jours, l'ancienne décote valait zéro
+    /// pour TOUT LE MONDE, et zéro pour tout le monde ne classe plus personne.
+    #[test]
+    fn l_age_departage_encore_bien_au_dela_de_trois_jours() {
+        let trois_jours = recency_decay(72.0);
+        let trois_semaines = recency_decay(504.0);
+        assert!(
+            trois_jours > trois_semaines * 2.0,
+            "trois jours ({trois_jours}) doit dominer trois semaines ({trois_semaines})"
+        );
+        // L'ancienne formule rendait 5e-6 et 1e-38 : deux valeurs que rien ne
+        // sépare une fois multipliées par un poids de 0,08.
+        assert!(
+            trois_semaines > 0.01,
+            "un vieux tweet doit garder une valeur mesurable : {trois_semaines}"
+        );
+    }
+
+    /// Ce que la composante rapide protège : le tout frais doit toujours
+    /// ressortir nettement.
+    #[test]
+    fn le_tres_frais_reste_nettement_devant() {
+        assert!(recency_decay(1.0) > recency_decay(24.0) * 2.0);
+        assert!(recency_decay(0.0) > 0.95);
+    }
+
+    #[test]
+    fn la_decote_est_strictement_decroissante_et_bornee() {
+        let mut precedent = f64::INFINITY;
+        for h in [0.0, 0.5, 1.0, 6.0, 24.0, 72.0, 168.0, 504.0, 2160.0, 10_000.0] {
+            let v = recency_decay(h);
+            assert!((0.0..=1.0).contains(&v), "hors bornes à {h} h : {v}");
+            assert!(v < precedent, "non décroissante à {h} h : {v} >= {precedent}");
+            precedent = v;
+        }
+        // Un âge négatif (horloge décalée) ne doit pas dépasser 1.
+        assert!(recency_decay(-5.0) <= 1.0);
     }
 
     // ─── D10 — affinité de goût ──────────────────────────────────────────────
