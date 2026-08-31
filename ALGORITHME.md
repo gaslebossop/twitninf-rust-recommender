@@ -163,6 +163,7 @@ Chaque tweet reçoit neuf scores dans [0,1] :
 | **D7** | Prédiction virale | Accélération de l'engagement (×1,2 si source Tendance) |
 | **D8** | Profondeur de personnalisation | Signaux fins propres au lecteur |
 | **D9** | Compréhension LLM | Qualité, thème et ton établis hors-ligne par l'annotateur |
+| **D10** | Affinité de goût | Proximité sémantique entre le texte et ce que CE lecteur consomme |
 
 ### 5.2 Composition du score de base
 
@@ -175,13 +176,31 @@ score_base    = score_global × 0,60 + score_lecteur × 0,40
 Poids par défaut (somme = 1,00) :
 
 ```
-D1 0,24 · D2 0,12 · D3 0,22 · D4 0,09 · D5 0,08
-D6 0,06 · D7 0,06 · D8 0,03 · D9 0,10
+D1 0,18 · D2 0,10 · D3 0,22 · D4 0,08 · D5 0,08
+D6 0,06 · D7 0,04 · D8 0,03 · D9 0,09 · D10 0,12
 ```
 
-D9 a été financée par un prélèvement sur les autres, pas par une inflation du
-total : si la somme dérive, tous les scores montent et les seuils calibrés
-ailleurs sautent.
+D9 puis D10 ont été financées par un prélèvement sur les autres, pas par une
+inflation du total : si la somme dérive, tous les scores montent et les seuils
+calibrés ailleurs sautent.
+
+Le prélèvement de D10 n'est pas réparti au hasard — il porte d'abord sur D1
+(vélocité) et D7 (viralité), les deux dimensions qui mesurent ce que **tout le
+monde** regarde. C'est le déplacement délibéré de « ce qui marche en ce
+moment » vers « ce que CE lecteur consomme ».
+
+**Part de personnalisation.** D3 + D5 + D8 + D10 = **0,45** : les quatre
+dimensions qui changent d'un lecteur à l'autre pour un même tweet pèsent plus
+que la popularité (D1 + D7 = 0,22). Un plancher à 0,40 empêche le réglage
+automatique de défaire cet équilibre — il l'avait fait descendre à 0,26 sans
+que rien ne le signale (voir `ml/auto_tuner.rs`).
+
+**D10 classe, elle ne mesure pas.** La similarité cosinus médiane entre un
+lecteur et un candidat quelconque vaut ~0,65 : verser cette valeur brute
+reviendrait à ajouter une constante au score de presque tout le monde, sans
+déplacer un seul rang. La dimension rend donc la POSITION du candidat dans le
+vivier, de 0 (le plus éloigné du goût) à 1 (le plus proche), et vaut 0,5 —
+neutre, jamais pénalisante — quand la mesure manque.
 
 ### 5.3 Modulateurs multiplicatifs
 
