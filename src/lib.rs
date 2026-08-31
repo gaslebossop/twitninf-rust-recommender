@@ -19,6 +19,7 @@ pub mod bandit; // Phase 3: Contextual Bandit
 pub mod calibration; // Recalibration explicite de l'algo, depuis les Paramètres
 pub mod collab; // Plongements collaboratifs : lecteurs et auteurs dans le meme espace
 pub mod constants;
+pub mod content; // Analyse du texte d un tweet, faite une fois a l entree du pipeline
 pub mod cooccurrence;
 pub mod embeddings;
 pub mod eval; // Mesure hors-echantillon des modeles : AUC, log-loss, calibration, NDCG

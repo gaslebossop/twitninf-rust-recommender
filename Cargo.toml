@@ -30,6 +30,17 @@ redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 # ML / randomness
 rand = "0.8"
 
+# Recherche simultanee de plusieurs motifs dans un texte.
+#
+# D2 et D8 cherchaient chacun les ~30 centres d'interet du lecteur dans le
+# texte de CHAQUE candidat, a coups de `str::contains` — une cinquantaine de
+# balayages du meme texte par tweet, 85 000 par recommandation. Un automate
+# construit une fois par profil repond a la meme question en un passage.
+#
+# Deja present dans l'arbre (regex <- tracing-subscriber) : le declarer en
+# direct n'ajoute rien au temps de compilation.
+aho-corasick = "1"
+
 # Embeddings sémantiques — modèle ONNX local, auto-hébergé (aucun coût d'API,
 # aucune dépendance à un service tiers). Voir src/embeddings.rs.
 fastembed = "4"

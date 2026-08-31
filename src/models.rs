@@ -1,7 +1,12 @@
+use std::sync::Arc;
+
+use aho_corasick::AhoCorasick;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::content::{analyze_content, ContentFeatures};
 use crate::shadowban::ShadowbanLevel;
+use crate::utils::{FxHashMap, FxHashSet};
 
 // ─── Requêtes entrantes ───────────────────────────────────────────────────────
 
@@ -260,13 +265,69 @@ pub struct UserProfile {
     // moins cher que de les transporter, et un profil relu du cache passe de
     // toute façon par `rebuild_indexes()`.
     #[serde(skip)]
-    pub following_set: std::collections::HashSet<String>,
+    pub following_set: FxHashSet<String>,
     #[serde(skip)]
-    pub mutual_set: std::collections::HashSet<String>,
+    pub mutual_set: FxHashSet<String>,
     #[serde(skip)]
-    pub second_degree_set: std::collections::HashSet<String>,
+    pub second_degree_set: FxHashSet<String>,
     #[serde(skip)]
-    pub seen_set: std::collections::HashSet<String>,
+    pub seen_set: FxHashSet<String>,
+
+    /// `top_authors` indexé.
+    ///
+    /// D3 (« ce lecteur a-t-il déjà interagi avec l'auteur ? ») et D8 (« à quel
+    /// point ? ») posent la MÊME question, et la résolvaient chacune par un
+    /// balayage linéaire de la liste. Deux balayages par candidat, 3400 par
+    /// recommandation, pour une valeur qu'on peut hacher une seule fois.
+    #[serde(skip)]
+    pub author_affinity_index: FxHashMap<String, f64>,
+
+    /// Recherche simultanée des centres d'intérêt dans le texte d'un candidat.
+    ///
+    /// D2 et D8 posent là aussi la même question — « lesquels des mots-clés de
+    /// ce lecteur apparaissent dans ce tweet ? » — et y répondaient chacune par
+    /// une boucle de `str::contains` : une cinquantaine de recherches de
+    /// sous-chaîne PAR CANDIDAT, 85 000 par recommandation, pour une réponse
+    /// qui tient en un seul passage.
+    ///
+    /// L'automate donne EXACTEMENT le même verdict que `contains` (« ce motif
+    /// est-il une sous-chaîne ? ») : ni frontière de mot, ni casse, ni ordre
+    /// n'entrent en jeu. Le classement ne bouge pas, et c'est vérifié par
+    /// `l_automate_et_le_balayage_lineaire_disent_la_meme_chose`.
+    ///
+    /// `Arc` parce que `UserProfile` est cloné et que l'automate, lui, ne doit
+    /// pas l'être. `None` quand il n'y a pas de mots-clés, ou qu'il y en a plus
+    /// que le masque de bits n'en porte : le repli linéaire prend le relais.
+    #[serde(skip)]
+    pub word_matcher: Option<Arc<AhoCorasick>>,
+}
+
+/// Nombre maximum de centres d'intérêt que l'automate peut suivre.
+///
+/// Le passage de l'automate rend les motifs trouvés dans l'ordre du TEXTE ; D8
+/// les somme, lui, dans l'ordre des MOTS-CLÉS. Pour que la somme flottante soit
+/// au bit près celle du balayage linéaire, on mémorise les motifs vus dans un
+/// masque de bits, puis on parcourt les mots-clés dans LEUR ordre. D'où la
+/// borne : un `u64` porte 64 motifs. `top_words` en contient 30 au plus (voir
+/// `extract_content_prefs`), elle n'est donc jamais atteinte en production —
+/// elle existe pour que le cas contraire retombe sur le chemin linéaire au lieu
+/// de perdre des mots-clés en silence.
+pub const MAX_INDEXED_KEYWORDS: usize = 64;
+
+/// Nombre de centres d'intérêt que D8 pondère (les plus fréquents d'abord).
+pub const D8_KEYWORD_DEPTH: usize = 20;
+
+/// Ce que D2 et D8 tirent des centres d'intérêt du lecteur, en UN passage.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct KeywordHits {
+    /// Combien de mots-clés du lecteur apparaissent dans ce tweet — ce que D2
+    /// compte.
+    pub matches: usize,
+    /// Somme pondérée sur les `D8_KEYWORD_DEPTH` premiers mots-clés, AVANT
+    /// plafonnement — ce que D8 additionne.
+    pub weighted: f64,
+    /// Combien de ces `D8_KEYWORD_DEPTH` premiers ont été trouvés (trace D8).
+    pub top_matches: usize,
 }
 
 impl UserProfile {
@@ -282,6 +343,130 @@ impl UserProfile {
         self.mutual_set = self.mutual_follow_ids.iter().cloned().collect();
         self.second_degree_set = self.second_degree_ids.iter().cloned().collect();
         self.seen_set = self.seen_tweet_ids.iter().cloned().collect();
+
+        // `or_insert` et non `insert` : le balayage linéaire qu'on remplace
+        // s'arrêtait au PREMIER auteur trouvé. Une collecte naïve garderait le
+        // dernier, et deux lignes pour le même auteur — impossible avec le
+        // GROUP BY qui alimente ce champ, mais rien ne l'interdit au type —
+        // donneraient alors une affinité différente d'avant.
+        self.author_affinity_index =
+            FxHashMap::with_capacity_and_hasher(self.top_authors.len(), Default::default());
+        for (author_id, affinity) in &self.top_authors {
+            self.author_affinity_index
+                .entry(author_id.clone())
+                .or_insert(*affinity);
+        }
+
+        // Un motif vide serait trouvé dans n'importe quel texte : `contains("")`
+        // vaut `true`. Les mots-clés viennent de mots de plus de trois lettres,
+        // mais le champ est public et un profil forgé à la main peut en porter.
+        // Dans ce cas on ne construit pas d'automate plutôt que d'en construire
+        // un qui mentirait sur QUEL mot a été trouvé.
+        let has_empty = self.top_words.iter().any(|(word, _)| word.is_empty());
+        self.word_matcher = if self.top_words.is_empty()
+            || has_empty
+            || self.top_words.len() > MAX_INDEXED_KEYWORDS
+        {
+            None
+        } else {
+            // Le constructeur par defaut, et non un DFA force : mesure faite,
+            // le DFA n est pas plus rapide ici (0,297 ms contre 0,270 sur
+            // 1700 candidats) parce qu il perd le PREFILTRE. Sur des mots-cles
+            // reels, dont les premieres lettres varient et qui sont absents de
+            // la plupart des tweets, ce prefiltre repond  non  en un balayage
+            // vectorise sans jamais entrer dans l automate.
+            AhoCorasick::new(self.top_words.iter().map(|(word, _)| word.as_str()))
+                .ok()
+                .map(Arc::new)
+        };
+    }
+
+    /// Affinité déjà mesurée entre ce lecteur et cet auteur, ou 0.
+    ///
+    /// Même repli que `member` : un index vide face à une liste pleine est
+    /// indiscernable d'un « aucune affinité », donc on rebalaie plutôt que de
+    /// rendre un zéro faux.
+    #[inline]
+    pub fn author_affinity(&self, author_id: &str) -> f64 {
+        if self.author_affinity_index.is_empty() && !self.top_authors.is_empty() {
+            return self
+                .top_authors
+                .iter()
+                .find(|(uid, _)| uid == author_id)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0);
+        }
+        self.author_affinity_index
+            .get(author_id)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Ce lecteur a-t-il déjà une histoire avec cet auteur ?
+    ///
+    /// Distinct de `author_affinity(id) > 0.0` : un auteur peut figurer dans
+    /// `top_authors` avec une affinité nulle, et le bandit a besoin de la
+    /// différence — « jamais vu » est ce qui rend un tweet candidat à
+    /// l'exploration, pas « vu et laissé indifférent ».
+    #[inline]
+    pub fn knows_author(&self, author_id: &str) -> bool {
+        if self.author_affinity_index.is_empty() && !self.top_authors.is_empty() {
+            return self.top_authors.iter().any(|(uid, _)| uid == author_id);
+        }
+        self.author_affinity_index.contains_key(author_id)
+    }
+
+    /// Centres d'intérêt présents dans ce texte — la question de D2 et de D8,
+    /// posée une seule fois.
+    ///
+    /// `content_lower` doit déjà être en minuscules : `top_words` l'est par
+    /// construction, et l'automate ne replie pas la casse.
+    pub fn keyword_hits(&self, content_lower: &str) -> KeywordHits {
+        let Some(matcher) = self.word_matcher.as_ref() else {
+            return self.keyword_hits_linear(content_lower);
+        };
+
+        // `find_overlapping_iter` et non `find_iter` : un mot-clé peut être
+        // contenu dans un autre (« chat » dans « chateau »). Avec les matchs
+        // non chevauchants, le plus long masquerait le plus court et D2
+        // compterait une correspondance de moins que `contains`.
+        let mut seen: u64 = 0;
+        for m in matcher.find_overlapping_iter(content_lower) {
+            seen |= 1u64 << m.pattern().as_usize();
+        }
+
+        let mut hits = KeywordHits::default();
+        if seen == 0 {
+            return hits;
+        }
+        for (i, (_, count)) in self.top_words.iter().enumerate() {
+            if seen & (1u64 << i) == 0 {
+                continue;
+            }
+            hits.matches += 1;
+            if i < D8_KEYWORD_DEPTH {
+                hits.top_matches += 1;
+                hits.weighted += (*count as f64).ln() / 5.0;
+            }
+        }
+        hits
+    }
+
+    /// Le chemin d'avant, gardé comme repli ET comme référence de justesse : un
+    /// test compare les deux sur les mêmes entrées.
+    pub fn keyword_hits_linear(&self, content_lower: &str) -> KeywordHits {
+        let mut hits = KeywordHits::default();
+        for (i, (word, count)) in self.top_words.iter().enumerate() {
+            if !content_lower.contains(word.as_str()) {
+                continue;
+            }
+            hits.matches += 1;
+            if i < D8_KEYWORD_DEPTH {
+                hits.top_matches += 1;
+                hits.weighted += (*count as f64).ln() / 5.0;
+            }
+        }
+        hits
     }
 
     /// Appartenance, en préférant l'index quand il existe.
@@ -295,7 +480,7 @@ impl UserProfile {
     /// d'entier pour rendre cette panne impossible ; le chemin nominal, lui,
     /// reste bien en O(1).
     #[inline]
-    fn member(set: &std::collections::HashSet<String>, list: &[String], needle: &str) -> bool {
+    fn member(set: &FxHashSet<String>, list: &[String], needle: &str) -> bool {
         if set.is_empty() && !list.is_empty() {
             return list.iter().any(|id| id == needle);
         }
@@ -410,7 +595,17 @@ pub struct RawTweet {
     pub exclamation_count: i32,
     pub question_count: i32,
     pub url_count: i32,
-    pub words: Vec<String>,
+    /// Texte analysé une fois pour toutes à l'entrée du pipeline — voir
+    /// [`crate::content`]. Remplace le `words: Vec<String>` d'avant, qui
+    /// recopiait jusqu'à cinquante mots par candidat pour un détecteur qui ne
+    /// fait que les compter et les dédupliquer.
+    ///
+    /// ⚠ Dérivé de `content` : construit par `analyze_content`, jamais à la
+    /// main. Un `RawTweet` monté par `..Default::default()` avec un `content`
+    /// mais sans `text` retombe sur le calcul à la volée (voir
+    /// [`RawTweet::content_lower`]) plutôt que de faire comme si le tweet
+    /// était vide.
+    pub text: ContentFeatures,
 
     pub author_followers: i64,
     pub author_following: i64,
@@ -495,6 +690,32 @@ pub enum TweetSource {
 // `RawTweet` est construit dans les tests via `..Default::default()`, mais le
 // dérive était impossible : `DateTime<Utc>` n'implémente pas `Default`. Le test
 // de D1 ne compilait donc pas. Impl manuelle, avec l'epoch comme date neutre.
+impl RawTweet {
+    /// Le texte du tweet en minuscules.
+    ///
+    /// Rendu depuis l'analyse faite à l'entrée du pipeline quand elle existe,
+    /// recalculé à la volée sinon. Ce repli est le même parti que
+    /// `UserProfile::member` : un champ dérivé qu'on a oublié de remplir doit
+    /// coûter du temps, pas fausser un classement. Sans lui, un `RawTweet`
+    /// monté à la main avec un `content` mais sans `text` — c'est le cas de la
+    /// centaine de tweets de test construits par `..Default::default()` — se
+    /// comporterait comme un tweet au texte VIDE : D2 et D8 ne trouveraient
+    /// jamais un seul centre d'intérêt, sans la moindre erreur.
+    #[inline]
+    pub fn content_lower(&self) -> std::borrow::Cow<'_, str> {
+        if self.text.lower.is_empty() && !self.content.is_empty() {
+            return std::borrow::Cow::Owned(self.content.to_lowercase());
+        }
+        std::borrow::Cow::Borrowed(&self.text.lower)
+    }
+
+    /// Remplit `text` depuis `content`. À appeler sur tout tweet construit
+    /// autrement que par `map_rows`.
+    pub fn analyze(&mut self) {
+        self.text = analyze_content(&self.content);
+    }
+}
+
 impl Default for RawTweet {
     fn default() -> Self {
         Self {
@@ -521,7 +742,7 @@ impl Default for RawTweet {
             exclamation_count: 0,
             question_count: 0,
             url_count: 0,
-            words: Vec::new(),
+            text: ContentFeatures::default(),
             author_followers: 0,
             author_following: 0,
             author_is_verified: false,
@@ -807,6 +1028,219 @@ mod profile_index_tests {
         assert!(!relu.following_set.is_empty());
         assert!(relu.follows("a") && relu.is_mutual("b") && relu.has_seen("t1"));
         assert!(!relu.follows("z"));
+    }
+
+    // ─── Affinité d'auteur indexée ───────────────────────────────────────────
+
+    fn profil_avec_auteurs(auteurs: Vec<(String, f64)>) -> UserProfile {
+        let mut p = UserProfile {
+            top_authors: auteurs,
+            ..Default::default()
+        };
+        p.rebuild_indexes();
+        p
+    }
+
+    #[test]
+    fn l_affinite_indexee_repond_comme_le_balayage() {
+        let auteurs: Vec<(String, f64)> = (0..40)
+            .map(|i| (format!("auteur-{i}"), 1.0 - i as f64 * 0.02))
+            .collect();
+        let p = profil_avec_auteurs(auteurs.clone());
+        for (id, attendu) in &auteurs {
+            assert_eq!(p.author_affinity(id), *attendu, "auteur {id}");
+        }
+        assert_eq!(p.author_affinity("inconnu"), 0.0);
+    }
+
+    /// Le balayage remplacé s'arrêtait au PREMIER auteur trouvé. Une collecte
+    /// naïve dans une table garderait le dernier : deux lignes pour le même
+    /// auteur suffiraient alors à changer un score, en silence.
+    #[test]
+    fn sur_un_auteur_en_double_c_est_la_premiere_ligne_qui_compte() {
+        let p = profil_avec_auteurs(vec![
+            ("double".into(), 0.90),
+            ("autre".into(), 0.10),
+            ("double".into(), 0.20),
+        ]);
+        assert_eq!(p.author_affinity("double"), 0.90);
+    }
+
+    /// « Connu » et « apprécié » ne sont pas la même question, et le bandit a
+    /// besoin de la première : c'est « jamais vu » qui rend un tweet candidat à
+    /// l'exploration, pas « vu et laissé indifférent ». Un auteur inscrit avec
+    /// une affinité nulle doit donc être connu.
+    #[test]
+    fn un_auteur_d_affinite_nulle_reste_un_auteur_connu() {
+        let p = profil_avec_auteurs(vec![("froid".into(), 0.0), ("chaud".into(), 0.8)]);
+        assert!(p.knows_author("froid"));
+        assert_eq!(p.author_affinity("froid"), 0.0);
+        assert!(p.knows_author("chaud"));
+        assert!(!p.knows_author("inconnu"));
+    }
+
+    #[test]
+    fn l_auteur_connu_se_reconnait_aussi_sans_index() {
+        let sans_index = UserProfile {
+            top_authors: vec![("froid".into(), 0.0)],
+            ..Default::default()
+        };
+        assert!(sans_index.author_affinity_index.is_empty());
+        assert!(sans_index.knows_author("froid"));
+        assert!(!sans_index.knows_author("inconnu"));
+    }
+
+    #[test]
+    fn l_affinite_repond_juste_meme_sans_index() {
+        // Même garde-fou que `follows` : un `rebuild_indexes()` oublié doit
+        // coûter du temps, pas fausser un score.
+        let sans_index = UserProfile {
+            top_authors: vec![("a".into(), 0.7)],
+            ..Default::default()
+        };
+        assert!(sans_index.author_affinity_index.is_empty());
+        assert_eq!(sans_index.author_affinity("a"), 0.7);
+        assert_eq!(sans_index.author_affinity("b"), 0.0);
+    }
+
+    // ─── Recherche des centres d'intérêt ─────────────────────────────────────
+
+    fn profil_avec_mots(mots: &[(&str, u32)]) -> UserProfile {
+        let mut p = UserProfile {
+            top_words: mots
+                .iter()
+                .map(|(w, n)| ((*w).to_string(), *n))
+                .collect(),
+            ..Default::default()
+        };
+        p.rebuild_indexes();
+        p
+    }
+
+    /// L'automate remplace une cinquantaine de `str::contains` par candidat.
+    /// C'est le remplacement le plus risqué de tout le lot : s'il ne trouve pas
+    /// exactement les mêmes motifs, D2 et D8 changent de valeur sans que rien
+    /// ne le signale. On compare donc les deux chemins terme à terme, sur des
+    /// cas choisis pour casser les implémentations naïves.
+    #[test]
+    fn l_automate_et_le_balayage_lineaire_disent_la_meme_chose() {
+        let profils = [
+            // Un motif contenu dans un autre : c'est ce qui distingue une
+            // recherche chevauchante d'une recherche gloutonne. Avec des matchs
+            // non chevauchants, « chat » disparaîtrait dans « chateau ».
+            profil_avec_mots(&[("chat", 9), ("chateau", 4), ("eau", 7)]),
+            // Motifs qui se recouvrent partiellement.
+            profil_avec_mots(&[("abab", 3), ("baba", 5), ("aba", 2)]),
+            // Au-delà des 20 premiers : seuls ceux-là comptent pour D8.
+            profil_avec_mots(
+                &(0..30)
+                    .map(|i| (["alpha", "beta", "gamma"][i % 3], 2 + i as u32))
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
+            profil_avec_mots(&[("accentué", 6), ("œuf", 3), ("straße", 5)]),
+            profil_avec_mots(&[]),
+        ];
+        let textes = [
+            "",
+            "chat",
+            "un chateau au bord de l'eau avec un chat",
+            "abababa",
+            "alpha beta gamma alpha",
+            "rien de tout cela ici",
+            "accentué œuf straße",
+            "CHAT en majuscules ne compte pas, la recherche est deja minuscule",
+            "chatchatchat",
+        ];
+        for (i, p) in profils.iter().enumerate() {
+            for texte in textes {
+                assert_eq!(
+                    p.keyword_hits(texte),
+                    p.keyword_hits_linear(texte),
+                    "profil {i}, texte {texte:?}"
+                );
+            }
+        }
+    }
+
+    /// Le repli doit être exact, pas seulement présent : c'est lui qui sert
+    /// pour un profil relu du cache avant reconstruction.
+    #[test]
+    fn sans_automate_la_recherche_reste_juste() {
+        let sans_index = UserProfile {
+            top_words: vec![("chat".into(), 9), ("chien".into(), 4)],
+            ..Default::default()
+        };
+        assert!(sans_index.word_matcher.is_none());
+        let hits = sans_index.keyword_hits("un chat et un chien");
+        assert_eq!(hits.matches, 2);
+        assert_eq!(hits.top_matches, 2);
+    }
+
+    /// Un mot-clé vide est trouvé dans n'importe quel texte (`"".contains("")`
+    /// vaut `true`) et décale les index de motifs. On refuse alors de
+    /// construire l'automate plutôt que d'en construire un qui se trompe de
+    /// mot.
+    #[test]
+    fn un_mot_cle_vide_desactive_l_automate_sans_changer_le_resultat() {
+        let p = profil_avec_mots(&[("chat", 9), ("", 4)]);
+        assert!(p.word_matcher.is_none());
+        assert_eq!(
+            p.keyword_hits("un chat"),
+            p.keyword_hits_linear("un chat")
+        );
+    }
+
+    #[test]
+    fn au_dela_du_masque_de_bits_on_retombe_sur_le_balayage() {
+        let mots: Vec<(String, u32)> = (0..MAX_INDEXED_KEYWORDS + 1)
+            .map(|i| (format!("mot{i}"), 2 + i as u32))
+            .collect();
+        let mut p = UserProfile {
+            top_words: mots,
+            ..Default::default()
+        };
+        p.rebuild_indexes();
+        assert!(p.word_matcher.is_none(), "trop de motifs pour le masque");
+        let texte = "mot0 mot7 mot64 quelque chose";
+        assert_eq!(p.keyword_hits(texte), p.keyword_hits_linear(texte));
+    }
+
+    /// D8 additionne des flottants : l'ORDRE des termes fait le résultat.
+    /// L'automate rend ses motifs dans l'ordre du texte, la somme doit rester
+    /// dans l'ordre des mots-clés.
+    #[test]
+    fn la_somme_de_d8_suit_l_ordre_des_mots_cles_pas_du_texte() {
+        let p = profil_avec_mots(&[("premier", 7), ("second", 13), ("tiers", 3)]);
+        let a = p.keyword_hits("tiers second premier");
+        let b = p.keyword_hits("premier second tiers");
+        assert_eq!(a.weighted.to_bits(), b.weighted.to_bits());
+        assert_eq!(a.weighted.to_bits(), p.keyword_hits_linear("tiers second premier").weighted.to_bits());
+    }
+
+    // ─── Minuscules du tweet ─────────────────────────────────────────────────
+
+    #[test]
+    fn content_lower_retombe_sur_le_calcul_quand_l_analyse_manque() {
+        // Le cas de tous les tweets montés par `..Default::default()`.
+        let brut = RawTweet {
+            content: "Du TEXTE en Majuscules".into(),
+            ..Default::default()
+        };
+        assert!(brut.text.lower.is_empty());
+        assert_eq!(&*brut.content_lower(), "du texte en majuscules");
+
+        let mut analyse = brut.clone();
+        analyse.analyze();
+        assert_eq!(&*analyse.content_lower(), &*brut.content_lower());
+    }
+
+    #[test]
+    fn un_tweet_sans_texte_ne_declenche_pas_le_repli() {
+        let vide = RawTweet::default();
+        assert_eq!(&*vide.content_lower(), "");
     }
 }
 

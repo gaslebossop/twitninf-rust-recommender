@@ -1,5 +1,14 @@
 # 🚀 Optimizations Applied
 
+> ⚠ **Document périmé — ne pas s'y fier.** Il décrit un
+> `src/algorithm/dimensions/`, un `src/error.rs` et un
+> `src/utils/validation.rs` qui n'existent plus (le premier a été supprimé par
+> le commit `b5be392`, les deux autres n'ont jamais existé sous cette forme).
+> Les chiffres qu'il annonce n'ont jamais été mesurés par un banc d'essai.
+>
+> Pour l'état réel des performances, les mesures et les bancs :
+> **[PASSATION-PERFORMANCE-2026-08-31.md](PASSATION-PERFORMANCE-2026-08-31.md)**.
+
 ## Structure Optimizations 📁
 
 ### Separation of Concerns

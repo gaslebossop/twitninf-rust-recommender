@@ -9,6 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::algorithm::scoring::{
     compute_feed_metrics, impression_fatigue, score_tweet_ml_with_weights, BlendProfile,
+    ScoringContext,
     theme_diversity_multiplier, FeedShape,
 };
 use crate::bandit::bandit_select;
@@ -933,12 +934,16 @@ impl RecommenderService {
         neural_scores: &HashMap<String, f64>,
         auto_strike_candidates: &mut Vec<AutoStrikeCandidate>,
     ) -> Vec<ScoredTweet> {
-        let mut author_count: HashMap<String, u32> = HashMap::new();
+        // Compteurs indexés par référence dans `tweets` et non par `String`
+        // clonée : la boucle clonait l'identifiant de l'auteur de CHAQUE
+        // candidat pour l'insérer, puis le thème de chaque tweet annoté. 1700
+        // allocations par recommandation pour deux compteurs.
+        let mut author_count: HashMap<&str, u32> = HashMap::new();
         // Anti-répétition THÉMATIQUE — voir `theme_diversity_multiplier`. Le
         // champ `theme` (annotation LLM) était déjà chargé et disponible ;
         // rien ne le lisait jamais pour de la diversité, seulement D9 pour
         // repérer deux catégories dégradantes.
-        let mut theme_count: HashMap<String, u32> = HashMap::new();
+        let mut theme_count: HashMap<&str, u32> = HashMap::new();
         let mut scored_feed: Vec<ScoredTweet> = Vec::with_capacity(tweets.len());
         // Forme du fil tenue au fil de l'eau — voir `FeedShape`. D6 la
         // recalculait en parcourant tout le fil deja score a chaque candidat.
@@ -972,6 +977,8 @@ impl RecommenderService {
         };
         let detector = GarbageContentDetector::new();
         let enforcer = ShadowbanEnforcer::new();
+        // Instant de référence du lot — voir `score_tweet_with_weights_at`.
+        let now = chrono::Utc::now();
         let mut dropped_garbage = 0usize;
         trace!(mode = ?mode, use_ml, ctr_samples, use_dwell, dwell_samples, "Scoring all tweets with mode adjustments");
 
@@ -1038,7 +1045,7 @@ impl RecommenderService {
             let ac = if *mode == RecommendMode::Trending {
                 0
             } else {
-                *author_count.get(&tweet.user_id).unwrap_or(&0)
+                *author_count.get(tweet.user_id.as_str()).unwrap_or(&0)
             };
             // Boost temps réel (30 min, voir `services::feedback_loop`) : réagit
             // à un like/skip de CETTE session, pas seulement au profil rechargé
@@ -1082,6 +1089,9 @@ impl RecommenderService {
                     .get(&tweet.id)
                     .filter(|_| self.neural.is_warm())
                     .map(|p| self.neural.lift(*p)),
+                // Instant du lot, et signaux de contenu poubelle déjà calculés
+                // quelques lignes plus haut pour l'admission par surface.
+                ScoringContext::at(now).with_garbage(signals),
             );
             let base_score = s.score;
 
@@ -1201,7 +1211,7 @@ impl RecommenderService {
                         s.score *= theme_mult;
                         trace!(tweet_id = %tweet.id, theme, tc, theme_mult, "Theme diversity applied");
                     }
-                    *theme_count.entry(theme.to_string()).or_insert(0) += 1;
+                    *theme_count.entry(theme).or_insert(0) += 1;
                 }
             }
 
@@ -1209,7 +1219,7 @@ impl RecommenderService {
                 trace!(idx, tweet_id = %tweet.id, base_score, final_score = s.score, "Sample scored tweet");
             }
 
-            *author_count.entry(tweet.user_id.clone()).or_insert(0) += 1;
+            *author_count.entry(tweet.user_id.as_str()).or_insert(0) += 1;
             feed_shape.push(tweet.has_media);
             scored_feed.push(s);
         }
@@ -1223,11 +1233,15 @@ impl RecommenderService {
             "Sorting {} scored tweets by final score...",
             scored_feed.len()
         );
-        scored_feed.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // `total_cmp` et non `partial_cmp().unwrap_or(Equal)` : même ordre sur
+        // toute valeur finie, mais une comparaison d'entiers au lieu d'un
+        // `Option` construit puis déballé à chaque paire — et un ordre TOTAL,
+        // donc un `NaN` échappé du scoring ne peut plus rendre le tri
+        // incohérent (avec `Equal` partout, l'ordre final dépendait de
+        // l'algorithme de tri). Le tri reste STABLE : deux tweets à score égal
+        // gardent leur ordre d'arrivée, ce dont dépend l'adjacence parent/
+        // réponse construite plus bas.
+        scored_feed.sort_by(|a, b| b.score.total_cmp(&a.score));
 
         let top_scores: Vec<_> = scored_feed
             .iter()
@@ -1270,15 +1284,33 @@ impl RecommenderService {
                 explore = selection.explore_count,
                 "Phase 3: Bandit reordering applied (80% exploit + 20% explore)"
             );
-            // Réordonner scored_feed selon l'ordre du bandit
-            let mut id_to_scored: HashMap<String, ScoredTweet> = scored_feed
+            // Réordonner scored_feed selon l'ordre du bandit.
+            //
+            // Par POSITIONS et non par une table `String -> ScoredTweet` : la
+            // version d'avant clonait l'identifiant de chaque tweet pour s'en
+            // servir de clé, soit un millier et demi d'allocations dont pas une
+            // ne survivait à la ligne suivante. L'index est bâti sur des
+            // références, puis relâché avant que `scored_feed` soit consommé.
+            let order: Vec<usize> = {
+                let position: crate::utils::FxHashMap<&str, usize> = scored_feed
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.tweet_id.as_str(), i))
+                    .collect();
+                selection
+                    .tweet_ids
+                    .iter()
+                    .filter_map(|id| position.get(id.as_str()).copied())
+                    .collect()
+            };
+            // `take()` et non un simple index : si le bandit citait deux fois
+            // le même tweet, la table précédente ne l'aurait rendu qu'une fois
+            // (`remove`). Le trou laissé derrière préserve ce comportement.
+            let mut slots: Vec<Option<ScoredTweet>> =
+                scored_feed.into_iter().map(Some).collect();
+            return order
                 .into_iter()
-                .map(|s| (s.tweet_id.clone(), s))
-                .collect();
-            return selection
-                .tweet_ids
-                .into_iter()
-                .filter_map(|id| id_to_scored.remove(&id))
+                .filter_map(|i| slots[i].take())
                 .collect();
         }
 
@@ -2588,32 +2620,14 @@ fn map_rows(rows: Vec<tokio_postgres::Row>) -> Vec<RawTweet> {
             let user_id: String = r.try_get(1).ok()?;
             let content: String = r.try_get(2).unwrap_or_default();
 
-            let content_lower = content.to_lowercase();
-            // Détection émoji couvrant les blocs Unicode réels (emoticons, symboles,
-            // dingbats, supplément). L'ancien seuil `> 0x1F000` manquait ❤ ✅ ⭐ … et
-            // comptait à tort des idéogrammes CJK situés plus haut.
-            let emoji_count = content
-                .chars()
-                .filter(|c| {
-                    let u = *c as u32;
-                    (0x1F300..=0x1FAFF).contains(&u)  // emoticons + symbols & pictographs + supplemental
-                || (0x2600..=0x27BF).contains(&u) // misc symbols + dingbats
-                || (0x1F000..=0x1F0FF).contains(&u) // mahjong, dominoes, cards
-                || (0xFE00..=0xFE0F).contains(&u)   // variation selectors (emoji style)
-                || u == 0x2B50 || u == 0x2764 // ⭐ ❤
-                })
-                .count() as i32;
-            let exclamation_count = content.matches('!').count() as i32;
-            let question_count = content.matches('?').count() as i32;
-            // Compter les vraies URLs (schémas) plutôt que toute occurrence de "http".
-            let url_count = (content_lower.matches("http://").count()
-                + content_lower.matches("https://").count()) as i32;
-            let words: Vec<String> = content_lower
-                .split_whitespace()
-                .filter(|w| w.len() > 3)
-                .map(String::from)
-                .take(50)
-                .collect();
+            // Émojis, ponctuation, URLs et mots : un seul passage sur le texte,
+            // et les minuscules gardées pour le scoring au lieu d'être
+            // recalculées à chaque recommandation. Voir `crate::content`.
+            let text = crate::content::analyze_content(&content);
+            let emoji_count = text.emoji_count;
+            let exclamation_count = text.exclamation_count;
+            let question_count = text.question_count;
+            let url_count = text.url_count;
 
             Some(RawTweet {
                 id,
@@ -2656,7 +2670,7 @@ fn map_rows(rows: Vec<tokio_postgres::Row>) -> Vec<RawTweet> {
                 exclamation_count,
                 question_count,
                 url_count,
-                words,
+                text,
                 source: match r.try_get::<_, i32>(27).unwrap_or(4) {
                     1 => TweetSource::Trending,
                     2 => TweetSource::SocialGraph,
@@ -2760,13 +2774,18 @@ const PAGE_WINDOW: usize = 50;
 ///
 /// ⚠ L'invariant tient tant que rien ne réordonne la liste ensuite :
 /// `spread_by_author` déplace les fils par BLOCS pour cette raison.
-fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<String> {
+pub fn shape_feed<'a>(scored: &[ScoredTweet], tweets: &HashMap<&str, &'a RawTweet>) -> Vec<String> {
     let max_replies = ((scored.len() as f64) * MAX_REPLY_RATIO).ceil() as usize;
 
     let mut out: Vec<String> = Vec::with_capacity(scored.len());
     // Tweets déjà visibles à l'écran, que ce soit comme entrée de feed ou comme
     // carte de contexte rendue par le client au-dessus d'une réponse.
-    let mut shown: HashSet<String> = HashSet::new();
+    // Des references et non des `String` : chaque identifiant emis etait
+    // recopie DEUX fois, une pour la liste de sortie et une pour cet ensemble.
+    // La seconde ne survivait pas a la fonction. Les identifiants vivent dans
+    // les tweets, qui vivent plus longtemps que la mise en forme.
+    let mut shown: crate::utils::FxHashSet<&'a str> =
+        crate::utils::FxHashSet::with_capacity_and_hasher(scored.len(), Default::default());
     let mut replies_kept = 0usize;
     let mut replies_dropped = 0usize;
 
@@ -2774,7 +2793,7 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
         let Some(t) = tweets.get(s.tweet_id.as_str()) else {
             continue;
         };
-        if shown.contains(&s.tweet_id) {
+        if shown.contains(s.tweet_id.as_str()) {
             continue;
         }
 
@@ -2822,7 +2841,7 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
             .is_some_and(|(parent, previous)| parent.id == *previous);
         if extends_last {
             out.push(t.id.clone());
-            shown.insert(t.id.clone());
+            shown.insert(t.id.as_str());
             replies_kept += 1;
             continue;
         }
@@ -2831,7 +2850,7 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
         // séparerait de son parent de plusieurs tweets, ce qui la rend illisible
         // — et le client ne tracerait aucun trait de conversation entre les
         // deux. Le fil est déjà représenté, on passe.
-        if chain.iter().skip(1).any(|a| shown.contains(&a.id)) {
+        if chain.iter().skip(1).any(|a| shown.contains(a.id.as_str())) {
             if is_reply {
                 replies_dropped += 1;
             }
@@ -2843,7 +2862,7 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
         // le fil à l'écran.
         for a in chain.iter().rev() {
             out.push(a.id.clone());
-            shown.insert(a.id.clone());
+            shown.insert(a.id.as_str());
         }
         if is_reply {
             replies_kept += 1;
@@ -2883,40 +2902,128 @@ fn shape_feed(scored: &[ScoredTweet], tweets: &HashMap<&str, &RawTweet>) -> Vec<
 /// auteur — le parent partait en page suivante et la réponse restait seule,
 /// exactement l'orpheline qu'on cherche à éviter. Un fil compte donc pour ses
 /// auteurs, mais se déplace d'un bloc.
-fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<String> {
-    let author_of = |id: &str| -> Option<&str> { tweets.get(id).map(|t| t.user_id.as_str()) };
+pub fn spread_by_author<'a>(ids: Vec<String>, tweets: &HashMap<&str, &'a RawTweet>) -> Vec<String> {
+    let author_of = |id: &str| -> Option<&'a str> { tweets.get(id).map(|t| t.user_id.as_str()) };
 
     let total = ids.len();
     let mut out: Vec<String> = Vec::with_capacity(total);
     // Auteurs présents dans les `PAGE_WINDOW` dernières positions émises, et
     // leur compte. Tenu à jour au fil de l'eau plutôt que recalculé : le
     // recalcul à chaque candidat rendait la fonction quadratique en la fenêtre.
-    let mut window: HashMap<String, u32> = HashMap::new();
-    let mut pending: Vec<Vec<String>> = group_threads(ids, tweets);
+    let mut window: crate::utils::FxHashMap<&'a str, u32> = Default::default();
+    let blocks: Vec<Vec<String>> = group_threads(ids, tweets);
     let mut deferrals = 0usize;
     let mut forced = 0usize;
 
-    // Place d'un bloc dans la fenêtre : le fil ne passe que si CHACUN de ses
-    // auteurs a encore de la place. Un fil de trois tweets du même auteur
-    // compte pour trois, sinon un compte prolifique reprendrait par le fil ce
-    // que le plafond lui refuse au tweet.
-    let fits = |block: &[String], window: &HashMap<String, u32>| -> bool {
-        let mut need: HashMap<&str, u32> = HashMap::new();
-        block.iter().filter_map(|id| author_of(id)).for_each(|a| {
-            *need.entry(a).or_insert(0) += 1;
-        });
+    // ── Ce que chaque bloc DEMANDE, calculé une seule fois ───────────────────
+    //
+    // Un fil ne passe que si CHACUN de ses auteurs a encore de la place ; un
+    // fil de trois tweets du même auteur compte pour trois, sinon un compte
+    // prolifique reprendrait par le fil ce que le plafond lui refuse au tweet.
+    //
+    // ⚠ Ce besoin était recalculé — table de hachage allouée comprise — à
+    // CHAQUE fois qu'on regardait si un bloc tenait dans la fenêtre, c'est-à-
+    // dire une fois par bloc restant et par place du fil. Mesuré sur le vivier
+    // réel (1700 candidats, une dizaine d'auteurs distincts) : **339 ms**, soit
+    // plus de cent fois le coût du scoring des mêmes 1700 tweets. C'était, et
+    // de loin, le premier poste de calcul d'une recommandation.
+    //
+    // Un `Vec` et non une table : un bloc porte quatre auteurs au plus
+    // (`MAX_THREAD_DEPTH`), un balayage linéaire y est plus rapide qu'un
+    // hachage, et surtout il n'alloue pas.
+    let needs: Vec<Vec<(&'a str, u32)>> = blocks
+        .iter()
+        .map(|block| {
+            let mut need: Vec<(&'a str, u32)> = Vec::new();
+            for author in block.iter().filter_map(|id| author_of(id)) {
+                match need.iter_mut().find(|(a, _)| *a == author) {
+                    Some((_, n)) => *n += 1,
+                    None => need.push((author, 1)),
+                }
+            }
+            need
+        })
+        .collect();
+
+    let fits = |need: &[(&str, u32)], window: &crate::utils::FxHashMap<&str, u32>| -> bool {
         need.iter()
-            .all(|(a, n)| window.get(*a).unwrap_or(&0) + n <= MAX_PER_AUTHOR_PER_PAGE)
+            .all(|(a, n)| window.get(a).copied().unwrap_or(0) + n <= MAX_PER_AUTHOR_PER_PAGE)
     };
 
-    while !pending.is_empty() {
-        // Premier candidat, dans l'ordre du score, dont l'auteur n'a pas encore
-        // saturé son quota sur la fenêtre courante.
-        let pick = pending.iter().position(|block| fits(block, &window));
+    // ── Les blocs, rangés par auteur ─────────────────────────────────────────
+    //
+    // La boucle cherchait « le premier bloc qui tient » en balayant TOUT ce qui
+    // reste à placer, et quand plus rien ne tenait — l'état permanent dès que
+    // le vivier compte peu d'auteurs — elle le rebalayait une seconde fois pour
+    // choisir le moins mauvais. Deux parcours complets par place servie.
+    //
+    // Or deux blocs du MÊME auteur demandant la même chose sont
+    // interchangeables du point de vue du quota : si le premier ne tient pas,
+    // aucun autre ne tiendra, et si l'on doit forcer, c'est le premier qu'on
+    // prend. Il suffit donc de regarder la TÊTE de chaque file d'auteur — une
+    // dizaine de tests au lieu de mille sept cents.
+    //
+    // Les blocs qui ne rentrent pas dans ce raisonnement (un fil à plusieurs
+    // auteurs, ou plusieurs tweets du même auteur) restent examinés un par un.
+    // Ils sont rares : un fil compte pour un quart du feed au plus, et la
+    // plupart n'ont qu'un auteur.
+    let mut simples: crate::utils::FxHashMap<&'a str, std::collections::VecDeque<usize>> =
+        Default::default();
+    let mut composes: Vec<usize> = Vec::new();
+    for (i, need) in needs.iter().enumerate() {
+        match need.as_slice() {
+            [(author, 1)] => simples.entry(author).or_default().push_back(i),
+            _ => composes.push(i),
+        }
+    }
+
+    let mut pending: Vec<Option<Vec<String>>> = blocks.into_iter().map(Some).collect();
+    let mut restants = pending.len();
+    // Plus petit index encore en attente. Le curseur ne recule jamais, donc son
+    // avancée coûte au total le nombre de blocs, pas un balayage par place.
+    let mut premier = 0usize;
+
+    while restants > 0 {
+        while pending[premier].is_none() {
+            premier += 1;
+        }
+
+        // ── Chemin rapide : le meilleur candidat restant tient ───────────────
+        //
+        // C'est le cas courant tant que la fenêtre n'est pas saturée, et c'est
+        // exactement ce que faisait la version d'avant en temps constant. Sans
+        // ce raccourci, l'indexation par auteur ferait PERDRE du temps sur un
+        // vivier varié : on paierait un test par auteur là où le tout premier
+        // bloc convenait.
+        let pick: Option<usize> = if fits(&needs[premier], &window) {
+            Some(premier)
+        } else {
+            // Premier candidat, dans l'ordre du score, dont l'auteur n'a pas
+            // encore saturé son quota sur la fenêtre courante.
+            let mut trouve: Option<usize> = None;
+            for (author, file) in &simples {
+                let Some(&i) = file.front() else { continue };
+                // Le bloc ne demande qu'une place, d'où le `<` plutôt que le
+                // `+ 1 <=` de `fits` : c'est la même condition écrite sans
+                // l'addition.
+                if window.get(author).copied().unwrap_or(0) < MAX_PER_AUTHOR_PER_PAGE {
+                    trouve = Some(trouve.map_or(i, |best: usize| best.min(i)));
+                }
+            }
+            for &i in &composes {
+                if fits(&needs[i], &window) {
+                    trouve = Some(trouve.map_or(i, |best: usize| best.min(i)));
+                    // `composes` est en ordre croissant : le premier qui tient
+                    // est le plus petit, inutile de continuer.
+                    break;
+                }
+            }
+            trouve
+        };
 
         let index = match pick {
             Some(i) => {
-                if i > 0 {
+                if i > premier {
                     deferrals += 1;
                 }
                 i
@@ -2930,7 +3037,7 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
             // refuser ferait dépendre la taille de la page du nombre d'auteurs
             // disponibles, ce qui casserait la pagination du client.
             //
-            // ⚠ Mais surtout PAS dans l'ordre brut. Reprendre `pending[0]` vidait
+            // ⚠ Mais surtout PAS dans l'ordre brut. Reprendre le premier vidait
             // le premier auteur d'un coup : on obtenait « 3 de chacun » puis
             // « 7 d'affilée du premier », soit pire qu'un simple tour de rôle.
             // On prend donc le candidat dont l'auteur est le MOINS présent dans
@@ -2938,31 +3045,60 @@ fn spread_by_author(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<
             // retomber en blocs.
             None => {
                 forced += 1;
-                pending
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(i, block)| {
-                        // Présence de l'auteur le PLUS installé du fil : c'est
-                        // lui qui décide si le servir maintenant déséquilibre
-                        // la fenêtre.
-                        let seen = block
-                            .iter()
-                            .filter_map(|id| author_of(id))
-                            .map(|a| *window.get(a).unwrap_or(&0))
-                            .max()
-                            .unwrap_or(0);
-                        // À égalité de présence, l'ordre du score tranche.
-                        (seen, *i)
-                    })
-                    .map_or(0, |(i, _)| i)
+                // Présence de l'auteur le PLUS installé du fil : c'est lui qui
+                // décide si le servir maintenant déséquilibre la fenêtre. À
+                // égalité de présence, l'ordre du score tranche — d'où la clé
+                // `(présence, index)`, qui est un ordre TOTAL : le parcours
+                // d'une table de hachage n'a pas d'ordre, mais un minimum sur
+                // une clé totale, si.
+                let mut best: Option<(u32, usize)> = None;
+                let mut retenir = |seen: u32, i: usize| {
+                    if best.is_none_or(|b| (seen, i) < b) {
+                        best = Some((seen, i));
+                    }
+                };
+                for (author, file) in &simples {
+                    if let Some(&i) = file.front() {
+                        retenir(window.get(author).copied().unwrap_or(0), i);
+                    }
+                }
+                for &i in &composes {
+                    let seen = needs[i]
+                        .iter()
+                        .map(|(a, _)| window.get(a).copied().unwrap_or(0))
+                        .max()
+                        .unwrap_or(0);
+                    retenir(seen, i);
+                }
+                best.map_or(premier, |(_, i)| i)
             }
         };
 
+        // Retirer le bloc de la structure où il attendait. Une tête de file se
+        // retire en temps constant ; un bloc composé se retire d'une liste qui
+        // reste courte.
+        match needs[index].as_slice() {
+            [(author, 1)] => {
+                if let Some(file) = simples.get_mut(author) {
+                    file.pop_front();
+                    if file.is_empty() {
+                        simples.remove(author);
+                    }
+                }
+            }
+            _ => composes.retain(|&i| i != index),
+        }
+
         // Le bloc entier part d'un coup : c'est ce qui garde la réponse collée
         // à son parent.
-        for id in pending.remove(index) {
+        let Some(block) = pending[index].take() else {
+            // Impossible : un index ne sort qu'une fois de sa file.
+            continue;
+        };
+        restants -= 1;
+        for id in block {
             if let Some(a) = author_of(&id) {
-                *window.entry(a.to_string()).or_insert(0) += 1;
+                *window.entry(a).or_insert(0) += 1;
             }
             out.push(id);
 
@@ -3127,21 +3263,27 @@ fn content_identity(tweet: &RawTweet) -> &str {
 }
 
 fn deduplicate(mut tweets: Vec<RawTweet>) -> Vec<RawTweet> {
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut result: Vec<RawTweet> = Vec::new();
+    // Clés hachées vite : ce sont des UUID que la base a produits, pas des
+    // chaînes qu'un utilisateur choisit — voir `crate::utils::fxhash`.
+    let mut seen: crate::utils::FxHashMap<String, usize> =
+        crate::utils::FxHashMap::with_capacity_and_hasher(tweets.len(), Default::default());
+    let mut result: Vec<RawTweet> = Vec::with_capacity(tweets.len());
 
     for tweet in tweets.drain(..) {
         // Clé = tweet d'origine, pas l'id du candidat. L'ancienne version
         // dédupliquait sur `tweet.id` : un tweet et trois retweets de ce tweet
         // passaient pour quatre contenus distincts et saturaient le feed avec
         // la même carte.
-        let key = content_identity(&tweet).to_string();
-        match seen.get(&key) {
+        //
+        // La clé n'est recopiée QUE si le tweet est retenu : la version d'avant
+        // allouait une chaîne par candidat, y compris pour les doublons qu'elle
+        // s'apprêtait à jeter.
+        match seen.get(content_identity(&tweet)).copied() {
             None => {
-                seen.insert(key, result.len());
+                seen.insert(content_identity(&tweet).to_string(), result.len());
                 result.push(tweet);
             }
-            Some(&idx) => {
+            Some(idx) => {
                 // On garde l'exemplaire déjà retenu, mais on lui laisse le
                 // meilleur poids de source des doublons rencontrés : si le
                 // tweet arrive à la fois par « suivi » et par « trending »,
@@ -3177,6 +3319,15 @@ const STOPWORDS: &[&str] = &[
     "them", "their", "what", "when", "which", "there", "here", "been", "were", "would", "could",
     "should", "about", "just", "like", "really", "https", "http",
 ];
+
+/// Les mêmes, indexés.
+///
+/// La liste était balayée en entier pour CHAQUE mot de CHAQUE tweet aimé —
+/// soixante-dix comparaisons de chaînes par mot, sur des milliers de mots à
+/// chaque reconstruction de profil. Construite une seule fois pour la vie du
+/// processus.
+static STOPWORDS_INDEX: std::sync::LazyLock<crate::utils::FxHashSet<&'static str>> =
+    std::sync::LazyLock::new(|| STOPWORDS.iter().copied().collect());
 
 /// Reconstruit les centres d'intérêt, le style et la positivité d'un lecteur à
 /// partir du texte des tweets qu'il a aimés.
@@ -3222,7 +3373,7 @@ fn profile_from_liked_text(texts: &[String]) -> (Vec<(String, u32)>, Personality
             if word.chars().all(|c| c.is_numeric()) {
                 continue;
             }
-            if STOPWORDS.contains(&word) {
+            if STOPWORDS_INDEX.contains(word) {
                 continue;
             }
             *counts.entry(word.to_string()).or_insert(0) += 1;
@@ -3400,6 +3551,174 @@ mod tests {
 
     fn index<'a>(raw: &'a [RawTweet]) -> HashMap<&'a str, &'a RawTweet> {
         raw.iter().map(|t| (t.id.as_str(), t)).collect()
+    }
+
+    // ─── Équivalence de l'étalement indexé ───────────────────────────────────
+    //
+    // `spread_by_author` a été réécrit : il cherchait « le premier bloc qui
+    // tient » en balayant tout ce qui restait à placer, deux fois par place
+    // quand rien ne tenait. Sur le vivier réel — 1700 candidats, une dizaine
+    // d'auteurs distincts, donc une fenêtre saturée en permanence — ça coûtait
+    // 339 ms, plus de cent fois le scoring des mêmes tweets.
+    //
+    // La version indexée ne regarde que la tête de la file de chaque auteur.
+    // Le raisonnement qui la justifie : deux blocs du même auteur demandant la
+    // même chose sont interchangeables pour le quota, donc si la tête ne tient
+    // pas, aucun autre ne tient — et s'il faut forcer, c'est la tête qu'on
+    // prend, puisque c'est le plus petit index.
+    //
+    // Ce raisonnement se démontre, mais l'ordre du fil de tous les lecteurs en
+    // dépend. On garde donc l'implémentation d'origine ici et on compare les
+    // deux sorties, à l'identique, sur des milliers de configurations.
+
+    /// L'étalement tel qu'il était écrit avant l'indexation par auteur.
+    /// N'existe plus que comme référence de ce test.
+    fn spread_de_reference(ids: Vec<String>, tweets: &HashMap<&str, &RawTweet>) -> Vec<String> {
+        let author_of = |id: &str| -> Option<&str> { tweets.get(id).map(|t| t.user_id.as_str()) };
+
+        let mut out: Vec<String> = Vec::with_capacity(ids.len());
+        let mut window: HashMap<String, u32> = HashMap::new();
+        let mut pending: Vec<Vec<String>> = group_threads(ids, tweets);
+
+        let fits = |block: &[String], window: &HashMap<String, u32>| -> bool {
+            let mut need: HashMap<&str, u32> = HashMap::new();
+            block.iter().filter_map(|id| author_of(id)).for_each(|a| {
+                *need.entry(a).or_insert(0) += 1;
+            });
+            need.iter()
+                .all(|(a, n)| window.get(*a).unwrap_or(&0) + n <= MAX_PER_AUTHOR_PER_PAGE)
+        };
+
+        while !pending.is_empty() {
+            let pick = pending.iter().position(|block| fits(block, &window));
+            let index = match pick {
+                Some(i) => i,
+                None => pending
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(i, block)| {
+                        let seen = block
+                            .iter()
+                            .filter_map(|id| author_of(id))
+                            .map(|a| *window.get(a).unwrap_or(&0))
+                            .max()
+                            .unwrap_or(0);
+                        (seen, *i)
+                    })
+                    .map_or(0, |(i, _)| i),
+            };
+
+            for id in pending.remove(index) {
+                if let Some(a) = author_of(&id) {
+                    *window.entry(a.to_string()).or_insert(0) += 1;
+                }
+                out.push(id);
+                if out.len() > PAGE_WINDOW {
+                    let leaving = &out[out.len() - PAGE_WINDOW - 1];
+                    if let Some(a) = author_of(leaving) {
+                        if let Some(count) = window.get_mut(a) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                window.remove(a);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Xorshift : un tirage rejouable. Un test d'équivalence qui échoue une
+    /// fois sur cent sans qu'on puisse reproduire le cas ne sert à rien.
+    struct Tirage(u64);
+
+    impl Tirage {
+        fn suivant(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn dans(&mut self, n: usize) -> usize {
+            (self.suivant() % n as u64) as usize
+        }
+    }
+
+    /// Un vivier tiré au sort : `taille` tweets, `auteurs` comptes, et une
+    /// proportion de réponses qui forment des fils (donc des blocs à plusieurs
+    /// tweets, parfois de plusieurs auteurs).
+    fn vivier_aleatoire(
+        tirage: &mut Tirage,
+        taille: usize,
+        auteurs: usize,
+        part_reponses: usize,
+    ) -> Vec<RawTweet> {
+        let mut tweets: Vec<RawTweet> = Vec::with_capacity(taille);
+        for i in 0..taille {
+            let parent = if i > 0 && tirage.dans(100) < part_reponses {
+                Some(format!("t{}", tirage.dans(i)))
+            } else {
+                None
+            };
+            tweets.push(RawTweet {
+                id: format!("t{i}"),
+                user_id: format!("a{}", tirage.dans(auteurs)),
+                parent_tweet_id: parent,
+                ..Default::default()
+            });
+        }
+        tweets
+    }
+
+    #[test]
+    fn l_etalement_indexe_rend_exactement_le_meme_fil() {
+        let mut tirage = Tirage(0x2026_0831_5EED_0001);
+        // Les tailles couvrent le cas où la fenêtre ne sature jamais (beaucoup
+        // d'auteurs) et celui où elle sature en permanence (un ou deux).
+        for &(taille, auteurs, part_reponses) in &[
+            (1usize, 1usize, 0usize),
+            (5, 1, 0),
+            (20, 1, 0),
+            (20, 2, 0),
+            (60, 3, 0),
+            (60, 3, 30),
+            (120, 5, 25),
+            (120, 40, 25),
+            (200, 8, 40),
+            (200, 60, 10),
+            (300, 2, 50),
+        ] {
+            for essai in 0..12 {
+                let tweets = vivier_aleatoire(&mut tirage, taille, auteurs, part_reponses);
+                let carte = index(&tweets);
+                let ids: Vec<String> = tweets.iter().map(|t| t.id.clone()).collect();
+
+                let attendu = spread_de_reference(ids.clone(), &carte);
+                let obtenu = spread_by_author(ids.clone(), &carte);
+
+                assert_eq!(
+                    obtenu, attendu,
+                    "taille={taille} auteurs={auteurs} reponses={part_reponses}% essai={essai}"
+                );
+                // Et l'invariant de base : on réordonne, on ne filtre pas.
+                assert_eq!(obtenu.len(), ids.len());
+            }
+        }
+    }
+
+    #[test]
+    fn l_etalement_ne_perd_ni_ne_duplique_aucun_tweet() {
+        let mut tirage = Tirage(0x2026_0831_5EED_0002);
+        let tweets = vivier_aleatoire(&mut tirage, 400, 6, 35);
+        let carte = index(&tweets);
+        let ids: Vec<String> = tweets.iter().map(|t| t.id.clone()).collect();
+        let out = spread_by_author(ids.clone(), &carte);
+
+        let avant: std::collections::BTreeSet<&String> = ids.iter().collect();
+        let apres: std::collections::BTreeSet<&String> = out.iter().collect();
+        assert_eq!(avant, apres);
+        assert_eq!(out.len(), ids.len(), "aucun doublon");
     }
 
     /// Pire concentration d'un auteur sur toute fenêtre glissante de

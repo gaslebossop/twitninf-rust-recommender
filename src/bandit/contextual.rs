@@ -282,7 +282,11 @@ pub fn select(
 /// Candidats pour exploration : sources inattendues, nouveaux auteurs, contenu frais
 fn is_exploration_candidate(scored: &ScoredTweet, raw: &RawTweet, profile: &UserProfile) -> bool {
     // Candidat exploration si :
-    let is_new_author = !profile.top_authors.iter().any(|(id, _)| id == &raw.user_id);
+    // Index plutôt que balayage : cette fonction est appelée une fois par
+    // candidat du vivier, et relisait la liste des vingt auteurs favoris à
+    // chaque fois. Même réponse, même repli si l'index est absent — voir
+    // `UserProfile::knows_author`.
+    let is_new_author = !profile.knows_author(&raw.user_id);
     let is_discovery = matches!(raw.source, TweetSource::Discovery | TweetSource::Quality);
     let is_not_followed = !profile.follows(&raw.user_id);
     let has_decent_score = scored.score > 0.20; // minimum qualité

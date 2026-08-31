@@ -10,11 +10,19 @@
 //! `Vec<String>`.
 //!
 //! ── Le A/B, sans deux binaires ──────────────────────────────────────────────
-//! Les accesseurs d'appartenance replient sur le vecteur quand l'index est
-//! vide (voir `UserProfile::member`). Appeler ou non `rebuild_indexes()` bascule
-//! donc entre l'ancien comportement et le nouveau, dans le MÊME binaire, avec
-//! la même charge et le même code — la comparaison ne peut pas être faussée par
-//! un écart de compilation ou de jeu de données.
+//! Tous les accesseurs derives du profil replient sur le calcul direct quand
+//! leur index est vide : appartenance sociale (`UserProfile::member`), affinite
+//! d auteur (`author_affinity`) et recherche des centres d interet
+//! (`keyword_hits`, qui retombe sur une boucle de `str::contains`). Appeler ou
+//! non `rebuild_indexes()` bascule donc entre l ancien comportement et le
+//! nouveau, dans le MEME binaire, avec la meme charge et le meme code — la
+//! comparaison ne peut pas etre faussee par un ecart de compilation ou de jeu
+//! de donnees.
+//!
+//! ⚠ Ce banc mesure donc les INDEX du profil, pas tout le travail
+//! d optimisation : le formatage de date, l analyse du texte a l ingestion et
+//! la detection de contenu poubelle sont hors de sa portee. Pour ceux-la, voir
+//! `bench_dimensions`, qui chiffre chaque poste separement.
 //!
 //! ── Usage ───────────────────────────────────────────────────────────────────
 //!   cargo run --release --example bench_scoring
@@ -103,6 +111,14 @@ fn build_candidates() -> Vec<RawTweet> {
             viewer_impressions: (i % 4) as i64,
             ..Default::default()
         })
+        .map(|mut t| {
+            // Comme a la sortie de `map_rows` : le texte est analyse une fois a
+            // l entree du pipeline. Sans ca, les deux bras du A/B paieraient
+            // tous les deux une conversion en minuscules par candidat, et le
+            // banc mesurerait un chemin que la production n emprunte plus.
+            t.analyze();
+            t
+        })
         .collect()
 }
 
@@ -166,9 +182,9 @@ fn main() {
     let m_avant = median(&avant);
     let m_apres = median(&apres);
 
-    println!("  balayage lineaire (sans index) : {m_avant:8.2} ms  (min {:.2}, max {:.2})",
+    println!("  calcul direct (sans index)     : {m_avant:8.2} ms  (min {:.2}, max {:.2})",
              avant[0] as f64 / 1000.0, avant[ROUNDS - 1] as f64 / 1000.0);
-    println!("  table de hachage (avec index)  : {m_apres:8.2} ms  (min {:.2}, max {:.2})",
+    println!("  index du profil (apres)        : {m_apres:8.2} ms  (min {:.2}, max {:.2})",
              apres[0] as f64 / 1000.0, apres[ROUNDS - 1] as f64 / 1000.0);
     println!();
     println!("  gain : x{:.2}  ({:+.1} %)", m_avant / m_apres,

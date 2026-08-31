@@ -58,8 +58,14 @@ jobs:
         run: cargo clippy --lib --no-deps 2>&1 | tail -40
         continue-on-error: true
 
+      # `--bins --examples` et pas seulement le défaut : `main.rs` redéclare sa
+      # propre liste de modules, indépendante de `lib.rs`, donc un module ajouté
+      # à la bibliothèque et oublié dans le binaire passe `cargo test --lib`
+      # sans broncher. Les exemples sont les bancs d'essai (`bench_scoring`,
+      # `bench_dimensions`) : ils appellent le scoring par ses signatures
+      # réelles, et c'est ce qui les empêche de pourrir sans qu'on le remarque.
       - name: Compilation en release
-        run: cargo build --release
+        run: cargo build --release --bins --examples
 
   deploy:
     name: Déploiement sur le VPS

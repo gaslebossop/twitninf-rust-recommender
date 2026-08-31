@@ -14,7 +14,7 @@
 ///   Phase 8 → Personalization Depth   (affinités calculées)
 ///   Mod A   → Diversity Multiplier    (anti-bulle de filtre)
 ///   Mod B   → Moderation Penalty      (sécurité contenu)
-use chrono::Utc;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use tracing::{debug, trace};
 
 use crate::admin::AlgoWeights;
@@ -27,8 +27,8 @@ use crate::ml::dwell_predictor::DwellPredictor;
 use crate::ml::objectives::{ObjectivePredictions, ObjectivePredictor};
 use crate::ml::user_weights::UserDimensionWeights;
 use crate::models::{
-    AuthorTier, ContentLength, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet, TweetSource,
-    UserProfile, UserType,
+    AuthorTier, ContentLength, KeywordHits, PersonalityType, RawTweet, ScoreBreakdown, ScoredTweet,
+    TweetSource, UserProfile, UserType,
 };
 use crate::shadowban::{GarbageContentDetector, ShadowbanEnforcer};
 
@@ -103,6 +103,62 @@ impl FeedShape {
     }
 }
 
+/// Ce que l'appelant a déjà calculé et que le scoring n'a pas à refaire.
+///
+/// Les deux champs répondent au même constat : `score_all` boucle sur 1700
+/// candidats, et le scoring rejouait à l'intérieur des choses que la boucle
+/// avait déjà sous la main.
+///
+/// * `now` — l'horloge, relue une fois par candidat (et trois fois avant que
+///   D1, D4 et D7 cessent de l'interroger chacune de leur côté). Fixer
+///   l'instant pour tout le lot est aussi plus juste : deux candidats d'une
+///   même page ne sont plus datés à des instants différents.
+/// * `garbage` — les signaux de contenu poubelle, que `score_all` calcule DÉJÀ
+///   avant le scoring pour décider de l'admission par surface, et que le
+///   scoring recalculait ensuite intégralement pour en tirer sa pénalité.
+///
+/// Un contexte « nu » (`ScoringContext::now()`) refait tout : c'est ce que
+/// prennent les appelants hors service (rattrapage CTR, tests, bancs d'essai),
+/// pour qui ces économies n'ont aucun sens.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoringContext {
+    pub now: DateTime<Utc>,
+    pub garbage: Option<crate::shadowban::GarbageSignals>,
+}
+
+impl ScoringContext {
+    /// Contexte autonome : horloge lue maintenant, rien de pré-calculé.
+    pub fn now() -> Self {
+        Self::at(Utc::now())
+    }
+
+    /// Contexte à instant imposé — celui d'un lot.
+    pub fn at(now: DateTime<Utc>) -> Self {
+        Self {
+            now,
+            garbage: None,
+        }
+    }
+
+    /// Signaux de contenu poubelle déjà calculés pour CE tweet.
+    pub fn with_garbage(mut self, garbage: crate::shadowban::GarbageSignals) -> Self {
+        self.garbage = Some(garbage);
+        self
+    }
+
+    #[inline]
+    fn garbage_for(&self, tweet: &RawTweet) -> crate::shadowban::GarbageSignals {
+        self.garbage
+            .unwrap_or_else(|| GarbageContentDetector::new().detect(tweet))
+    }
+}
+
+impl Default for ScoringContext {
+    fn default() -> Self {
+        Self::now()
+    }
+}
+
 /// Score final d'un tweet, toutes dimensions combinées.
 /// `author_feed_count` = combien de fois cet auteur apparaît déjà dans le feed courant.
 /// `ctr_predictor`     = modèle ML optionnel pour blending CTR prédit (Phase 2)
@@ -133,24 +189,58 @@ pub fn score_tweet_with_weights(
     feed: FeedShape,
     weights: &AlgoWeights,
 ) -> ScoredTweet {
-    let (d1, ev_raw, ev_accel, viral_vel) = d1_engagement_velocity(tweet);
-    // Minuscules calculees UNE fois. D2 et D8 cherchent chacun les mots-cles
-    // du lecteur dans le texte du tweet, et chacun refaisait sa propre copie
-    // en minuscules — deux allocations et deux conversions par candidat, pour
-    // exactement la meme chaine.
-    let content_lower = tweet.content.to_lowercase();
-    let d2 = d2_content_intelligence(tweet, profile, &content_lower);
+    score_tweet_with_weights_at(
+        tweet,
+        profile,
+        author_feed_count,
+        feed,
+        weights,
+        ScoringContext::now(),
+    )
+}
+
+/// Variante de `score_tweet_with_weights` à instant imposé.
+///
+/// L'horloge se lisait à l'intérieur, une fois par candidat — et trois fois
+/// avant que D1, D4 et D7 cessent de l'interroger chacune de leur côté. Un
+/// appel à `Utc::now()` coûte une soixantaine de nanosecondes ; multiplié par
+/// le vivier, c'était 7 % du chemin de scoring pour une valeur qui ne change
+/// pas pendant la passe.
+///
+/// Et ce n'est pas qu'une économie : tous les candidats d'une même page sont
+/// désormais datés du MÊME instant. Le classement d'un lot cesse de dépendre
+/// de la position d'un tweet dans la boucle.
+pub fn score_tweet_with_weights_at(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    author_feed_count: u32,
+    feed: FeedShape,
+    weights: &AlgoWeights,
+    ctx: ScoringContext,
+) -> ScoredTweet {
+    let now = ctx.now;
+    let (d1, ev_raw, ev_accel, viral_vel) = d1_engagement_velocity(tweet, now);
+    // Minuscules calculees UNE fois — et desormais une seule fois par tweet
+    // pour toute sa vie, a l'entree du pipeline (voir `crate::content`), pas a
+    // chaque recommandation servie. `content_lower()` retombe sur le calcul a
+    // la volee pour un tweet construit a la main.
+    let content_lower = tweet.content_lower();
+    // Et la RECHERCHE elle-même n'a lieu qu'une fois : D2 compte les mots-clés
+    // trouvés, D8 les pondère, mais c'est le même balayage du même texte avec
+    // la même liste. Voir `UserProfile::keyword_hits`.
+    let hits = profile.keyword_hits(&content_lower);
+    let d2 = d2_content_intelligence(tweet, profile, &hits);
     let (d3, d_follow, d_mutual, d_second) = d3_social_graph(tweet, profile);
-    let d4 = d4_temporal_dynamics(tweet, profile);
+    let d4 = d4_temporal_dynamics(tweet, profile, now);
     let d5 = d5_behavioral_prediction(tweet, profile);
     let d6 = d6_content_diversity(tweet, profile, feed);
-    let d7_raw = d7_viral_prediction(tweet);
+    let d7_raw = d7_viral_prediction(tweet, now);
     let d7 = if tweet.source == TweetSource::Trending {
         (d7_raw * 1.2).clamp(0.0, 1.0)
     } else {
         d7_raw
     };
-    let d8 = d8_personalization_depth(tweet, profile, &content_lower);
+    let d8 = d8_personalization_depth(tweet, profile, &hits);
     // D9 juge le texte lui-même via les étiquettes du LLM annotateur. Neutre
     // (0.5) tant qu'un tweet n'est pas annoté, donc sans effet sur le classement
     // existant.
@@ -193,7 +283,11 @@ pub fn score_tweet_with_weights(
     let score_after_shadowban =
         enforcer.apply_to_score(score_before_shadowban, tweet.author_shadowban_level);
 
-    let garbage_signals = GarbageContentDetector::new().detect(tweet);
+    // Recalculés seulement si l'appelant ne les a pas déjà : `score_all` les
+    // produit AVANT le scoring pour décider de l'admission par surface, puis le
+    // détecteur repassait intégralement sur le même tweet — deux fois le même
+    // travail par candidat. Voir `ScoringContext`.
+    let garbage_signals = ctx.garbage_for(tweet);
     let garbage_score = garbage_signals.score();
     let garbage_penalty = 1.0 - 0.60 * garbage_score;
 
@@ -511,16 +605,13 @@ pub fn score_tweet_ml_with_weights(
     // lift veuille dire quelque chose : dans tous ces cas le melange se
     // comporte exactement comme avant l'ajout du terme.
     neural_lift: Option<f64>,
+    // Ce que la boucle appelante a déjà sous la main — voir `ScoringContext`.
+    ctx: ScoringContext,
 ) -> ScoredTweet {
-    let mut scored = score_tweet_with_weights(
-        tweet,
-        profile,
-        author_feed_count,
-        feed,
-        weights,
-    );
+    let mut scored =
+        score_tweet_with_weights_at(tweet, profile, author_feed_count, feed, weights, ctx);
 
-    let features = ctr_feature_vector(tweet, profile, &scored, collab_affinity);
+    let features = ctr_feature_vector_at(tweet, profile, &scored, collab_affinity, ctx.now);
     scored.ctr_features = Some(features.to_vec());
 
     // Prédiction faite ICI et non par l'appelant : les features ne sont
@@ -596,8 +687,19 @@ pub(crate) fn ctr_feature_vector(
     // et n'a pas a avoir. Meme traitement que `realtime_boost`.
     collab_affinity: f64,
 ) -> [f64; N_FEATURES] {
-    let age_h = age_hours(tweet);
-    let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet);
+    ctr_feature_vector_at(tweet, profile, scored, collab_affinity, Utc::now())
+}
+
+/// `ctr_feature_vector` à instant imposé — voir `score_tweet_with_weights_at`.
+pub(crate) fn ctr_feature_vector_at(
+    tweet: &RawTweet,
+    profile: &UserProfile,
+    scored: &ScoredTweet,
+    collab_affinity: f64,
+    now: DateTime<Utc>,
+) -> [f64; N_FEATURES] {
+    let age_h = age_hours_at(tweet, now);
+    let (d1, _, ev_accel, _) = d1_engagement_velocity(tweet, now);
     // 20 likes/jour ≈ un lecteur très actif : `engagement_velocity` est un
     // compte brut (`SUM(... INTERVAL '1 day')`), sans plafond naturel.
     let reader_engagement = (profile.engagement_velocity / 20.0).clamp(0.0, 1.0);
@@ -625,8 +727,8 @@ pub(crate) fn ctr_feature_vector(
 // Mesure la vitesse d'accumulation d'engagement sur 3 fenêtres temporelles.
 // Calcule aussi l'accélération (tendance haussière vs stable).
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
-    let age_h = age_hours(t).max(0.1);
+pub fn d1_engagement_velocity(t: &RawTweet, now: DateTime<Utc>) -> (f64, f64, f64, f64) {
+    let age_h = age_hours_at(t, now).max(0.1);
     trace!(age_h, "D1 Age in hours");
 
     // Score brut pondéré par valeur d'action
@@ -713,7 +815,7 @@ fn d1_engagement_velocity(t: &RawTweet) -> (f64, f64, f64, f64) {
 // Analyse réelle du contenu : longueur idéale, richesse, format, style,
 // correspondance avec les préférences de l'utilisateur.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile, content_lower: &str) -> f64 {
+pub fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile, hits: &KeywordHits) -> f64 {
     let mut score = 0.0_f64;
     trace!(content_length = t.content_length, personality = ?profile.personality_type, "D2 Start");
 
@@ -816,11 +918,9 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile, content_lower: &
     score += personality_score;
 
     // ── Correspondance mots-clés préférés ────────────────────────────────────
-    let keyword_matches: usize = profile
-        .top_words
-        .iter()
-        .filter(|(word, _)| content_lower.contains(word.as_str()))
-        .count();
+    // Trouvés en un seul passage, partagé avec D8 — voir
+    // `UserProfile::keyword_hits`.
+    let keyword_matches = hits.matches;
     let keyword_score = (keyword_matches as f64 * 0.03).min(0.15);
     trace!(keyword_matches, keyword_score, "D2 Keyword matches");
     score += keyword_score;
@@ -837,7 +937,7 @@ fn d2_content_intelligence(t: &RawTweet, profile: &UserProfile, content_lower: &
 // D3 — SOCIAL GRAPH DYNAMICS (15%)
 // Proximité sociale multi-degrés : suivi direct, mutuel, amis d'amis.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) {
+pub fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) {
     let mut score = 0.0_f64;
     trace!(author_id = %t.user_id, "D3 Social graph analysis");
 
@@ -881,12 +981,7 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
     );
 
     // Bonus si l'utilisateur a déjà interagi positivement avec l'auteur
-    let prior_affinity = profile
-        .top_authors
-        .iter()
-        .find(|(uid, _)| uid == &t.user_id)
-        .map(|(_, s)| *s)
-        .unwrap_or(0.0);
+    let prior_affinity = profile.author_affinity(&t.user_id);
     let affinity_bonus = (prior_affinity * 0.20).min(0.20);
     score += affinity_bonus;
     trace!(prior_affinity, affinity_bonus, "D3 Prior author affinity");
@@ -915,8 +1010,8 @@ fn d3_social_graph(t: &RawTweet, profile: &UserProfile) -> (f64, f64, f64, f64) 
 // Pertinence temporelle réelle : récence + alignement heure d'activité
 // + momentum de tendance + patterns jour/heure.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile) -> f64 {
-    let age_h = age_hours(t);
+pub fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile, now: DateTime<Utc>) -> f64 {
+    let age_h = age_hours_at(t, now);
     trace!(age_h, "D4 Tweet age in hours");
 
     // Phase 1: demi-vie réduite de 6h → 4h pour favoriser contenu frais (+CTR)
@@ -924,24 +1019,23 @@ fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile) -> f64 {
     trace!(recency, "D4 Recency (4h half-life, Phase 1 optimization)");
 
     // Alignement heure d'activité utilisateur
-    let pub_hour = t
-        .created_at
-        .format("%H")
-        .to_string()
-        .parse::<u32>()
-        .unwrap_or(12) as usize;
+    //
+    // ⚠ Ces deux valeurs se lisaient jusqu'ici par
+    // `created_at.format("%H").to_string().parse()` : un formatage strftime
+    // complet, une allocation de chaîne et un parsing d'entier, DEUX fois par
+    // candidat ici et une troisième dans D8. À elles seules, ces trois
+    // conversions pesaient plus que les huit dimensions réunies (mesuré par
+    // `examples/bench_dimensions.rs`). `hour()` et `weekday()` rendent
+    // exactement les mêmes entiers — `%H` est l'heure UTC sur 0..=23, `%w` le
+    // jour à partir de dimanche sur 0..=6 — sans toucher au formatage.
+    let pub_hour = t.created_at.hour() as usize;
     let user_hour_activity = profile.hourly_activity[pub_hour];
     // user_hour_activity est déjà normalisé [0,1]
     let hour_match = user_hour_activity;
     trace!(pub_hour, hour_match, "D4 Hourly activity match");
 
     // Alignement jour de la semaine
-    let pub_day = t
-        .created_at
-        .format("%w")
-        .to_string()
-        .parse::<usize>()
-        .unwrap_or(1);
+    let pub_day = t.created_at.weekday().num_days_from_sunday() as usize;
     let day_match = profile.daily_activity[pub_day];
     trace!(pub_day, day_match, "D4 Daily activity match");
 
@@ -973,7 +1067,7 @@ fn d4_temporal_dynamics(t: &RawTweet, profile: &UserProfile) -> f64 {
 // D5 — BEHAVIORAL PREDICTION (10%)
 // Prédit la probabilité d'engagement basée sur l'historique réel.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d5_behavioral_prediction(t: &RawTweet, profile: &UserProfile) -> f64 {
+pub fn d5_behavioral_prediction(t: &RawTweet, profile: &UserProfile) -> f64 {
     let mut score = 0.0_f64;
     trace!(user_type = ?profile.user_type, "D5 Behavioral prediction start");
 
@@ -1073,7 +1167,7 @@ fn d5_behavioral_prediction(t: &RawTweet, profile: &UserProfile) -> f64 {
 // Maximal Marginal Relevance (MMR) adapté :
 // récompense les tweets qui apportent de la nouveauté au feed.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: FeedShape) -> f64 {
+pub fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: FeedShape) -> f64 {
     let feed_size = feed.len;
     trace!(feed_size, tweet_id = %t.id, "D6 Content diversity analysis");
 
@@ -1140,8 +1234,8 @@ fn d6_content_diversity(t: &RawTweet, profile: &UserProfile, feed: FeedShape) ->
 // D7 — VIRAL PREDICTION (7%)
 // Prédit le potentiel viral : accélération, shareabilité, cascade.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d7_viral_prediction(t: &RawTweet) -> f64 {
-    let age_h = age_hours(t).max(0.1);
+pub fn d7_viral_prediction(t: &RawTweet, now: DateTime<Utc>) -> f64 {
+    let age_h = age_hours_at(t, now).max(0.1);
     let total_eng = t.like_count + t.comment_count + t.retweet_count + t.share_count;
     trace!(age_h, total_eng, "D7 Viral prediction start");
 
@@ -1208,18 +1302,12 @@ fn d7_viral_prediction(t: &RawTweet) -> f64 {
 // D8 — PERSONALIZATION DEPTH (5%)
 // Affinité profonde : top auteurs, mots-clés, profil émotionnel.
 // ═══════════════════════════════════════════════════════════════════════════════
-fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile, content_lower: &str) -> f64 {
+pub fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile, hits: &KeywordHits) -> f64 {
     let mut score = 0.0_f64;
     trace!(author_id = %t.user_id, "D8 Personalization depth start");
 
     // Affinité auteur (score précalculé depuis l'historique d'interactions)
-    let author_affinity = profile
-        .top_authors
-        .iter()
-        .find(|(uid, _)| uid == &t.user_id)
-        .map(|(_, s)| *s)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
+    let author_affinity = profile.author_affinity(&t.user_id).clamp(0.0, 1.0);
     let affinity_score = author_affinity * 0.40;
     score += affinity_score;
     trace!(
@@ -1228,22 +1316,12 @@ fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile, content_lower: 
         "D8 Author affinity (40% weight)"
     );
 
-    // Correspondance mots avec centres d'intérêt
-    let mut word_matches = 0;
-    let interest_score: f64 = profile
-        .top_words
-        .iter()
-        .take(20)
-        .map(|(word, count)| {
-            if content_lower.contains(word.as_str()) {
-                word_matches += 1;
-                (*count as f64).ln() / 5.0 // pondéré par fréquence
-            } else {
-                0.0
-            }
-        })
-        .sum::<f64>()
-        .min(0.35);
+    // Correspondance mots avec centres d'intérêt — même passage que D2, voir
+    // `UserProfile::keyword_hits`. La somme est accumulée dans l'ordre des
+    // mots-clés, comme avant : sur des flottants, l'ordre d'addition est le
+    // résultat.
+    let word_matches = hits.top_matches;
+    let interest_score = hits.weighted.min(0.35);
     score += interest_score;
     trace!(
         interest_score,
@@ -1266,13 +1344,9 @@ fn d8_personalization_depth(t: &RawTweet, profile: &UserProfile, content_lower: 
         "D8 Emotional positivity"
     );
 
-    // Activité heure = match quasi parfait
-    let pub_hour = t
-        .created_at
-        .format("%H")
-        .to_string()
-        .parse::<u32>()
-        .unwrap_or(12);
+    // Activité heure = match quasi parfait. `hour()` plutôt que `format("%H")`
+    // — voir la note de D4 : même entier, sans strftime ni allocation.
+    let pub_hour = t.created_at.hour();
     let hour_bonus = if pub_hour == profile.most_active_hour {
         0.15
     } else {
@@ -1441,7 +1515,7 @@ pub fn theme_diversity_multiplier(theme_count_in_feed: u32) -> f64 {
 }
 
 /// Pénalité pour contenu rapporté ou signalé.
-fn moderation_penalty(t: &RawTweet) -> f64 {
+pub fn moderation_penalty(t: &RawTweet) -> f64 {
     if t.report_count == 0 {
         return 0.0;
     }
@@ -1535,7 +1609,23 @@ pub fn compute_feed_metrics(tweets: &[(&RawTweet, &ScoredTweet)]) -> FeedQuality
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub fn age_hours(t: &RawTweet) -> f64 {
-    let diff = Utc::now().signed_duration_since(t.created_at);
+    age_hours_at(t, Utc::now())
+}
+
+/// Âge d'un tweet vu depuis un instant DONNÉ.
+///
+/// `age_hours` lisait l'horloge à chaque appel, et trois dimensions l'appellent
+/// (D1, D4, D7) : trois lectures d'horloge par candidat, cinq mille par
+/// recommandation. Elles ne pouvaient d'ailleurs pas rendre le même âge — les
+/// appels sont séparés de quelques centaines de nanosecondes — donc D1 et D7 ne
+/// travaillaient pas tout à fait sur le même tweet.
+///
+/// L'instant est désormais figé une fois pour toute la passe de scoring : c'est
+/// à la fois moins cher et plus juste, et ça rend le score d'un candidat
+/// reproductible à instant donné.
+#[inline]
+pub fn age_hours_at(t: &RawTweet, now: DateTime<Utc>) -> f64 {
+    let diff = now.signed_duration_since(t.created_at);
     (diff.num_seconds() as f64 / 3600.0).max(0.0)
 }
 
@@ -1857,5 +1947,162 @@ mod tests {
         // Compte historique : `premium` seul, sans palier explicite.
         assert_eq!(AuthorTier::resolve("free", true), AuthorTier::Pro);
         assert_eq!(AuthorTier::resolve("free", false), AuthorTier::Free);
+    }
+
+    // ─── Lecture de l'heure et du jour ───────────────────────────────────────
+    //
+    // D4 et D8 lisaient l'heure de publication par
+    // `created_at.format("%H").to_string().parse::<u32>()`, et D4 le jour par
+    // `format("%w")`. Trois formatages strftime et trois allocations par
+    // candidat — le premier poste du scoring avant qu'on le mesure. Les
+    // accesseurs de chrono rendent les mêmes entiers ; ces tests le vérifient
+    // sur les valeurs où une implémentation approximative se trompe.
+
+    fn heure_par_formatage(t: DateTime<Utc>) -> u32 {
+        t.format("%H").to_string().parse::<u32>().unwrap_or(12)
+    }
+
+    fn jour_par_formatage(t: DateTime<Utc>) -> usize {
+        t.format("%w").to_string().parse::<usize>().unwrap_or(1)
+    }
+
+    #[test]
+    fn l_heure_lue_vaut_celle_du_formatage() {
+        // Toutes les heures, y compris minuit (« 00 », que `parse` doit rendre
+        // à 0 et non échouer) et 23 h.
+        let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        for h in 0..48 {
+            let t = base + chrono::Duration::hours(h);
+            assert_eq!(t.hour(), heure_par_formatage(t), "{t}");
+            assert!(t.hour() < 24);
+        }
+    }
+
+    #[test]
+    fn le_jour_lu_vaut_celui_du_formatage() {
+        // `%w` numérote les jours à partir de DIMANCHE (0). Une lecture par
+        // `num_days_from_monday` donnerait un décalage d'un cran, donc un
+        // profil d'activité lu au mauvais index — sans jamais planter, puisque
+        // les deux restent dans 0..=6.
+        let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        for j in 0..14 {
+            let t = base + chrono::Duration::days(j);
+            assert_eq!(
+                t.weekday().num_days_from_sunday() as usize,
+                jour_par_formatage(t),
+                "{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn l_heure_et_le_jour_restent_dans_les_bornes_des_tableaux() {
+        // `hourly_activity` fait 24 cases et `daily_activity` 7 : un index hors
+        // borne serait une panique, donc un 500 sur le fil du lecteur.
+        for secondes in [0i64, 1, 1_000_000_000, 2_000_000_000, 4_000_000_000] {
+            let t = DateTime::<Utc>::from_timestamp(secondes, 0).unwrap();
+            assert!((t.hour() as usize) < 24);
+            assert!((t.weekday().num_days_from_sunday() as usize) < 7);
+        }
+    }
+
+    // ─── Contexte de lot ─────────────────────────────────────────────────────
+
+    fn tweet_pour_contexte() -> RawTweet {
+        let mut t = RawTweet {
+            id: "t".into(),
+            user_id: "a".into(),
+            content: "Un contenu de test avec assez de mots pour compter".into(),
+            created_at: Utc::now() - chrono::Duration::hours(3),
+            view_count: 400,
+            like_count: 12,
+            comment_count: 3,
+            retweet_count: 2,
+            content_length: 50,
+            author_followers: 900,
+            ..Default::default()
+        };
+        t.analyze();
+        t
+    }
+
+    /// Passer les signaux de contenu poubelle au lieu de les recalculer ne doit
+    /// rien changer au score. C'est toute la sûreté du raccourci : `score_all`
+    /// les calcule déjà pour l'admission par surface, et le scoring les
+    /// recalculait intégralement derrière.
+    #[test]
+    fn les_signaux_precalcules_donnent_le_meme_score() {
+        let tweet = tweet_pour_contexte();
+        let profile = UserProfile::default();
+        let weights = AlgoWeights::default();
+        let now = Utc::now();
+
+        let recalcule = score_tweet_with_weights_at(
+            &tweet,
+            &profile,
+            0,
+            FeedShape::empty(),
+            &weights,
+            ScoringContext::at(now),
+        );
+        let fourni = score_tweet_with_weights_at(
+            &tweet,
+            &profile,
+            0,
+            FeedShape::empty(),
+            &weights,
+            ScoringContext::at(now)
+                .with_garbage(GarbageContentDetector::new().detect(&tweet)),
+        );
+        assert_eq!(recalcule.score.to_bits(), fourni.score.to_bits());
+        assert_eq!(
+            recalcule.breakdown.garbage_penalty.to_bits(),
+            fourni.breakdown.garbage_penalty.to_bits()
+        );
+    }
+
+    /// Un instant imposé doit donner exactement ce que donne l'horloge lue à
+    /// cet instant-là — sinon figer l'instant du lot déplacerait le classement.
+    #[test]
+    fn l_instant_impose_donne_le_meme_score_que_l_horloge() {
+        let tweet = tweet_pour_contexte();
+        let profile = UserProfile::default();
+        let weights = AlgoWeights::default();
+        let now = Utc::now();
+
+        let a = score_tweet_with_weights_at(
+            &tweet,
+            &profile,
+            0,
+            FeedShape::empty(),
+            &weights,
+            ScoringContext::at(now),
+        );
+        let b = score_tweet_with_weights_at(
+            &tweet,
+            &profile,
+            0,
+            FeedShape::empty(),
+            &weights,
+            ScoringContext::at(now),
+        );
+        assert_eq!(a.score.to_bits(), b.score.to_bits(), "le scoring doit être déterministe à instant fixé");
+
+        // Et le chemin sans contexte reste dans le même voisinage : il lit
+        // l'horloge lui-même, à quelques microsecondes près.
+        let libre = score_tweet_with_weights(&tweet, &profile, 0, FeedShape::empty(), &weights);
+        assert!((libre.score - a.score).abs() < 1e-6, "libre={} fixe={}", libre.score, a.score);
+    }
+
+    /// Les trois dimensions temporelles voyaient chacune un instant différent :
+    /// D1 lisait l'horloge, puis D4, puis D7. L'écart était infime mais réel.
+    /// Elles partagent maintenant l'instant du lot.
+    #[test]
+    fn les_dimensions_temporelles_partagent_le_meme_instant() {
+        let tweet = tweet_pour_contexte();
+        let now = Utc::now();
+        let age_d1 = age_hours_at(&tweet, now);
+        let age_d7 = age_hours_at(&tweet, now);
+        assert_eq!(age_d1.to_bits(), age_d7.to_bits());
     }
 }

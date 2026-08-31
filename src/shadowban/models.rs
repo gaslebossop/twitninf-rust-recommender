@@ -529,7 +529,7 @@ impl ContentEligibility {
 // ─── Signaux de contenu poubelle (par tweet) ──────────────────────────────────
 
 /// Signaux extraits d'un tweet individuel.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct GarbageSignals {
     pub spam_hashtag_density: bool, // hashtags > 30% des mots
     pub spam_mentions: bool,        // > 5 @mentions

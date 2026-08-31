@@ -6,6 +6,10 @@ mod calibration;
 mod collab;
 mod config;
 mod constants;
+// ⚠ Meme piege que `neural` ci-dessous : cette liste double celle de
+// `lib.rs`. Un module oublie ici casse le BINAIRE, que `cargo test --lib` ne
+// compile pas.
+mod content;
 mod cooccurrence;
 mod embeddings;
 mod eval;
