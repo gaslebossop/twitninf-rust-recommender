@@ -201,6 +201,38 @@ de l'auto-réglage protège à 0,40.
 
 ---
 
+## 3 bis. Mesuré après déploiement
+
+Même appel, même lecteur, avant / après :
+
+| | avant | après |
+|---|---|---|
+| candidats collectés | 74 | 74 |
+| source `social_graph` | **0** | **37** |
+| source `trending` | 33 | 1 |
+| poids D5 comportemental | 0,0008 | **0,08** |
+| poids D6 diversité | 0,0008 | **0,06** |
+| poids D3 graphe social | 0,082 | **0,17** |
+| poids D10 affinité de goût | — | **0,12** |
+| part personnelle | **0,26** | **0,43** |
+| part popularité (D1+D7) | 0,42 | **0,25** |
+| tweets servis de moins de 72 h | **2** / 50 | **17** / 42 |
+| tweets servis de moins de 7 j | 3 | **22** |
+| âge médian servi | 413 h | **152 h** |
+
+⚠ **La page est passée de 50 à 42 entrées.** C'est le prix de l'arrêt anticipé
+de l'élargissement : un vivier plus étroit, mais nettement plus frais. Servir
+cinquante tweets vieux de dix-sept jours n'était pas une meilleure page.
+
+⚠ **Deux allers-retours ont été nécessaires, et le second corrigeait le
+premier.** Élargir la collecte a d'abord EMPIRÉ la fraîcheur (2 tweets récents
+sur 50, âge médian 17 jours) parce que ça a révélé un défaut que les fenêtres
+courtes masquaient : D4 valait zéro passé trois jours, donc ne départageait
+plus rien, pendant que D1 et D7 comptent un engagement qui s'accumule avec
+l'âge. C'est la mesure APRÈS déploiement qui l'a montré — pas la revue de code.
+
+---
+
 ## 4. Ce qui reste
 
 ### 🟠 La calibration mesurée n'est toujours pas appliquée
@@ -219,6 +251,17 @@ invariants testés. C'est la limite honnête de tout ce document.
 Toujours pas de part réservée entre abonnements et hors-réseau ; l'appartenance
 agit par multiplicateur. Un plafond dur produirait des trous sur ce vivier.
 À rouvrir quand le vivier tiendra la cible de 200 sans élargissement.
+
+### 🔴 Le vrai plafond n'est plus l'algorithme
+20 auteurs actifs, 731 tweets sur 36 jours, 11 lecteurs actifs sur 7 jours. Le
+vivier plafonne à ~74 candidats parce que `MAX_CANDIDATES_PER_AUTHOR = 12`
+multiplié par une vingtaine d'auteurs ne peut pas donner davantage — élargir
+les fenêtres au-delà n'ajoute que de l'âge, ce que l'arrêt anticipé constate
+désormais tout seul.
+
+**Aucun réglage supplémentaire ne fera mieux à ce volume.** Ce qui bougerait
+l'aiguille maintenant, c'est plus d'auteurs qui publient, pas plus de
+dimensions.
 
 ### 🟡 Les 243 réponses sans like
 Sur 30 jours, 243 réponses sont écartées faute d'un seul like — c'est le plus
