@@ -2316,7 +2316,30 @@ cand AS (
           LIMIT 100)
 ),
 merged AS (
-    SELECT id, MAX(w) AS w, (ARRAY_AGG(src ORDER BY w DESC))[1] AS src
+    -- /!\ Le canal retenu est celui que le CLASSEMENT valorise le plus, PAS
+    -- celui de plus fort poids de collecte.
+    --
+    -- Ce `ORDER BY` portait sur `w`, le poids du SQL, où « tendance » (0,15)
+    -- passe devant « graphe social » (0,12). Le classement fait l'inverse
+    -- (0,04 contre 0,08). Un tweet publié par un compte que le lecteur SUIT et
+    -- qui figurait aussi parmi les populaires repartait donc étiqueté
+    -- « tendance », et perdait la moitié de son bonus de canal.
+    --
+    -- Ce n'était pas un cas limite : la fenêtre « tendance » de `for_you` fait
+    -- 72 h et il se publie 34 tweets en 72 h sur cette plateforme. La source
+    -- « tendance » ramassait TOUT, et la source « graphe social » sortait à
+    -- ZÉRO dans les statistiques d'un lecteur suivant 27 comptes qui avaient
+    -- publié 44 fois pendant la fenêtre.
+    --
+    -- Le `CASE` est GÉNÉRÉ depuis `TweetSource::feed_bonus` — voir
+    -- `TweetSource::sql_priority_case`. Le recopier ici aurait dérivé dès la
+    -- première modification des bonus.
+    --
+    -- `w` suit le canal choisi au lieu d'être un `MAX` indépendant : sinon la
+    -- ligne décrirait un canal et porterait le poids d'un autre.
+    SELECT id,
+           (ARRAY_AGG(w   ORDER BY {PRIORITE} DESC, w DESC))[1] AS w,
+           (ARRAY_AGG(src ORDER BY {PRIORITE} DESC, w DESC))[1] AS src
     FROM cand GROUP BY id
 ),
 -- ⚠ Plafond par auteur SUR LE VIVIER, toutes sources confondues.
@@ -2524,8 +2547,22 @@ picked AS (
 ///
 /// `concat!` ne sait pas coller des constantes, et refaire le `format!` à
 /// chaque requête réallouerait plusieurs kilo-octets par recommandation.
-static CANDIDATES_SQL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{CANDIDATES_CTE}{PROJECTION_SQL}"));
+/// Le SQL de collecte, tel qu'il part vraiment vers Postgres.
+///
+/// Exposé pour qu'on puisse le faire valider par la base AVANT un déploiement
+/// (voir `examples/dump_sql.rs`) : ce texte est engendré, et une erreur de
+/// syntaxe casserait CHAQUE requête de fil — que le repli silencieux du client
+/// Node masquerait en simple baisse de qualité.
+pub fn candidates_sql() -> &'static str {
+    CANDIDATES_SQL.as_str()
+}
+
+static CANDIDATES_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}{PROJECTION_SQL}",
+        CANDIDATES_CTE.replace("{PRIORITE}", &TweetSource::sql_priority_case())
+    )
+});
 static PARENTS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{PARENTS_CTE}{PROJECTION_SQL}"));
 static SEMANTIC_SQL: std::sync::LazyLock<String> =
@@ -4429,6 +4466,47 @@ mod tests {
                 "le canal du classement doit l'emporter sur celui du SQL"
             );
         }
+    }
+
+    /// La déduplication a lieu DEUX fois — en SQL (`merged`, regroupé par `id`)
+    /// et en Rust (`deduplicate`, regroupé par identité de contenu). Les deux
+    /// doivent choisir le même canal, sans quoi le tri dépendrait de l'endroit
+    /// où le doublon a été vu.
+    ///
+    /// Ce test vérifie que le `CASE` SQL est bien engendré depuis la table du
+    /// classement, et pas recopié à côté d'elle.
+    #[test]
+    fn le_case_sql_suit_la_table_du_classement() {
+        let case = TweetSource::sql_priority_case();
+        for source in TweetSource::ALL {
+            let attendu = format!(
+                " WHEN {} THEN {}",
+                source.src_code(),
+                (source.feed_bonus() * 100.0).round() as i64
+            );
+            assert!(
+                case.contains(&attendu),
+                "canal {source:?} absent ou mal coté dans « {case} »"
+            );
+        }
+        // L'ordre qui comptait : le graphe social doit dominer la tendance.
+        assert!(
+            TweetSource::SocialGraph.feed_bonus() > TweetSource::Trending.feed_bonus(),
+            "c'est tout l'objet du correctif"
+        );
+    }
+
+    /// Le SQL réellement envoyé ne doit plus porter de marqueur non substitué —
+    /// sinon Postgres renverrait une erreur de syntaxe sur CHAQUE requête de
+    /// fil, et le repli silencieux du client Node la masquerait.
+    #[test]
+    fn le_sql_de_collecte_est_completement_substitue() {
+        let sql = CANDIDATES_SQL.as_str();
+        assert!(
+            !sql.contains("{PRIORITE}"),
+            "marqueur non substitué dans le SQL de collecte"
+        );
+        assert!(sql.contains("CASE src WHEN"), "le CASE de priorité est absent");
     }
 
     /// Le pendant : un canal réellement moins valorisé ne doit pas remplacer un

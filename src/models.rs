@@ -707,6 +707,57 @@ impl TweetSource {
     ///
     /// Une seule table désormais, et c'est celle du classement : c'est lui qui
     /// décide de ce qu'un canal vaut, pas l'ordre des `UNION ALL`.
+    /// Les huit canaux, dans l'ordre de leur code `src` en SQL.
+    pub const ALL: [TweetSource; 8] = [
+        TweetSource::Trending,
+        TweetSource::SocialGraph,
+        TweetSource::Viral,
+        TweetSource::Discovery,
+        TweetSource::Temporal,
+        TweetSource::Influencer,
+        TweetSource::Personalized,
+        TweetSource::Quality,
+    ];
+
+    /// Code `src` porté par la colonne du SQL de collecte.
+    ///
+    /// ⚠ `Discovery` vaut 4 parce que c'est la valeur de repli du `match` de
+    /// `map_rows` : tout code inconnu y retombe.
+    pub fn src_code(self) -> i32 {
+        match self {
+            TweetSource::Trending => 1,
+            TweetSource::SocialGraph => 2,
+            TweetSource::Viral => 3,
+            TweetSource::Discovery => 4,
+            TweetSource::Temporal => 5,
+            TweetSource::Influencer => 6,
+            TweetSource::Personalized => 7,
+            TweetSource::Quality => 8,
+        }
+    }
+
+    /// Le `CASE` SQL qui classe les canaux comme le fait `feed_bonus`.
+    ///
+    /// GÉNÉRÉ, et non recopié à la main : la déduplication a lieu deux fois —
+    /// une fois en SQL (`merged`, qui regroupe par `id`) et une fois en Rust
+    /// (`deduplicate`, qui regroupe par identité de contenu). Les deux doivent
+    /// choisir le MÊME canal, sans quoi le tri dépend de l'endroit où le
+    /// doublon a été vu. Une table recopiée dans du SQL littéral aurait dérivé
+    /// dès la première modification des bonus.
+    pub fn sql_priority_case() -> String {
+        let mut cas = String::from("CASE src");
+        for source in Self::ALL {
+            // Centièmes : `ORDER BY` sur des entiers, pas sur des flottants.
+            cas.push_str(&format!(
+                " WHEN {} THEN {}",
+                source.src_code(),
+                (source.feed_bonus() * 100.0).round() as i64
+            ));
+        }
+        cas.push_str(" ELSE 0 END");
+        cas
+    }
+
     pub fn feed_bonus(self) -> f64 {
         match self {
             // Un compte que le lecteur a explicitement choisi de suivre.
