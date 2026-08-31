@@ -16,8 +16,9 @@ use crate::bandit::bandit_select;
 use crate::constants::{
     COLD_START_FOLLOW_BOOST_MAX, COLD_START_INTERACTION_FLOOR, EXCLUDE_SEEN_MIN_REMAINING,
     FOLLOW_FEED_BOOST, FOLLOW_MUTUAL_BOOST, TRENDING_HOOK_POOL, TRENDING_HOOK_SIZE,
-    TRENDING_HOOK_TEMPERATURE, TRENDING_MEDIA_BOOST, TRENDING_MIN_POOL,
-    TRENDING_SHUFFLE_TEMPERATURE, TRENDING_TASTE_BOOST_MAX, TRENDING_WIDEN_FACTOR,
+    CANDIDATE_TARGET_POOL, CANDIDATE_WIDEN_STEPS,
+    TRENDING_HOOK_TEMPERATURE, TRENDING_MEDIA_BOOST,
+    TRENDING_SHUFFLE_TEMPERATURE, TRENDING_TASTE_BOOST_MAX,
 };
 use crate::experiments;
 use crate::ml::auto_tuner::AutoTuner;
@@ -655,6 +656,11 @@ impl RecommenderService {
         // que `velocity_throttles` et `realtime_author_boosts` juste au-dessus.
         let taste_boosts = self.taste_boosts(&mode, &profile, &deduped).await;
 
+        // D10 — affinité sémantique, sur TOUS les modes. Calculée ici et non
+        // dans `score_all`, qui est synchrone : même patron que le renfort
+        // d'Explorer juste au-dessus.
+        let taste_affinities = self.taste_affinities(&profile, &deduped).await;
+
         // ── Modele neuronal externe (`taste-model`) ──────────────────────────
         //
         // L'interrupteur est relu ICI, sur l'aller-retour Redis qui existe deja
@@ -685,6 +691,7 @@ impl RecommenderService {
             &realtime_author_boosts,
             &arm_stats,
             &taste_boosts,
+            &taste_affinities,
             &neural_scores,
             &mut auto_strike_candidates,
         );
@@ -877,6 +884,50 @@ impl RecommenderService {
     /// Vide aussi quand le lecteur n'a pas encore de vecteur de goût (compte
     /// neuf, ou likes pas encore embeddés) : la page reste alors exactement ce
     /// qu'elle était avant ce renfort.
+    /// D10 — position de chaque candidat dans le vivier selon le goût
+    /// sémantique du lecteur.
+    ///
+    /// ⚠ Contrairement à `taste_boosts`, ceci vaut pour TOUS les modes.
+    /// Jusqu'ici le vecteur de goût — le signal le plus personnel du moteur —
+    /// ne servait qu'à cibler les publicités et à renforcer l'onglet Explorer.
+    /// Le fil principal, celui que les applications demandent réellement, ne le
+    /// consultait jamais.
+    ///
+    /// Une carte vide (lecteur sans vecteur de goût, plongements indisponibles,
+    /// vivier trop petit) laisse la dimension à sa valeur neutre : le
+    /// classement est alors exactement celui d'avant.
+    async fn taste_affinities(
+        &self,
+        profile: &UserProfile,
+        tweets: &[RawTweet],
+    ) -> HashMap<String, f64> {
+        let Some(taste) = profile.taste_vector.as_ref() else {
+            return HashMap::new();
+        };
+        let ids: Vec<String> = tweets.iter().map(|t| t.id.clone()).collect();
+        let similarities = match crate::embeddings::taste_similarities(&self.pg, taste, &ids).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // Silencieux à dessein, comme le renfort d'Explorer : une
+                // dimension indisponible doit rendre le fil d'avant, pas une
+                // erreur.
+                debug!(user_id = %profile.user_id, error = %e,
+                       "D10 : similarités de goût indisponibles");
+                return HashMap::new();
+            }
+        };
+        let ranks = crate::algorithm::taste::affinity_ranks(&similarities);
+        debug!(
+            user_id = %profile.user_id,
+            mesures = similarities.len(),
+            classes = ranks.len(),
+            candidats = tweets.len(),
+            "D10 : affinité de goût calculée"
+        );
+        ranks
+    }
+
     async fn taste_boosts(
         &self,
         mode: &RecommendMode,
@@ -931,6 +982,7 @@ impl RecommenderService {
         realtime_author_boosts: &HashMap<String, f64>,
         arm_stats: &HashMap<String, (f64, u32)>,
         taste_boosts: &HashMap<String, f64>,
+        taste_affinities: &HashMap<String, f64>,
         neural_scores: &HashMap<String, f64>,
         auto_strike_candidates: &mut Vec<AutoStrikeCandidate>,
     ) -> Vec<ScoredTweet> {
@@ -1091,7 +1143,9 @@ impl RecommenderService {
                     .map(|p| self.neural.lift(*p)),
                 // Instant du lot, et signaux de contenu poubelle déjà calculés
                 // quelques lignes plus haut pour l'admission par surface.
-                ScoringContext::at(now).with_garbage(signals),
+                ScoringContext::at(now)
+                    .with_garbage(signals)
+                    .with_taste(taste_affinities.get(&tweet.id).copied()),
             );
             let base_score = s.score;
 
@@ -1743,29 +1797,34 @@ impl RecommenderService {
         let client = self.pg.get().await?;
 
         // ── Fenêtres élargies si le vivier est trop maigre ───────────────────
-        // Les fenêtres courtes de Trending (6 h) supposent un flux de
-        // publication soutenu. Quand il ne l'est pas, elles ne contiennent
-        // presque rien : la page de découverte affiche la même poignée de
-        // tweets toute la journée, et il n'y a aucune raison d'y revenir. On
-        // retente alors UNE fois, plus large — un aller de plus en base
-        // seulement dans ce cas, jamais sur le chemin nominal.
         //
-        // Les autres modes n'ont qu'une tentative : leurs fenêtres sont déjà
-        // larges, et c'est Trending qui porte la page de découverte.
-        let mut attempts: Vec<(i32, i32, i32, i32)> = vec![(
-            window_trending,
-            window_social,
-            window_discover,
-            window_viral,
-        )];
-        if *mode == RecommendMode::Trending {
-            attempts.push((
-                window_trending * TRENDING_WIDEN_FACTOR,
-                window_social * TRENDING_WIDEN_FACTOR,
-                window_discover,
-                window_viral * TRENDING_WIDEN_FACTOR,
-            ));
-        }
+        // Ce rattrapage n'existait QUE pour Trending, dont les fenêtres de 6 h
+        // supposent un flux de publication soutenu. Le constat vaut en réalité
+        // pour tous les modes : `for_you` regarde 72 h, et il ne se publie que
+        // trente-quatre tweets en 72 h sur cette plateforme, quand trois cent
+        // quatre-vingt-deux sont éligibles sur trente jours. Le classement
+        // recevait 16 % de ce qu'il aurait pu trier.
+        //
+        // On élargit donc par paliers, dans TOUS les modes, jusqu'à ce que le
+        // vivier atteigne `CANDIDATE_TARGET_POOL`. Le premier palier vaut 1 :
+        // sur un flux dense il suffit, et le comportement comme le coût sont
+        // exactement ceux d'avant. Voir `CANDIDATE_WIDEN_STEPS`.
+        //
+        // La fenêtre de découverte ne suit pas les paliers : elle est déjà la
+        // plus large des quatre (jusqu'à trente jours), et la multiplier
+        // ferait remonter des tweets plus vieux que ce que le classement
+        // saurait départager.
+        let attempts: Vec<(i32, i32, i32, i32)> = CANDIDATE_WIDEN_STEPS
+            .iter()
+            .map(|facteur| {
+                (
+                    window_trending * facteur,
+                    window_social * facteur,
+                    window_discover,
+                    window_viral * facteur,
+                )
+            })
+            .collect();
 
         let mut all = Vec::new();
         for (attempt, (wt, ws, wd, wv)) in attempts.into_iter().enumerate() {
@@ -1790,14 +1849,15 @@ impl RecommenderService {
                 .await?;
 
             all = map_rows(rows);
-            if all.len() >= TRENDING_MIN_POOL {
+            if all.len() >= CANDIDATE_TARGET_POOL {
                 break;
             }
             debug!(
                 attempt,
                 candidates = all.len(),
-                floor = TRENDING_MIN_POOL,
-                "Candidate pool below floor"
+                cible = CANDIDATE_TARGET_POOL,
+                fenetre_tendance = wt,
+                "Vivier sous la cible — élargissement des fenêtres"
             );
         }
 
@@ -3285,10 +3345,18 @@ fn deduplicate(mut tweets: Vec<RawTweet>) -> Vec<RawTweet> {
             }
             Some(idx) => {
                 // On garde l'exemplaire déjà retenu, mais on lui laisse le
-                // meilleur poids de source des doublons rencontrés : si le
-                // tweet arrive à la fois par « suivi » et par « trending »,
-                // il mérite le poids du canal le plus fort.
-                if tweet.source_weight > result[idx].source_weight {
+                // MEILLEUR CANAL des doublons rencontrés : si le tweet arrive
+                // à la fois par « suivi » et par « tendance », il doit compter
+                // comme venant du compte que le lecteur a choisi de suivre.
+                //
+                // ⚠ L'arbitrage se fait sur `feed_bonus`, la table du
+                // CLASSEMENT, et non sur le poids `w` du SQL de collecte. Les
+                // deux se contredisaient : le SQL place « tendance » (0,15)
+                // devant « graphe social » (0,12), le classement fait
+                // l'inverse (0,04 contre 0,08). Le SQL gagnait, et les tweets
+                // des comptes suivis perdaient la moitié de leur bonus en
+                // étant réétiquetés « tendance ». Voir `TweetSource::feed_bonus`.
+                if tweet.source.feed_bonus() > result[idx].source.feed_bonus() {
                     result[idx].source_weight = tweet.source_weight;
                     result[idx].source = tweet.source;
                 }
@@ -4325,6 +4393,55 @@ mod tests {
         );
         // L'original doit être conservé plutôt qu'un de ses retweets.
         assert_eq!(deduped[0].id, "origine");
+    }
+
+    /// Le défaut corrigé le 2026-08-31 : un tweet arrivé à la fois par
+    /// « tendance » et par « graphe social » repartait étiqueté TENDANCE, parce
+    /// que la déduplication arbitrait sur le poids du SQL de collecte (0,15
+    /// contre 0,12) alors que le classement, lui, valorise le graphe social
+    /// deux fois plus (0,08 contre 0,04).
+    ///
+    /// Conséquence en production : un lecteur suivant 27 comptes qui avaient
+    /// publié 44 fois dans la fenêtre voyait la source « graphe social » comptée
+    /// à ZÉRO dans son fil, et chacun de ces tweets perdait la moitié de son
+    /// bonus de canal.
+    #[test]
+    fn un_tweet_a_la_fois_suivi_et_populaire_reste_du_graphe_social() {
+        let mut par_tendance = tweet("t");
+        par_tendance.source = TweetSource::Trending;
+        par_tendance.source_weight = 0.15;
+
+        let mut par_abonnement = tweet("t");
+        par_abonnement.source = TweetSource::SocialGraph;
+        par_abonnement.source_weight = 0.12;
+
+        // Dans les deux ordres d'arrivée : le canal retenu ne doit pas dépendre
+        // de l'ordre des `UNION ALL`.
+        for entrees in [
+            vec![par_tendance.clone(), par_abonnement.clone()],
+            vec![par_abonnement.clone(), par_tendance.clone()],
+        ] {
+            let deduped = deduplicate(entrees);
+            assert_eq!(deduped.len(), 1);
+            assert_eq!(
+                deduped[0].source,
+                TweetSource::SocialGraph,
+                "le canal du classement doit l'emporter sur celui du SQL"
+            );
+        }
+    }
+
+    /// Le pendant : un canal réellement moins valorisé ne doit pas remplacer un
+    /// canal plus fort.
+    #[test]
+    fn un_canal_plus_faible_ne_remplace_pas_un_plus_fort() {
+        let mut fort = tweet("t");
+        fort.source = TweetSource::SocialGraph;
+        let mut faible = tweet("t");
+        faible.source = TweetSource::Discovery;
+
+        let deduped = deduplicate(vec![fort, faible]);
+        assert_eq!(deduped[0].source, TweetSource::SocialGraph);
     }
 
     #[test]

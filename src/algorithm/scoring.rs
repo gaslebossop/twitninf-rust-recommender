@@ -124,6 +124,14 @@ impl FeedShape {
 pub struct ScoringContext {
     pub now: DateTime<Utc>,
     pub garbage: Option<crate::shadowban::GarbageSignals>,
+    /// D10 — position de CE tweet dans le vivier, du plus loin (0) au plus
+    /// proche (1) du goût sémantique du lecteur. Voir `algorithm::taste`.
+    ///
+    /// `None` quand la mesure n'existe pas — lecteur sans vecteur de goût,
+    /// tweet sans plongement, vivier trop petit pour classer. La dimension
+    /// vaut alors `taste::NEUTRAL`, jamais zéro : ne rien savoir ne doit pas
+    /// pénaliser.
+    pub taste_affinity: Option<f64>,
 }
 
 impl ScoringContext {
@@ -137,12 +145,19 @@ impl ScoringContext {
         Self {
             now,
             garbage: None,
+            taste_affinity: None,
         }
     }
 
     /// Signaux de contenu poubelle déjà calculés pour CE tweet.
     pub fn with_garbage(mut self, garbage: crate::shadowban::GarbageSignals) -> Self {
         self.garbage = Some(garbage);
+        self
+    }
+
+    /// Affinité de goût déjà mesurée pour CE tweet.
+    pub fn with_taste(mut self, affinity: Option<f64>) -> Self {
+        self.taste_affinity = affinity;
         self
     }
 
@@ -245,6 +260,10 @@ pub fn score_tweet_with_weights_at(
     // (0.5) tant qu'un tweet n'est pas annoté, donc sans effet sur le classement
     // existant.
     let d9 = calculate_d9(tweet);
+    // D10 juge le CONTENU par rapport a ce que ce lecteur consomme, la ou D8
+    // juge l'AUTEUR et les mots-cles. Neutre quand la mesure manque, jamais
+    // penalisant — voir `algorithm::taste`.
+    let d10 = ctx.taste_affinity.unwrap_or(crate::algorithm::taste::NEUTRAL);
 
     let user_weights = UserDimensionWeights::for_profile(profile);
     let user_weighted_score = user_weights.apply(d1, d2, d3, d4, d5, d6, d7, d8);
@@ -259,21 +278,14 @@ pub fn score_tweet_with_weights_at(
         + d6 * w.d6_diversity
         + d7 * w.d7_viral
         + d8 * w.d8_personalization
-        + d9 * w.d9_llm_understanding;
+        + d9 * w.d9_llm_understanding
+        + d10 * w.d10_taste_affinity;
     let base_score = global_score * 0.60 + user_weighted_score * 0.40;
 
     let diversity_mult = diversity_multiplier(author_feed_count);
     let mod_penalty = moderation_penalty(tweet);
-    let source_bonus = match tweet.source {
-        TweetSource::SocialGraph => 0.08,
-        TweetSource::Personalized => 0.05,
-        TweetSource::Viral => 0.04,
-        TweetSource::Influencer => 0.03,
-        TweetSource::Trending => 0.04,
-        TweetSource::Temporal => 0.02,
-        TweetSource::Discovery => 0.01,
-        TweetSource::Quality => 0.01,
-    };
+    // Table unique, partagée avec la déduplication — voir `TweetSource::feed_bonus`.
+    let source_bonus = tweet.source.feed_bonus();
 
     let score_before_shadowban =
         ((base_score + source_bonus) * diversity_mult + mod_penalty).clamp(0.0, 1.0);
@@ -349,6 +361,7 @@ pub fn score_tweet_with_weights_at(
             content_diversity: d6,
             viral_prediction: d7,
             personalization_depth: d8,
+            taste_affinity: d10,
             engagement_velocity_raw: ev_raw,
             engagement_acceleration: ev_accel,
             viral_velocity: viral_vel,
@@ -2092,6 +2105,96 @@ mod tests {
         // l'horloge lui-même, à quelques microsecondes près.
         let libre = score_tweet_with_weights(&tweet, &profile, 0, FeedShape::empty(), &weights);
         assert!((libre.score - a.score).abs() < 1e-6, "libre={} fixe={}", libre.score, a.score);
+    }
+
+    // ─── D10 — affinité de goût ──────────────────────────────────────────────
+
+    fn tweet_neutre(id: &str) -> RawTweet {
+        let mut t = RawTweet {
+            id: id.into(),
+            user_id: "auteur".into(),
+            content: "Un contenu quelconque, ni bon ni mauvais, juste du texte".into(),
+            created_at: Utc::now() - chrono::Duration::hours(5),
+            view_count: 100,
+            like_count: 4,
+            content_length: 55,
+            author_followers: 300,
+            ..Default::default()
+        };
+        t.analyze();
+        t
+    }
+
+    fn score_avec_gout(affinity: Option<f64>) -> f64 {
+        let tweet = tweet_neutre("t");
+        score_tweet_with_weights_at(
+            &tweet,
+            &UserProfile::default(),
+            0,
+            FeedShape::empty(),
+            &AlgoWeights::default(),
+            ScoringContext::at(Utc::now()).with_taste(affinity),
+        )
+        .score
+    }
+
+    /// Le contenu le plus proche de ce que ce lecteur consomme doit passer
+    /// devant le plus éloigné. C'est toute la raison d'être de la dimension.
+    #[test]
+    fn un_contenu_proche_du_gout_passe_devant_un_contenu_lointain() {
+        let proche = score_avec_gout(Some(1.0));
+        let loin = score_avec_gout(Some(0.0));
+        assert!(
+            proche > loin,
+            "proche={proche} devrait dépasser loin={loin}"
+        );
+    }
+
+    /// Ne rien savoir ne doit pas pénaliser : un tweet publié il y a trois
+    /// minutes n'a pas encore son plongement, et le rétrograder pour ça
+    /// reviendrait à filtrer la fraîcheur — exactement ce que D4 favorise.
+    #[test]
+    fn une_affinite_inconnue_vaut_le_milieu_pas_zero() {
+        let inconnu = score_avec_gout(None);
+        let milieu = score_avec_gout(Some(crate::algorithm::taste::NEUTRAL));
+        let nul = score_avec_gout(Some(0.0));
+        assert!((inconnu - milieu).abs() < 1e-12);
+        assert!(inconnu > nul, "l'inconnu ne doit pas être traité comme un rejet");
+    }
+
+    /// La dimension doit peser assez pour déplacer un classement, sinon elle
+    /// est décorative. À poids par défaut, l'écart entre le candidat le plus
+    /// proche et le plus lointain du goût doit dépasser ce que produisent la
+    /// plupart des autres départages.
+    #[test]
+    fn le_gout_pese_assez_pour_departager() {
+        let ecart = score_avec_gout(Some(1.0)) - score_avec_gout(Some(0.0));
+        let attendu = AlgoWeights::default().d10_taste_affinity * 0.60;
+        assert!(
+            (ecart - attendu).abs() < 1e-9,
+            "écart={ecart}, attendu≈{attendu} (poids D10 × part des règles)"
+        );
+        assert!(ecart > 0.05, "D10 trop faible pour départager : {ecart}");
+    }
+
+    /// Les quatre dimensions qui décrivent le lecteur doivent garder la
+    /// majorité relative du score par défaut. C'est l'invariant que
+    /// l'auto-réglage avait fait sauter en silence.
+    #[test]
+    fn le_defaut_reste_majoritairement_personnel() {
+        let w = AlgoWeights::default();
+        assert!(
+            w.personalization_share() >= 0.40,
+            "part personnelle du défaut = {}",
+            w.personalization_share()
+        );
+        let popularite = w.d1_engagement_velocity + w.d7_viral;
+        assert!(
+            w.personalization_share() > popularite,
+            "personnalisation {} devrait dépasser popularité {}",
+            w.personalization_share(),
+            popularite
+        );
     }
 
     /// Les trois dimensions temporelles voyaient chacune un instant différent :

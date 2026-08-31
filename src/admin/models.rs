@@ -72,6 +72,7 @@ pub struct SetWeightsRequest {
     pub d7: Option<f64>,
     pub d8: Option<f64>,
     pub d9: Option<f64>,
+    pub d10: Option<f64>,
 }
 
 // ─── Réponses admin ───────────────────────────────────────────────────────────
@@ -118,10 +119,24 @@ pub struct AlgoWeights {
     /// évite qu'une config déjà enregistrée en Redis devienne illisible.
     #[serde(default = "default_d9")]
     pub d9_llm_understanding: f64,
+    /// D10 — affinité sémantique au goût du lecteur (voir `algorithm::taste`).
+    ///
+    /// Même traitement `serde(default)` que D9 : les poids déjà enregistrés en
+    /// Redis avant son introduction ne portent pas ce champ, et doivent rester
+    /// lisibles. Un défaut à 0 rendrait la dimension inerte pour toute
+    /// installation qui a déjà réglé ses poids une fois — on lui donne donc sa
+    /// part, quitte à ce que la somme d'une vieille configuration dépasse 1,0
+    /// jusqu'au prochain enregistrement.
+    #[serde(default = "default_d10")]
+    pub d10_taste_affinity: f64,
 }
 
 fn default_d9() -> f64 {
     0.10
+}
+
+fn default_d10() -> f64 {
+    0.12
 }
 
 impl Default for AlgoWeights {
@@ -133,22 +148,30 @@ impl Default for AlgoWeights {
         // reste à 1,0. Un abonnement pesait environ +0,05 sur un score borné à
         // 1 — invisible face à D1. Le multiplicateur FOLLOW_FEED_BOOST fait le
         // reste du travail au moment du classement.
+        //
+        // D10 (affinité de goût) est financée de la même façon, et le
+        // prélèvement n'est pas réparti au hasard : il porte d'abord sur D1
+        // (vélocité) et D7 (viralité), les deux dimensions qui mesurent ce que
+        // TOUT LE MONDE regarde. Leur donner moins et donner à D10 déplace le
+        // score de « ce qui marche en ce moment » vers « ce que CE lecteur
+        // consomme », ce qui est exactement l'objet de la dimension.
         Self {
-            d1_engagement_velocity: 0.24,
-            d2_content_intelligence: 0.12,
+            d1_engagement_velocity: 0.18,
+            d2_content_intelligence: 0.10,
             d3_social_graph: 0.22,
-            d4_temporal: 0.09,
+            d4_temporal: 0.08,
             d5_behavioral: 0.08,
             d6_diversity: 0.06,
-            d7_viral: 0.06,
+            d7_viral: 0.04,
             d8_personalization: 0.03,
-            d9_llm_understanding: 0.10,
+            d9_llm_understanding: 0.09,
+            d10_taste_affinity: 0.12,
         }
     }
 }
 
 impl AlgoWeights {
-    pub fn as_array(&self) -> [f64; 9] {
+    pub fn as_array(&self) -> [f64; 10] {
         [
             self.d1_engagement_velocity,
             self.d2_content_intelligence,
@@ -159,7 +182,28 @@ impl AlgoWeights {
             self.d7_viral,
             self.d8_personalization,
             self.d9_llm_understanding,
+            self.d10_taste_affinity,
         ]
+    }
+
+    /// Part du score qui décrit CE LECTEUR plutôt que la popularité générale.
+    ///
+    /// D3 (son graphe), D5 (son comportement), D8 (ses auteurs et ses mots) et
+    /// D10 (son goût sémantique) sont les quatre dimensions qui changent d'un
+    /// lecteur à l'autre pour un même tweet. Les autres — vélocité, viralité,
+    /// fraîcheur, qualité du texte — rendent la même valeur pour tout le monde.
+    ///
+    /// Ce nombre existe parce que l'auto-réglage l'avait laissé tomber à 0,26
+    /// sans que rien ne le signale : voir `AutoTuner::PERSONALIZATION_FLOOR`.
+    pub fn personalization_share(&self) -> f64 {
+        self.d3_social_graph
+            + self.d5_behavioral
+            + self.d8_personalization
+            + self.d10_taste_affinity
+    }
+
+    pub fn sum(&self) -> f64 {
+        self.as_array().iter().sum()
     }
 }
 

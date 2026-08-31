@@ -103,14 +103,43 @@ pub const TRENDING_TASTE_BOOST_MAX: f64 = 1.18;
 /// qu'une page vide, qui elle ne donne aucune raison de revenir.
 pub const EXCLUDE_SEEN_MIN_REMAINING: usize = 30;
 
-/// En dessous de ce nombre de candidats, le mode Trending rouvre sa fenêtre.
-///
-/// Ses fenêtres sont volontairement courtes (6 h) pour garder le haut du fil
-/// frais. Ça suppose un flux de publication soutenu : quand il ne l'est pas, la
-/// fenêtre ne contient presque rien et la page est identique toute la journée —
-/// exactement ce qui empêche de revenir. On élargit alors une fois.
-pub const TRENDING_MIN_POOL: usize = 60;
+// `TRENDING_MIN_POOL` (60) et `TRENDING_WIDEN_FACTOR` (6) vivaient ici. Ils
+// n'élargissaient QUE Trending, et sur un seuil calibré pour une page de
+// découverte. Le mécanisme est désormais général et vaut pour tous les modes —
+// voir `CANDIDATE_TARGET_POOL` juste en dessous. Les retirer plutôt que les
+// laisser inertes : une constante que plus rien ne lit finit par être reprise
+// comme si elle décrivait le comportement courant.
 
-/// Facteur d'élargissement appliqué aux fenêtres courtes de Trending quand le
-/// vivier est sous `TRENDING_MIN_POOL`.
-pub const TRENDING_WIDEN_FACTOR: i32 = 6;
+/// Nombre de candidats en dessous duquel TOUT mode rouvre ses fenêtres.
+///
+/// ── Le classement ne peut pas être meilleur que ce qu'on lui donne ──────────
+/// Relevé en production le 2026-08-31, pour un lecteur réel en `for_you` :
+/// **74 candidats collectés, 61 après déduplication, 41 servis**. Le
+/// classement retenait deux candidats sur trois — à ce taux, il ne classe
+/// plus, il transmet. Aucun réglage de poids, aucune dimension supplémentaire
+/// et aucun modèle ne peut rattraper ça : c'est la RECHERCHE de candidats qui
+/// plafonne la qualité, pas le tri.
+///
+/// Pendant ce temps, **382 tweets** étaient éligibles sur trente jours. Le
+/// moteur en voyait 16 %. La cause n'est pas un filtre trop sévère mais des
+/// fenêtres calibrées pour un flux dense : « tendance » et « graphe social »
+/// regardent 72 h, et il ne se publie que 34 tweets en 72 h sur cette
+/// plateforme.
+///
+/// Quatre candidats par place servie : en dessous, le tri n'a plus de marge.
+pub const CANDIDATE_TARGET_POOL: usize = 200;
+
+/// Élargissements successifs des fenêtres courtes quand le vivier est sous
+/// `CANDIDATE_TARGET_POOL`.
+///
+/// Multiplicateurs, appliqués dans l'ordre, jusqu'à ce que la cible soit
+/// atteinte. `1` d'abord : sur un flux dense, la première tentative suffit et
+/// **rien ne change**, ni le vivier ni le coût. L'élargissement ne se paie que
+/// là où il sert.
+///
+/// ⚠ Élargir ne veut pas dire servir du vieux. La fenêtre décide de ce qu'on
+/// REGARDE ; c'est D4 (demi-vie de 4 h) qui décide de ce qui remonte. Un vivier
+/// large et une décote de fraîcheur forte servent du frais quand il y en a et
+/// du choix quand il n'y en a pas — un vivier étroit, lui, sert ce qu'il a,
+/// frais ou non.
+pub const CANDIDATE_WIDEN_STEPS: [i32; 3] = [1, 4, 12];

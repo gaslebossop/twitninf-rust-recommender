@@ -59,6 +59,34 @@ const MODEL_PATH: &str = "data/objective_models.json";
 /// le CTR et le dwell : un modèle tout juste initialisé ne doit jamais peser.
 pub const MIN_SAMPLES: u64 = 200;
 
+/// Événements POSITIFS avant qu'une tête ne pèse dans le classement.
+///
+/// ── Pourquoi compter les échantillons ne suffit pas ─────────────────────────
+/// Une régression logistique n'apprend pas d'un échantillon, elle apprend d'un
+/// ÉVÉNEMENT. Relevé en production le 2026-08-31, avec le seul seuil
+/// d'échantillons :
+///
+/// ```text
+/// tête      échantillons   taux de base   positifs réels
+/// reply         6 481         0,108 %            7
+/// reject        7 558         0,132 %           10
+/// amplify       7 561         0,278 %           21
+/// fav           6 625         2,234 %          148
+/// ```
+///
+/// Les trois premières étaient déclarées « prêtes » et pesaient sur le
+/// classement de tout le monde, ajustées sur sept à vingt et un exemples pour
+/// {N_FEATURES} traits. Ce ne sont pas des modèles, c'est du bruit avec un
+/// intervalle de confiance.
+///
+/// La règle usuelle demande une dizaine d'événements par trait — soit 220 ici.
+/// On retient 30, c'est-à-dire à peine plus d'un événement par trait : le
+/// minimum absolu en dessous duquel l'ajustement ne veut rien dire du tout.
+/// C'est délibérément indulgent, pour qu'une tête parle dès qu'elle le peut
+/// plausiblement, et ça écarte tout de même les trois têtes de bruit
+/// ci-dessus.
+pub const MIN_POSITIVES: u64 = 30;
+
 /// Voir `ctr_predictor::BIAS_LR_MULTIPLIER` — même raison : encaisser le
 /// recalibrage initial sur un seul paramètre plutôt que sur les 15 poids.
 const BIAS_LR_MULTIPLIER: f64 = 8.0;
@@ -329,8 +357,13 @@ impl Head {
     }
 
     /// Cette tête a-t-elle assez appris pour peser dans le classement ?
+    ///
+    /// Les DEUX conditions comptent : assez d'échantillons pour que la
+    /// moyenne courante (dénominateur de `lift`) soit stable, et assez
+    /// d'ÉVÉNEMENTS pour que les poids veuillent dire quelque chose. Voir
+    /// `MIN_POSITIVES` — c'est la seconde qui manquait.
     pub fn is_ready(&self) -> bool {
-        self.samples_seen >= MIN_SAMPLES
+        self.samples_seen >= MIN_SAMPLES && self.positives >= MIN_POSITIVES
     }
 }
 
@@ -852,7 +885,60 @@ mod tests {
             assert!(p.record_interaction(&f, InteractionType::Retweet));
         }
         let pred = p.predict(&f);
-        assert!(pred.amplify_lift.is_some() && pred.reject_p.is_some());
+        assert!(
+            pred.amplify_lift.is_some(),
+            "200 relais : la tête d'amplification a vu 200 événements"
+        );
+        // ⚠ La tête de rejet, elle, a vu 200 échantillons et ZÉRO rejet. Elle
+        // ne sait pas à quoi ressemble un refus — la déclarer mûre reviendrait
+        // à laisser peser un modèle ajusté sur aucun événement. C'est
+        // exactement le défaut relevé en production : `reject` pesait sur le
+        // classement de tout le monde avec dix positifs pour vingt-deux traits.
+        assert!(
+            pred.reject_p.is_none(),
+            "aucun rejet observé : la tête ne doit pas peser"
+        );
+    }
+
+    /// Le pendant : dès qu'une tête voit de vrais événements, elle parle.
+    #[test]
+    fn une_tete_parle_des_qu_elle_a_vu_assez_d_evenements() {
+        let p = ObjectivePredictor::new();
+        let f = features();
+        for _ in 0..MIN_SAMPLES {
+            p.record_interaction(&f, InteractionType::Retweet);
+        }
+        for _ in 0..MIN_POSITIVES {
+            p.record_interaction(&f, InteractionType::Report);
+        }
+        let pred = p.predict(&f);
+        assert!(
+            pred.reject_p.is_some(),
+            "{MIN_POSITIVES} rejets observés : la tête doit peser"
+        );
+    }
+
+    /// Le défaut corrigé, énoncé en une ligne : beaucoup d'échantillons et
+    /// presque aucun événement ne fait pas un modèle.
+    #[test]
+    fn un_taux_de_base_minuscule_garde_la_tete_muette() {
+        let p = ObjectivePredictor::new();
+        let f = features();
+        // Proportions de production pour la tête `reply` : 6481 échantillons,
+        // 7 positifs.
+        for i in 0..6_481 {
+            let geste = if i % 926 == 0 {
+                InteractionType::Comment
+            } else {
+                InteractionType::Skip
+            };
+            p.record_interaction(&f, geste);
+        }
+        let pred = p.predict(&f);
+        assert!(
+            pred.reply_lift.is_none(),
+            "sept réponses sur 6481 impressions ne font pas un modèle"
+        );
     }
 
     /// Une interaction qui n'apprend rien à une tête ne doit pas faire avancer

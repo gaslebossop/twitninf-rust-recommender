@@ -687,6 +687,42 @@ pub enum TweetSource {
     Quality,
 }
 
+impl TweetSource {
+    /// Bonus de score accordé au canal par lequel ce candidat est arrivé.
+    ///
+    /// ⚠ Cette table était écrite dans `scoring.rs`, et la déduplication en
+    /// utilisait une AUTRE — le poids `w` du SQL de collecte, où « tendance »
+    /// (0,15) passe devant « graphe social » (0,12). Les deux se
+    /// contredisaient, et c'est le SQL qui gagnait : un tweet publié par un
+    /// compte que le lecteur SUIT, et qui figurait aussi parmi les tweets
+    /// populaires, était réétiqueté « tendance » et perdait la moitié de son
+    /// bonus.
+    ///
+    /// Ce n'était pas un cas limite. Relevé en production le 2026-08-31 : la
+    /// fenêtre « tendance » du mode `for_you` fait 72 h, et il se publie 57
+    /// tweets en 72 h sur toute la plateforme. La source « tendance »
+    /// ramassait donc TOUT, et la source « graphe social » était comptée à
+    /// **zéro** dans les statistiques de fil d'un lecteur qui suit 27 comptes
+    /// ayant publié 44 fois pendant la fenêtre.
+    ///
+    /// Une seule table désormais, et c'est celle du classement : c'est lui qui
+    /// décide de ce qu'un canal vaut, pas l'ordre des `UNION ALL`.
+    pub fn feed_bonus(self) -> f64 {
+        match self {
+            // Un compte que le lecteur a explicitement choisi de suivre.
+            // Aucun autre canal ne porte une intention aussi nette.
+            TweetSource::SocialGraph => 0.08,
+            TweetSource::Personalized => 0.05,
+            TweetSource::Viral => 0.04,
+            TweetSource::Trending => 0.04,
+            TweetSource::Influencer => 0.03,
+            TweetSource::Temporal => 0.02,
+            TweetSource::Discovery => 0.01,
+            TweetSource::Quality => 0.01,
+        }
+    }
+}
+
 // `RawTweet` est construit dans les tests via `..Default::default()`, mais le
 // dérive était impossible : `DateTime<Utc>` n'implémente pas `Default`. Le test
 // de D1 ne compilait donc pas. Impl manuelle, avec l'epoch comme date neutre.
@@ -780,6 +816,10 @@ pub struct ScoreBreakdown {
     pub content_diversity: f64,
     pub viral_prediction: f64,
     pub personalization_depth: f64,
+    /// D10 — position du tweet dans le vivier selon le goût sémantique du
+    /// lecteur. `taste::NEUTRAL` quand la mesure manque.
+    #[serde(default)]
+    pub taste_affinity: f64,
 
     pub engagement_velocity_raw: f64,
     pub engagement_acceleration: f64,
